@@ -158,7 +158,8 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
      * A tap on a Secured notification. Only our own action is touched; everything else is Telegram's.
      * Passcode: if Telegram's passcode is showing or due, return false untouched, so Telegram's own flow runs and
      * re-delivers this intent (needShowPasscode(false): the reset variant would clear the state Telegram checks next).
-     * No Telegram account: the id stays pending (in memory) and Telegram carries on; step 4 routes that case.
+     * No Telegram account: the id stays pending (in memory); with Secured-only on, the standalone list consumes it,
+     * otherwise Telegram carries on.
      */
     @Override
     public boolean handleIntent(Activity activity, Intent intent) {
@@ -174,10 +175,21 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 return false;
             }
             SecuredUi.deliverOpenChat(intent.getLongExtra(SecuredUi.EXTRA_CHAT_ID, SecuredUi.NO_CHAT));
-            return UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated();
+            return UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated() || SecuredUi.securedOnly();
         } catch (Throwable t) {
             fail("handleIntent", t);
             return false;
+        }
+    }
+
+    /** Telegram's start screen when logged out: the standalone list if Secured-only was chosen, else the welcome. */
+    @Override
+    public BaseFragment loggedOutIntro(BaseFragment intro) {
+        try {
+            return SecuredUi.securedOnly() ? new SecuredDialogsActivity() : new SecuredWelcomeActivity();
+        } catch (Throwable t) {
+            fail("loggedOutIntro", t);
+            return intro;
         }
     }
 

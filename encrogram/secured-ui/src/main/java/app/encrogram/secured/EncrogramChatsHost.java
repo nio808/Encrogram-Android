@@ -1,16 +1,9 @@
 package app.encrogram.secured;
 
 import android.animation.Animator;
-import android.Manifest;
-import android.app.Activity;
-import android.content.Context;
-import android.content.pm.PackageManager;
-import android.os.Build;
 import android.view.MotionEvent;
 import android.view.View;
 
-import org.telegram.messenger.AndroidUtilities;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.INavigationLayout;
 import org.telegram.ui.Components.CubicBezierInterpolator;
@@ -21,11 +14,6 @@ import org.telegram.ui.ViewPagerActivity;
 
 import android.animation.ValueAnimator;
 
-import app.encrogram.core.api.EngineState;
-import app.encrogram.core.api.SecuredEngine;
-import app.encrogram.core.api.SecuredListener;
-import app.encrogram.core.background.BatteryHelper;
-import app.encrogram.core.background.SecuredBackground;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -53,8 +41,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     private int securedUnread;
     private boolean resumed;
     private Runnable onDestroy;
-    private SecuredEngine bgEngine;
-    private SecuredListener bgListener;
+    private final SecuredBackgroundPrompt background = new SecuredBackgroundPrompt(this);
 
     EncrogramChatsHost(DialogsActivity telegramPage) {
         super();
@@ -107,7 +94,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     public void onFragmentDestroy() {
         SecuredUi.setLinkListener(null);
         SecuredUi.setOpenChatListener(null);
-        stopBackgroundSetup();
+        background.stop();
         final Runnable release = onDestroy;
         onDestroy = null;
         if (release != null) {
@@ -124,7 +111,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         onLinkAvailable();
         onOpenChatAvailable();
         if (selected == POSITION_SECURED) {
-            armBackgroundSetup();
+            background.arm();
         }
     }
 
@@ -148,7 +135,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         }
         selected = network;
         if (network == POSITION_SECURED) {
-            armBackgroundSetup();
+            background.arm();
         }
         for (ChatsSwitcherView v : new ArrayList<>(switchers)) {
             v.setSelectedAnimated(network);
@@ -240,94 +227,6 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         if (chatId != SecuredUi.NO_CHAT) {
             // Same call as a tap on a row of the Secured list: right-hand pane on tablets.
             presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
-        }
-    }
-
-    // ---- background receiving: first use ----------------------------------------------------------------------
-
-    private static final int REQUEST_POST_NOTIFICATIONS = 7301;   // Telegram's codes: 2..22, 104, 150..211
-    private static final String UI_PREFS = "encrogram_secured_ui";
-    private static final String KEY_BG_ASKED = "background_asked";
-
-    /** Waits (through a listener, which replays the state at once) for the engine to be RUNNING with a profile. */
-    private void armBackgroundSetup() {
-        if (bgListener != null) {
-            return;
-        }
-        try {
-            final SecuredEngine engine = SecuredUi.engine();
-            if (engine == null) {
-                return;
-            }
-            bgEngine = engine;
-            bgListener = new SecuredListener() {
-                @Override
-                public void onStateChanged(EngineState state) {
-                    if (state == EngineState.RUNNING && engine.profile() != null) {
-                        // Not inside the engine's own callback (it replays the state while addListener runs).
-                        AndroidUtilities.runOnUIThread(() -> {
-                            if (bgListener != null) {
-                                stopBackgroundSetup();
-                                setUpBackground();
-                            }
-                        });
-                    }
-                }
-            };
-            engine.addListener(bgListener);
-        } catch (Throwable t) {
-            stopBackgroundSetup();
-        }
-    }
-
-    private void stopBackgroundSetup() {
-        try {
-            if (bgEngine != null && bgListener != null) {
-                bgEngine.removeListener(bgListener);
-            }
-        } catch (Throwable ignored) {
-        }
-        bgEngine = null;
-        bgListener = null;
-    }
-
-    /** Starts the service (every time, it is idempotent) and, once ever, asks for notifications and battery. */
-    private void setUpBackground() {
-        final Activity activity = getParentActivity();
-        if (activity == null) {
-            return;
-        }
-        try {
-            SecuredBackground.start(activity);
-            final android.content.SharedPreferences prefs = activity.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE);
-            if (prefs.getBoolean(KEY_BG_ASKED, false)) {
-                return;
-            }
-            prefs.edit().putBoolean(KEY_BG_ASKED, true).apply();
-            if (BatteryHelper.isIgnoringBatteryOptimizations(activity)) {
-                requestNotificationPermission(activity);
-                return;
-            }
-            final AlertDialog.Builder b = new AlertDialog.Builder(activity, SecuredResourcesProvider.get());
-            b.setTitle(activity.getString(R.string.sec_bg_title));
-            b.setMessage(activity.getString(R.string.sec_bg_text));
-            b.setPositiveButton(activity.getString(R.string.sec_bg_allow), (d, w) -> {
-                try {
-                    activity.startActivity(BatteryHelper.requestIgnoreIntent(activity));
-                } catch (Throwable ignored) {
-                }
-                requestNotificationPermission(activity);
-            });
-            b.setNegativeButton(activity.getString(R.string.sec_bg_not_now), (d, w) -> requestNotificationPermission(activity));
-            showDialog(b.create());
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void requestNotificationPermission(Activity activity) {
-        if (Build.VERSION.SDK_INT >= 33
-                && activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            activity.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_POST_NOTIFICATIONS);
         }
     }
 

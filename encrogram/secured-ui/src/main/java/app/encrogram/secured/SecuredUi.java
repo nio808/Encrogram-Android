@@ -6,6 +6,8 @@ import android.os.Handler;
 import android.os.Looper;
 
 import org.telegram.messenger.EncrogramHooks;
+import org.telegram.ui.ActionBar.BaseFragment;
+import org.telegram.ui.IntroActivity;
 
 import app.encrogram.core.api.SecuredEngine;
 
@@ -120,6 +122,38 @@ public final class SecuredUi {
 
     static void setOpenChatListener(OpenChatListener listener) {
         openChatListener = listener;
+    }
+
+    // ---- logged-out doors ------------------------------------------------------------------------------------
+
+    /** Secured's own preferences file (never Telegram's). */
+    static final String UI_PREFS = "encrogram_secured_ui";
+    private static final String KEY_SECURED_ONLY = "secured_only";
+
+    /** True once the user chose "Continue without Telegram". One SharedPreferences read; safe in onCreate. */
+    static boolean securedOnly() {
+        try {
+            return app != null && app.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).getBoolean(KEY_SECURED_ONLY, false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    static void setSecuredOnly() {
+        try {
+            if (app != null) {
+                app.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_SECURED_ONLY, true).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Telegram's own login flow (its intro, then "Start Messaging"), on top of {@code from} so Back returns.
+     * A fresh IntroActivity each time: an instance that was already shown and finished cannot be shown again.
+     */
+    static void openTelegramLogin(BaseFragment from) {
+        from.presentFragment(new IntroActivity());
     }
 
     // ---- debug self-check -------------------------------------------------------------------------------------

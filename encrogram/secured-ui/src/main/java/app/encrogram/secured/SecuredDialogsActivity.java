@@ -75,7 +75,11 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
     private enum Mode { STARTING, FAILED, PROFILE, LIST }
 
-    private final EncrogramChatsHost host;
+    private final EncrogramChatsHost host;   // null in standalone mode (root screen when Telegram is logged out)
+    private final ChatsSwitcherView.Owner owner;
+    private final SecuredBackgroundPrompt background = new SecuredBackgroundPrompt(this);
+    private ChatsSwitcherView localSwitcher;
+    private int localUnread;
     private SecuredEngine engine;
     private boolean listening;
     private boolean destroyed;
@@ -126,6 +130,72 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     SecuredDialogsActivity(EncrogramChatsHost host) {
         super();
         this.host = host;
+        this.owner = host;
+    }
+
+    /** Standalone: the root screen when no Telegram account is activated. The switcher is satisfied locally. */
+    SecuredDialogsActivity() {
+        super();
+        this.host = null;
+        this.owner = new ChatsSwitcherView.Owner() {
+            @Override
+            public int selectedNetwork() {
+                return ChatsSwitcherView.NETWORK_SECURED;
+            }
+
+            @Override
+            public void selectNetwork(int network) {
+                if (network == ChatsSwitcherView.NETWORK_TELEGRAM) {
+                    SecuredUi.openTelegramLogin(SecuredDialogsActivity.this);   // this list stays below: Back returns
+                }
+            }
+
+            @Override
+            public String telegramStatus() {
+                return null;
+            }
+
+            @Override
+            public int securedUnread() {
+                return localUnread;
+            }
+
+            @Override
+            public void attachSwitcher(ChatsSwitcherView view) {
+                localSwitcher = view;
+            }
+
+            @Override
+            public void detachSwitcher(ChatsSwitcherView view) {
+                if (localSwitcher == view) localSwitcher = null;
+            }
+        };
+    }
+
+    // ---- standalone mode: what the host does for the Secured page ---------------------------------------------
+
+    @Override
+    public boolean onFragmentCreate() {
+        if (host == null) {
+            SecuredUi.setLinkListener(this::consumePending);
+            SecuredUi.setOpenChatListener(this::consumePending);
+        }
+        return super.onFragmentCreate();
+    }
+
+    private void consumePending() {
+        if (host != null || !resumed || destroyed) {
+            return;
+        }
+        final String link = SecuredUi.takePendingLink();
+        if (link != null) {
+            setPendingLink(link);
+            showPendingLinkIfReady();
+        }
+        final Long chatId = SecuredUi.takePendingOpenChat();
+        if (chatId != null && chatId != SecuredUi.NO_CHAT) {
+            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
+        }
     }
 
     @Override
@@ -225,6 +295,10 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         super.onResume();
         resumed = true;
         ensureEngine();
+        if (host == null) {
+            background.arm();
+            consumePending();
+        }
         applyInsets();
         updateMode();
         if (mode == Mode.PROFILE) {
@@ -242,6 +316,11 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        if (host == null) {
+            SecuredUi.setLinkListener(null);
+            SecuredUi.setOpenChatListener(null);
+            background.stop();
+        }
         if (engine != null && listening) {
             listening = false;
             try {
@@ -276,7 +355,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             }
         });
         labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet));
-        final ChatsSwitcherView switcher = new ChatsSwitcherView(context, host);
+        final ChatsSwitcherView switcher = new ChatsSwitcherView(context, owner);
         actionBar.addView(switcher, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 48, Gravity.LEFT | Gravity.BOTTOM, 22, 0, 0, 4));
 
         final LinearLayout column = new LinearLayout(context);
@@ -609,7 +688,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         for (ChatSummary c : chats) {
             if (!c.getMuted() && !c.getArchived()) unread += c.getUnreadCount();
         }
-        host.setSecuredUnread(unread);
+        if (host != null) {
+            host.setSecuredUnread(unread);
+        } else {
+            localUnread = unread;
+            if (localSwitcher != null) localSwitcher.setSecuredUnread(unread);
+        }
     }
 
     // ---- list model ------------------------------------------------------------------------------------------

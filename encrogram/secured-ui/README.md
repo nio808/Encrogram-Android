@@ -10,7 +10,9 @@ All Secured screens and the "Telegram | Secured" control live here. Telegram's o
 - `ChatsSwitcherView` (+ `LockIcon`) - the "Telegram | Secured" pill, 36 dp in a 48 dp touch area, TalkBack labels per tab.
 - `SecuredDialogsActivity` - profile setup, engine states, chat list (DialogCell via CustomDialog), empty state, FAB.
 - `SecuredSheets` - invite sheet (Copy, Share) and connect sheet (checkLink, readable errors).
-- `SecuredChatActivity`, `BubbleView`, `DateView` - chat screen: own bubbles, ticks, composer from `EditTextCaption` + `ChatActivityEnterView.SendButton`.
+- `SecuredChatActivity` (+ `SecuredMessageMapper`, `SecuredChatResources`, `SecuredReactionsView`) - chat screen: Telegram's `ChatMessageCell` through the one text mapper, ticks, reactions, composer from `EditTextCaption` + `ChatActivityEnterView.SendButton`.
+- `SecuredWelcomeActivity` - logged-out start screen (`SecuredHooks.loggedOutIntro`): "Continue with Telegram" opens Telegram's intro on top (Back returns), "Continue without Telegram" saves Secured-only in our own prefs and replaces it with the standalone list.
+- Standalone mode: `new SecuredDialogsActivity()` (no host) is the root screen when Telegram is logged out. Its switcher is satisfied locally (Secured selected; tapping Telegram opens login above it). It consumes deep links and notification taps itself; `SecuredBackgroundPrompt` is the first-use background setup shared with `EncrogramChatsHost`.
 - `SecuredResourcesProvider` - Encro Indigo overrides, Secured screens only. `Kit` - small view helpers.
 - Strings: `res/values/secured_strings.xml` (plain Android resources).
 
@@ -26,7 +28,6 @@ The engine is created and started lazily when the Secured page is first resumed.
 - Telegram unread counter on the Telegram segment - ChatsSwitcherView.java.
 - Chats-tab `openFolder` should switch back to Telegram - needs a hook in MainTabsActivity (budget) - EncrogramChatsHost.java.
 - Deep link only handled when Chats tab is resumed; handle other tabs/screens - EncrogramChatsHost.java.
-- Secured is unreachable without a Telegram login (no startupRoute hook yet) - SecuredHooks.java.
 - Telegram "Connecting..." tap action (proxy setup) is dropped when routed to the dot - SecuredHooks.java.
 - "N stories" title is suppressed while the control is shown - SecuredHooks.java.
 - Disable text-style formatting in `EditTextCaption` (uses MediaDataController locally) - SecuredChatActivity.java.

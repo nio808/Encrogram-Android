@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_welcome_title">Encrogram</string>
+    <string name="sec_welcome_subtitle">Telegram and a private Secured messenger in one app.</string>
+    <string name="sec_welcome_telegram">Continue with Telegram</string>
+    <string name="sec_welcome_without">Continue without Telegram</string>
+    <string name="sec_welcome_unofficial">Unofficial app, not affiliated with Telegram.</string>
+</resources>
