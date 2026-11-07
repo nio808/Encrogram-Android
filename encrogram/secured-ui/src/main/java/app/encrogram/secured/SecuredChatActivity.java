@@ -46,6 +46,7 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.FlagSecureReason;
 import org.telegram.messenger.ChatMessageSharedResources;
 import org.telegram.messenger.Emoji;
+import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.tgnet.TLRPC;
@@ -256,13 +257,33 @@ public class SecuredChatActivity extends BaseFragment {
             return false;
         }
         engine.addListener(listener);
+        NotificationCenter.getGlobalInstance().addObserver(emojiLoaded, NotificationCenter.emojiLoaded);
         return super.onFragmentCreate();
+    }
+
+    // Telegram's bundled emoji images load lazily and announce it with this local event (no data, no network):
+    // redraw the open screen and the reaction picker, as ChatActivity does, or they stay grey placeholders.
+    private View reactionPicker;
+    private final NotificationCenter.NotificationCenterDelegate emojiLoaded = (id, account, args) -> {
+        if (id != NotificationCenter.emojiLoaded) return;
+        invalidateTree(fragmentView);
+        invalidateTree(reactionPicker);
+    };
+
+    private static void invalidateTree(View v) {
+        if (v == null) return;
+        v.invalidate();
+        if (v instanceof ViewGroup) {
+            final ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) invalidateTree(g.getChildAt(i));
+        }
     }
 
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
         AndroidUtilities.cancelRunOnUIThread(hideFloatingDate);
+        NotificationCenter.getGlobalInstance().removeObserver(emojiLoaded, NotificationCenter.emojiLoaded);
         if (engine != null) {
             engine.removeListener(listener);
         }
@@ -292,6 +313,22 @@ public class SecuredChatActivity extends BaseFragment {
 
             @Override
             protected boolean getNewDrawableMotion() {
+                return false;
+            }
+
+            // This root starts below the header (not edge-to-edge), so the wallpaper must not skip a header height again.
+            @Override
+            protected boolean isActionBarVisible() {
+                return false;
+            }
+
+            @Override
+            protected boolean isStatusBarVisible() {
+                return false;
+            }
+
+            @Override
+            protected boolean useRootView() {
                 return false;
             }
         };
@@ -1045,6 +1082,7 @@ public class SecuredChatActivity extends BaseFragment {
             });
             row.addView(t, LayoutHelper.createLinear(34, 36));
         }
+        reactionPicker = row;
         return row;
     }
 

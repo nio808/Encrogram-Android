@@ -107,7 +107,6 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     public void onResume() {
         super.onResume();
         resumed = true;
-        SecuredUi.debugSelfCheck(getParentActivity(), currentAccount);
         onLinkAvailable();
         onOpenChatAvailable();
         if (selected == POSITION_SECURED) {

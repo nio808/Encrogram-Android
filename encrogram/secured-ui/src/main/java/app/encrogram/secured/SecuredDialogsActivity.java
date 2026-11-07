@@ -300,6 +300,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onResume() {
         super.onResume();
         resumed = true;
+        SecuredUi.debugSelfCheck(getParentActivity(), currentAccount);
         // Secured screens stay out of Recents thumbnails and screenshots (SPEC: protect screen, on by default).
         if (flagSecure == null && getParentActivity() != null) {
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);

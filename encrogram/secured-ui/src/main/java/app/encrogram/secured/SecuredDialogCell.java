@@ -92,12 +92,15 @@ final class SecuredDialogCell extends DialogCell {
                 outlineHalf = new OutlineTick(oldHalf.getIntrinsicWidth(), oldHalf.getIntrinsicHeight());
                 outlineFull = new OutlineTick(oldFull.getIntrinsicWidth(), oldFull.getIntrinsicHeight());
             }
-            final int color = Kit.color(Theme.key_chats_sentReadCheck);
+            final int color = Kit.color(Theme.key_chats_sentCheck); // not the green "read" colour: Secured has no read state
             outlineHalf.setColor(color);
             outlineFull.setColor(color);
             Theme.dialogs_halfCheckDrawable = outlineHalf;
             Theme.dialogs_checkReadDrawable = outlineFull;
         }
+        // DialogCell paints unread badges with Telegram's global paint; Secured badges use Encro Indigo (design rule).
+        final int oldCount = Theme.dialogs_countPaint != null ? Theme.dialogs_countPaint.getColor() : 0;
+        if (Theme.dialogs_countPaint != null) Theme.dialogs_countPaint.setColor(SecuredResourcesProvider.accentFill());
         try {
             super.onDraw(canvas);
         } finally {
@@ -105,6 +108,7 @@ final class SecuredDialogCell extends DialogCell {
                 Theme.dialogs_halfCheckDrawable = oldHalf;
                 Theme.dialogs_checkReadDrawable = oldFull;
             }
+            if (Theme.dialogs_countPaint != null) Theme.dialogs_countPaint.setColor(oldCount);
         }
         if (tick == ChatRowMapper.Tick.FAILED && unread == 0) {
             drawFailedBadge(canvas);
