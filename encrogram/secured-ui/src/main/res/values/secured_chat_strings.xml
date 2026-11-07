@@ -16,4 +16,26 @@
     <string name="secchat_quote_not_loaded">The original message is not loaded</string>
     <string name="secchat_reaction_a11y">%1$s, %2$d</string>
     <string name="secchat_reaction_mine_a11y">%1$s, %2$d, including yours</string>
+    <string name="secchat_search_hint">Search in this chat</string>
+    <string name="secchat_search_none">No matching messages</string>
+    <string name="secchat_search_emoji">Search for words or numbers. Emoji alone can’t be searched.</string>
+    <string name="secchat_disappear">Disappearing messages</string>
+    <string name="secchat_disappear_note">Messages in this chat are deleted after the time you choose. This only takes effect if %1$s’s app allows disappearing messages too.</string>
+    <string name="secchat_disappear_off">Off</string>
+    <string name="secchat_disappear_1d">1 day</string>
+    <string name="secchat_disappear_1w">1 week</string>
+    <string name="secchat_disappear_1m">1 month</string>
+    <string name="secchat_disappear_saved">Timer saved on your side. It applies only if %1$s’s app allows it.</string>
+    <string name="secchat_verify_menu">Verify security code</string>
+    <string name="secchat_verify_title">Security code</string>
+    <string name="secchat_verify_text">Compare this code with %1$s’s screen, in person or on a call you trust. If it matches, mark as verified.</string>
+    <string name="secchat_verify_mark">Mark as verified</string>
+    <string name="secchat_verify_clear">Clear verification</string>
+    <string name="secchat_verify_is_verified">You marked %1$s as verified.</string>
+    <string name="secchat_verify_done">Marked as verified</string>
+    <string name="secchat_verify_cleared">Verification cleared</string>
+    <string name="secchat_verify_failed">The code did not match</string>
+    <string name="secchat_clear_title">Clear history</string>
+    <string name="secchat_clear_text">All messages in this chat are removed from this phone. %1$s keeps their own copy.</string>
+    <string name="secchat_clear_confirm">Clear</string>
 </resources>
