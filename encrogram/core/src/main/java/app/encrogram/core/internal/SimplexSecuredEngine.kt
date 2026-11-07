@@ -3,9 +3,12 @@ package app.encrogram.core.internal
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import app.encrogram.core.api.ChatAction
 import app.encrogram.core.api.ChatSummary
 import app.encrogram.core.api.EngineState
+import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
+import app.encrogram.core.api.MessagePage
 import app.encrogram.core.api.RelayConfig
 import app.encrogram.core.api.SecuredCallback
 import app.encrogram.core.api.SecuredEngine
@@ -16,6 +19,7 @@ import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredProfile
 import app.encrogram.core.api.SecuredResult
 import app.encrogram.core.internal.ErrorMapper.Op
+import app.encrogram.core.internal.InputRules.MAX_PAGE
 import app.encrogram.core.internal.SecuredLog.Ev
 import chat.simplex.common.platform.chatCloseStore
 import chat.simplex.common.platform.chatMigrateInit
@@ -74,9 +78,16 @@ internal class SimplexSecuredEngine(
     private var userId = 0L
     private var chatStarted = false
     private val chatCache = HashMap<Long, ChatSummary>()
+    /** Item id of each cached row's last message, so status and edit events can update the row. */
+    private val lastItemIds = HashMap<Long, Long>()
+    /** Chats where disappearing messages are on for both sides (marking read starts received timers). */
+    private val timedChats = HashSet<Long>()
     private var receiver: Receiver? = null
 
     private val dataDir: File get() = File(appContext.noBackupFilesDir, DATA_DIR)
+
+    /** Local-only archive flags, in the same no-backup folder as the databases. */
+    private val archive: ArchiveStore by lazy { ArchiveStore(File(dataDir, ARCHIVE_FILE)) }
 
     /** Present from profile creation until our servers have been verified once: start with the network locked. */
     private val lockdownMarker: File get() = File(dataDir, LOCKDOWN_MARKER)
@@ -110,17 +121,49 @@ internal class SimplexSecuredEngine(
     override fun createProfile(displayName: String, callback: SecuredCallback<SecuredProfile>) =
         post(callback) { createProfileOnEngine(displayName, callback) }
 
+    override fun updateProfile(displayName: String, callback: SecuredCallback<SecuredProfile>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val name = validName(displayName) ?: return@post err(callback, nameError())
+        val local = activeProfileJson() ?: return@post err(callback, ErrorMapper.engine("active_user"))
+        // Read-modify-write: the core replaces the whole profile (G4). Our preferences ride along.
+        val update = CoreJson.profileUpdate(local, name) ?: return@post ok(callback, SecuredProfile(name))
+        when (val r = send(Commands.updateProfile(userId, update))) {
+            is CoreReply.Result -> when (r.type) {
+                "userProfileUpdated", "userProfileNoChange" -> {
+                    SecuredLog.i(Ev.PROFILE_UPDATED, r.type)
+                    val profile = SecuredProfile(name)
+                    currentProfile = profile
+                    ok(callback, profile)
+                }
+                else -> err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.PROFILE))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
     override fun chats(): List<ChatSummary> = chatSnapshot
 
-    override fun messages(chatId: Long, limit: Int, callback: SecuredCallback<List<SecuredMessage>>) = post(callback) {
+    override fun messages(chatId: Long, limit: Int, callback: SecuredCallback<List<SecuredMessage>>) =
+        messages(chatId, MessagePage(limit), callback)
+
+    override fun messages(chatId: Long, page: MessagePage, callback: SecuredCallback<List<SecuredMessage>>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        val want = limit.coerceIn(1, MAX_PAGE)
-        // Service items (e.g. "connected", encryption notices) count against the engine's page, so ask for more.
-        when (val r = send(Commands.getChat(chatId, minOf(want + 50, MAX_PAGE * 2)))) {
+        if (listOfNotNull(page.beforeId, page.afterId, page.aroundId).size > 1) {
+            return@post err(callback, ErrorMapper.invalid("Only one of before, after and around can be set."))
+        }
+        val search = page.search?.takeIf { it.isNotBlank() }?.let { raw ->
+            if (raw.length > InputRules.MAX_SEARCH_CHARS) return@post err(callback, ErrorMapper.invalid("The search text is too long."))
+            InputRules.searchQuery(raw)
+                ?: return@post err(callback, ErrorMapper.notAllowed("Search needs some text: emoji alone can't be searched yet."))
+        }
+        val want = page.count.coerceIn(1, MAX_PAGE)
+        val cmd = Commands.getChat(chatId, InputRules.corePageCount(page, want), page.beforeId, page.afterId, page.aroundId, search)
+        when (val r = send(cmd)) {
             is CoreReply.Result ->
                 if (r.type == "apiChat") {
-                    val msgs = CoreJson.parseChatItemsOfChat(r.body).filter { it.isMessage }.takeLast(want).map { it.toMessage() }
-                    ok(callback, msgs)
+                    val items = InputRules.pageWindow(CoreJson.parseChatItemsOfChat(r.body), page, want)
+                    ok(callback, items.map { MessageMapper.toMessage(it) })
                 } else {
                     err(callback, unexpected(r))
                 }
@@ -185,19 +228,70 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    override fun sendText(chatId: Long, text: String, callback: SecuredCallback<SecuredMessage>) = post(callback) {
+    override fun sendText(chatId: Long, text: String, callback: SecuredCallback<SecuredMessage>) =
+        sendMessage(chatId, text, null, callback)
+
+    override fun sendMessage(chatId: Long, text: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        if (text.isBlank()) return@post err(callback, SecuredError(SecuredError.Kind.UNKNOWN, "The message is empty."))
-        if (encodedTextBytes(text) > MAX_TEXT_BYTES) return@post err(callback, SecuredError(SecuredError.Kind.UNKNOWN, "The message is too long."))
-        when (val r = send(Commands.sendText(chatId, text))) {
+        if (text.isBlank()) return@post err(callback, ErrorMapper.invalid("The message is empty."))
+        if (!InputRules.textFits(text)) return@post err(callback, ErrorMapper.invalid(ErrorMapper.TOO_LONG))
+        if (replyToId != null) {
+            val quoted = itemOrErr(chatId, replyToId, callback) ?: return@post
+            if (quoted.deleted) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
+            // The core copies the whole quoted text into the message (it can't be shortened), so it uses up
+            // part of the body cap.
+            if (!InputRules.replyFits(text, quoted.text)) {
+                return@post err(callback, ErrorMapper.invalid("This reply is too long. Shorten it, or send it without the quote."))
+            }
+        }
+        when (val r = send(Commands.sendText(chatId, text, replyToId))) {
             is CoreReply.Result -> {
                 val item = if (r.type == "newChatItems") CoreJson.parseChatItems(r.body).firstOrNull { it.chatId == chatId } else null
                 if (item == null) return@post err(callback, unexpected(r))
-                ok(callback, item.toMessage())
+                ok(callback, MessageMapper.toMessage(item))
                 applyNewItems(listOf(item))
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.SEND))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    override fun itemAction(chatId: Long, messageIds: List<Long>, action: ItemAction, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val ids = messageIds.distinct()
+        if (ids.isEmpty() || ids.size > InputRules.MAX_ITEM_IDS) {
+            return@post err(callback, ErrorMapper.invalid("Select 1 to ${InputRules.MAX_ITEM_IDS} messages."))
+        }
+        if (chatCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
+        when (action) {
+            is ItemAction.Edit -> editOnEngine(chatId, ids, action.newText, callback)
+            ItemAction.DeleteForMe -> deleteOnEngine(chatId, ids, Commands.DeleteMode.INTERNAL, callback)
+            ItemAction.DeleteForEveryone -> deleteOnEngine(chatId, ids, Commands.DeleteMode.BROADCAST, callback)
+            is ItemAction.React -> reactOnEngine(chatId, ids, action, callback)
+            is ItemAction.ForwardTo -> forwardOnEngine(chatId, ids, action.toChatId, callback)
+        }
+    }
+
+    override fun chatAction(chatId: Long, action: ChatAction, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        if (chatCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
+        when (action) {
+            is ChatAction.SetPinned ->
+                updateChatSettings(chatId, "pin", callback) { it.put("favorite", action.pinned) }
+            is ChatAction.SetMuted ->
+                updateChatSettings(chatId, "mute", callback) { it.put("enableNtfs", if (action.muted) "none" else "all") }
+            is ChatAction.SetArchived -> setArchivedOnEngine(chatId, action.archived, callback)
+            ChatAction.ClearHistory -> chatCommand("clear", Commands.clearChat(chatId), "chatCleared", callback)
+            // The reload that follows drops the chat's archive flag (ArchiveStore.retainOnly).
+            is ChatAction.Delete -> chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback)
+            is ChatAction.SetDisappearing -> {
+                val ttl = action.ttlSeconds
+                if (ttl != null && !InputRules.ttlAllowed(ttl)) {
+                    return@post err(callback, ErrorMapper.invalid("Choose a timer between 1 second and 1 year."))
+                }
+                val contact = contactOrErr(chatId, callback) ?: return@post
+                chatCommand("disappearing", Commands.setContactPrefs(chatId, CoreJson.contactPrefsUpdate(contact, ttl)), "contactPrefsUpdated", callback)
+            }
         }
     }
 
@@ -210,8 +304,194 @@ internal class SimplexSecuredEngine(
                 chatCache[chatId] = s.copy(unreadCount = 0)
                 publishChats()
                 notifyChatsChanged()
+                // Reading starts the countdown of received disappearing messages (APIChatRead).
+                if (chatId in timedChats) reportStartedTimers(chatId, s.unreadCount)
             }
         }
+    }
+
+    override fun securityCode(chatId: Long, callback: SecuredCallback<String>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        when (val r = send(Commands.getCode(chatId))) {
+            is CoreReply.Result -> {
+                val code = if (r.type == "contactCode") CoreJson.contactCode(r.body) else null
+                if (code == null) return@post err(callback, unexpected(r))
+                ok(callback, code)
+                // The core clears the verified mark here when the keys changed since verification.
+                val verified = CoreJson.parseContact(r.body.optJSONObject("contact"))?.verified
+                if (verified != null && verified != chatCache[chatId]?.verified) refreshChats(notify = true)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.VERIFY))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    override fun verifyContact(chatId: Long, code: String?, callback: SecuredCallback<Boolean>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val checked = code?.let { InputRules.securityCode(it) ?: return@post err(callback, ErrorMapper.invalid("A security code has only digits and spaces.")) }
+        when (val r = send(Commands.verifyCode(chatId, checked))) {
+            is CoreReply.Result -> {
+                if (r.type != "connectionVerified") return@post err(callback, unexpected(r))
+                ok(callback, checked != null && CoreJson.connectionVerified(r.body))
+                refreshChats(notify = true)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.VERIFY))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    // =============================================================================================================
+    // Item and chat actions (engine thread)
+    // =============================================================================================================
+
+    private fun editOnEngine(chatId: Long, ids: List<Long>, text: String, callback: SecuredCallback<Unit>) {
+        val id = ids.singleOrNull() ?: return err(callback, ErrorMapper.invalid("Edit one message at a time."))
+        if (text.isBlank()) return err(callback, ErrorMapper.invalid("The message is empty."))
+        if (!InputRules.textFits(text)) return err(callback, ErrorMapper.invalid(ErrorMapper.TOO_LONG))
+        val item = itemOrErr(chatId, id, callback) ?: return
+        // meta.editable: our own text message, under 24 h, not forwarded, not deleted.
+        if (!MessageMapper.toMessage(item).canEdit) return refuse(callback, "edit", ErrorMapper.CANT_EDIT)
+        when (val r = send(Commands.updateItem(chatId, id, text))) {
+            is CoreReply.Result -> when (r.type) {
+                "chatItemUpdated" -> {
+                    SecuredLog.i(Ev.ITEM_ACTION, "edit")
+                    ok(callback, Unit)
+                    CoreJson.parseAChatItem(r.body.optJSONObject("chatItem"))?.let { applyItemUpdated(it) }
+                }
+                "chatItemNotChanged" -> ok(callback, Unit)
+                else -> err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.EDIT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /** `broadcast` sends x.msg.del; with fullDelete on for both, the rows go on both sides, else they are marked. */
+    private fun deleteOnEngine(chatId: Long, ids: List<Long>, mode: Commands.DeleteMode, callback: SecuredCallback<Unit>) {
+        when (val r = send(Commands.deleteItems(chatId, ids, mode))) {
+            is CoreReply.Result -> {
+                if (r.type != "chatItemsDeleted") return err(callback, unexpected(r))
+                SecuredLog.i(Ev.ITEM_ACTION, mode.word, ids.size)
+                ok(callback, Unit)
+                applyDeletions(CoreJson.parseDeletions(r.body))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.DELETE))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    private fun reactOnEngine(chatId: Long, ids: List<Long>, action: ItemAction.React, callback: SecuredCallback<Unit>) {
+        val id = ids.singleOrNull() ?: return err(callback, ErrorMapper.invalid("React to one message at a time."))
+        if (!InputRules.reactionAllowed(action.emoji)) return refuse(callback, "react_unknown", ErrorMapper.CANT_REACT)
+        val item = itemOrErr(chatId, id, callback) ?: return
+        if (item.deleted || !item.shared) return refuse(callback, "react_item", ErrorMapper.CANT_REACT)
+        val mine = item.reactions.filter { it.mine }
+        // The core errors on adding a reaction twice or removing an absent one: already the wanted state.
+        if (mine.any { it.emoji == action.emoji } == action.add) return ok(callback, Unit)
+        if (action.add && mine.size >= InputRules.MAX_OWN_REACTIONS) {
+            return refuse(callback, "react_limit", "You can add up to ${InputRules.MAX_OWN_REACTIONS} reactions to a message.")
+        }
+        when (val r = send(Commands.reaction(chatId, id, action.add, action.emoji))) {
+            is CoreReply.Result -> {
+                if (r.type != "chatItemReaction") return err(callback, unexpected(r))
+                SecuredLog.i(Ev.ITEM_ACTION, if (action.add) "react_on" else "react_off")
+                ok(callback, Unit)
+                CoreJson.parseReactionItem(r.body)?.let { emitChanged(listOf(it)) }
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.REACT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    private fun forwardOnEngine(chatId: Long, ids: List<Long>, toChatId: Long, callback: SecuredCallback<Unit>) {
+        if (chatCache[toChatId] == null) return err(callback, ErrorMapper.chatGone())
+        when (val r = send(Commands.forward(toChatId, chatId, ids))) {
+            is CoreReply.Result -> {
+                if (r.type != "newChatItems") return err(callback, unexpected(r))
+                val items = CoreJson.parseChatItems(r.body).filter { it.chatId == toChatId }
+                val copies = items.filter { it.isMessage }.map { MessageMapper.toMessage(it) }
+                if (copies.isEmpty()) return refuse(callback, "forward_none", "These messages can't be forwarded.")
+                SecuredLog.i(Ev.ITEM_ACTION, "forward", copies.size)
+                ok(callback, Unit)
+                applyNewItems(items)
+                main.post { for (m in copies) for (l in listeners) l.onMessageReceived(m) }
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.FORWARD))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /** `/_settings` replaces all of ChatSettings: read the current one, change one field, send it all back. */
+    private fun updateChatSettings(chatId: Long, tag: String, callback: SecuredCallback<Unit>, edit: (JSONObject) -> Unit) {
+        val contact = contactOrErr(chatId, callback) ?: return
+        chatCommand(tag, Commands.chatSettings(chatId, CoreJson.chatSettingsUpdate(contact, edit)), "cmdOk", callback)
+    }
+
+    /** Local only: never sent. */
+    private fun setArchivedOnEngine(chatId: Long, archived: Boolean, callback: SecuredCallback<Unit>) {
+        if (!archive.set(chatId, archived)) return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE))
+        chatCache[chatId]?.let { chatCache[chatId] = it.copy(archived = archived) }
+        SecuredLog.i(Ev.CHAT_ACTION, "archive")
+        publishChats()
+        ok(callback, Unit)
+        notifyChatsChanged()
+    }
+
+    /** Sends a chat command that answers [expected]; on success reloads the chat list (onChatsChanged). */
+    private fun chatCommand(tag: String, cmd: String, expected: String, callback: SecuredCallback<Unit>) {
+        when (val r = send(cmd)) {
+            is CoreReply.Result -> {
+                if (r.type != expected) return err(callback, unexpected(r))
+                SecuredLog.i(Ev.CHAT_ACTION, tag)
+                ok(callback, Unit)
+                refreshChats(notify = true)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /** The contact as stored now (for read-modify-write), or null after reporting an error to [callback]. */
+    private fun <T> contactOrErr(chatId: Long, callback: SecuredCallback<T>): JSONObject? {
+        when (val r = send(Commands.getChat(chatId, 1))) {
+            is CoreReply.Result -> {
+                if (r.type == "apiChat") CoreJson.contactOfChat(r.body)?.let { return it }
+                err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        return null
+    }
+
+    /** One message of a chat as stored now, or null after reporting an error to [callback]. */
+    private fun <T> itemOrErr(chatId: Long, itemId: Long, callback: SecuredCallback<T>): CoreItem? {
+        when (val r = send(Commands.getChat(chatId, 1, aroundId = itemId))) {
+            is CoreReply.Result -> {
+                if (r.type != "apiChat") {
+                    err(callback, unexpected(r))
+                    return null
+                }
+                CoreJson.parseChatItemsOfChat(r.body).firstOrNull { it.itemId == itemId && it.isMessage }?.let { return it }
+                err(callback, ErrorMapper.messageGone())
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.LOAD))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        return null
+    }
+
+    private fun <T> refuse(callback: SecuredCallback<T>, tag: String, message: String) {
+        SecuredLog.i(Ev.ACTION_REFUSED, tag)
+        err(callback, ErrorMapper.notAllowed(message))
+    }
+
+    /** After a read: received timed messages now have a deleteAt. Bounded to the unread ones. */
+    private fun reportStartedTimers(chatId: Long, unread: Int) {
+        val r = send(Commands.getChat(chatId, minOf(unread + 50, MAX_PAGE * 2)))
+        if (r !is CoreReply.Result || r.type != "apiChat") return
+        val started = CoreJson.parseChatItemsOfChat(r.body).filter { it.isMessage && !it.outgoing && it.expiresAtMs != null }
+        emitChanged(started)
     }
 
     // =============================================================================================================
@@ -252,16 +532,11 @@ internal class SimplexSecuredEngine(
             EngineState.RUNNING -> return err(callback, SecuredError(SecuredError.Kind.ENGINE, "A Secured profile already exists."))
             else -> return err(callback, ErrorMapper.notRunning(state))
         }
-        val displayName = name.trim()
-        // The core counts characters (code points), not UTF-16 units: mkValidName keeps at most 50.
-        val nameLength = displayName.codePointCount(0, displayName.length)
-        if (nameLength == 0 || nameLength > MAX_NAME_CHARS) {
-            return err(callback, SecuredError(SecuredError.Kind.UNKNOWN, "Enter a name of 1 to $MAX_NAME_CHARS characters."))
-        }
+        val displayName = validName(name) ?: return err(callback, nameError())
         // Before the user exists: from here until our servers are verified, every start locks the network first.
         if (!markFirstRunLockdown()) {
             SecuredLog.e(Ev.CONFIG_STEP_FAILED, "lockdown_mark")
-            return err(callback, SecuredError(SecuredError.Kind.ENGINE, "Secured storage couldn't be written. Try again."))
+            return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE))
         }
         setState(EngineState.STARTING)
         val r = send(Commands.createUser(displayName))
@@ -281,6 +556,45 @@ internal class SimplexSecuredEngine(
             val f = StartFailure(ErrorMapper.engine("internal"), "internal")
             failClosed(f)
             err(callback, f.error)
+        }
+    }
+
+    /** The trimmed name, or null. The core counts characters (code points): mkValidName keeps at most 50. */
+    private fun validName(name: String): String? {
+        val displayName = name.trim()
+        val nameLength = displayName.codePointCount(0, displayName.length)
+        return if (nameLength == 0 || nameLength > MAX_NAME_CHARS) null else displayName
+    }
+
+    private fun nameError() = ErrorMapper.invalid("Enter a name of 1 to $MAX_NAME_CHARS characters.")
+
+    /** The active user's LocalProfile JSON as stored now (`/u`), or null. */
+    private fun activeProfileJson(): JSONObject? {
+        val r = send(Commands.SHOW_ACTIVE_USER)
+        if (r !is CoreReply.Result || r.type != "activeUser") return null
+        val user = r.body.optJSONObject("user") ?: return null
+        if (user.optLong("userId") != userId) return null
+        return user.optJSONObject("profile")
+    }
+
+    /**
+     * Profiles created before v2 lack fullDelete=yes and calls=no: merge them in once, with a read-modify-write
+     * `/_profile` that keeps every other field. A no-op when they are already there (every new profile). Runs
+     * after the relay lock-down is verified, because it sends the profile to every contact. Never fails the
+     * start: on any failure it is simply tried again at the next start.
+     */
+    private fun mergeSecuredPreferences() {
+        try {
+            val local = activeProfileJson() ?: return SecuredLog.w(Ev.PROFILE_PREFS_FAILED, "active_user")
+            val update = CoreJson.profileUpdate(local) ?: return
+            val r = send(Commands.updateProfile(userId, update))
+            if (r is CoreReply.Result && (r.type == "userProfileUpdated" || r.type == "userProfileNoChange")) {
+                SecuredLog.i(Ev.PROFILE_PREFS_MERGED, r.type)
+            } else {
+                SecuredLog.w(Ev.PROFILE_PREFS_FAILED, (r as? CoreReply.Result)?.type ?: (r as? CoreReply.Error)?.error?.tag)
+            }
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.PROFILE_PREFS_FAILED, t)
         }
     }
 
@@ -424,6 +738,9 @@ internal class SimplexSecuredEngine(
                 if (!ServerConfigPlanner.networkConfigOk(net.body)) throw configFailure("network_unlock_verify", net)
                 clearFirstRunLockdown()
             }
+
+            // 7. Our chat preferences in the profile (existing users, once). Not fatal.
+            mergeSecuredPreferences()
         } catch (t: Throwable) {
             val f = t as? StartFailure ?: run {
                 SecuredLog.crash(Ev.START_FAILED, t)
@@ -502,6 +819,8 @@ internal class SimplexSecuredEngine(
         ctrl = 0L
         userId = 0L
         chatCache.clear()
+        lastItemIds.clear()
+        timedChats.clear()
         publishChats()
         setState(EngineState.NOT_STARTED)
         notifyChatsChanged()
@@ -583,14 +902,23 @@ internal class SimplexSecuredEngine(
                 "newChatItems" -> {
                     val items = CoreJson.parseChatItems(reply.body)
                     applyNewItems(items)
-                    val incoming = items.filter { it.isMessage && !it.outgoing }.map { it.toMessage() }
+                    val incoming = items.filter { it.isMessage && !it.outgoing }.map { MessageMapper.toMessage(it) }
                     if (incoming.isNotEmpty()) main.post { for (m in incoming) for (l in listeners) l.onMessageReceived(m) }
                 }
                 "chatItemsStatusesUpdated" -> {
                     val items = CoreJson.parseChatItems(reply.body).filter { it.isMessage }
                     if (items.isNotEmpty()) {
                         main.post { for (i in items) for (l in listeners) l.onMessageStatusChanged(i.chatId, i.itemId, i.status) }
+                        applyStatuses(items)
                     }
+                }
+                // An edit, by us on another path or by the contact.
+                "chatItemUpdated" -> CoreJson.parseAChatItem(reply.body.optJSONObject("chatItem"))?.let { applyItemUpdated(it) }
+                "chatItemReaction" -> CoreJson.parseReactionItem(reply.body)?.let { emitChanged(listOf(it)) }
+                // Deleted by the contact (byUser=false) or a disappearing message that expired (timed=true).
+                "chatItemsDeleted" -> {
+                    SecuredLog.i(Ev.EVENT, if (reply.body.optBoolean("timed", false)) "chatItemsDeleted.timed" else reply.type)
+                    applyDeletions(CoreJson.parseDeletions(reply.body))
                 }
                 in CHAT_LIST_EVENTS -> {
                     SecuredLog.i(Ev.EVENT, reply.type)
@@ -611,10 +939,17 @@ internal class SimplexSecuredEngine(
     private fun refreshChats(notify: Boolean) {
         val r = send(Commands.getChats(userId))
         if (r !is CoreReply.Result || r.type != "apiChats") return
+        val chats = CoreJson.parseChats(r.body)
+        if (!archive.retainOnly(chats.mapTo(HashSet()) { it.contact.contactId })) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "prune")
         chatCache.clear()
-        for (chat in CoreJson.parseChats(r.body)) {
-            if (chat.contact.isContactCard || chat.contact.removed) continue
-            chatCache[chat.contact.contactId] = summaryOf(chat)
+        lastItemIds.clear()
+        timedChats.clear()
+        for (chat in chats) {
+            val c = chat.contact
+            if (c.isContactCard || c.removed) continue
+            chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId))
+            chat.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[c.contactId] = it.itemId }
+            if (c.timedEnabled) timedChats.add(c.contactId)
         }
         SecuredLog.i(Ev.CHATS_LOADED, count = chatCache.size)
         publishChats()
@@ -632,11 +967,8 @@ internal class SimplexSecuredEngine(
                 continue
             }
             if (!item.isMessage) continue
-            chatCache[item.chatId] = row.copy(
-                lastMessageText = item.text,
-                lastMessageTimeMs = if (item.timeMs > 0) item.timeMs else row.lastMessageTimeMs,
-                unreadCount = row.unreadCount + if (item.unread) 1 else 0,
-            )
+            chatCache[item.chatId] = MessageMapper.withNewItem(row, item)
+            lastItemIds[item.chatId] = item.itemId
             changed = true
         }
         if (unknownChat) {
@@ -647,25 +979,54 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    private fun summaryOf(chat: CoreChat): ChatSummary {
-        val c = chat.contact
-        val lastMessage = chat.lastItem?.takeIf { it.isMessage }
-        val time = lastMessage?.timeMs?.takeIf { it > 0 } ?: maxOf(c.activityTimeMs, chat.lastItem?.timeMs ?: 0L)
-        return ChatSummary(
-            chatId = c.contactId,
-            displayName = c.displayName,
-            lastMessageText = lastMessage?.text,
-            lastMessageTimeMs = time,
-            unreadCount = chat.unreadCount,
-            verified = c.verified,
-            ready = c.ready,
-        )
+    /** Delivery ticks of a row's last message. */
+    private fun applyStatuses(items: List<CoreItem>) {
+        var changed = false
+        for (item in items) {
+            if (!item.outgoing || lastItemIds[item.chatId] != item.itemId) continue
+            val row = chatCache[item.chatId] ?: continue
+            if (row.lastMessageStatus == item.status) continue
+            chatCache[item.chatId] = row.copy(lastMessageStatus = item.status)
+            changed = true
+        }
+        if (changed) {
+            publishChats()
+            notifyChatsChanged()
+        }
+    }
+
+    /** An edited (or otherwise updated) message: tell the UI; reload the list when it is a row's last message. */
+    private fun applyItemUpdated(item: CoreItem) {
+        if (!item.isMessage) return
+        emitChanged(listOf(item))
+        if (lastItemIds[item.chatId] == item.itemId) refreshChats(notify = true)
+    }
+
+    /** Fully deleted -> onMessagesRemoved; only marked deleted -> onMessageChanged (deleted=true, text ""). */
+    private fun applyDeletions(deletions: List<CoreDeletion>) {
+        if (deletions.isEmpty()) return
+        val removed = LinkedHashMap<Long, MutableList<Long>>()
+        val marked = ArrayList<CoreItem>()
+        for (d in deletions) {
+            val now = d.replacement
+            if (now == null || !now.isMessage) removed.getOrPut(d.chatId) { ArrayList() }.add(d.itemId) else marked.add(now)
+        }
+        if (removed.isNotEmpty()) {
+            val gone = removed.mapValues { it.value.toList() }
+            main.post { for ((chatId, ids) in gone) for (l in listeners) l.onMessagesRemoved(chatId, ids) }
+        }
+        emitChanged(marked)
+        if (deletions.any { lastItemIds[it.chatId] == it.itemId }) refreshChats(notify = true)
+    }
+
+    private fun emitChanged(items: List<CoreItem>) {
+        val messages = items.filter { it.isMessage }.map { MessageMapper.toMessage(it) }
+        if (messages.isEmpty()) return
+        main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
     }
 
     private fun publishChats() {
-        chatSnapshot = chatCache.values.sortedWith(
-            compareByDescending<ChatSummary> { it.lastMessageTimeMs }.thenByDescending { it.chatId },
-        )
+        chatSnapshot = MessageMapper.sortChats(chatCache.values)
     }
 
     // =============================================================================================================
@@ -769,45 +1130,16 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    private fun CoreItem.toMessage() = SecuredMessage(chatId, itemId, outgoing, text, timeMs, status)
-
-    /**
-     * UTF-8 bytes of [text] once the core JSON-encodes it into the message body (aeson writes non-ASCII as raw
-     * UTF-8 and escapes quotes, backslashes and control characters). Lone surrogates become U+FFFD (3 bytes).
-     */
-    private fun encodedTextBytes(text: String): Int {
-        var n = 0
-        var i = 0
-        while (i < text.length) {
-            val cp = text.codePointAt(i)
-            n += when {
-                cp == '"'.code || cp == '\\'.code || cp == '\n'.code || cp == '\r'.code || cp == '\t'.code -> 2
-                cp < 0x20 -> 6
-                cp < 0x80 -> 1
-                cp < 0x800 -> 2
-                cp < 0x10000 -> 3
-                else -> 4
-            }
-            i += Character.charCount(cp)
-        }
-        return n
-    }
-
     private companion object {
         const val DATA_DIR = "encrogram-secured"
         const val DB_PREFIX = "secured"
         const val LOCKDOWN_MARKER = "first_run_lockdown"
         const val MIGRATION_CONFIRM = "yesUp"
         const val RECV_WAIT_MICROS = 2_000_000
-        const val MAX_PAGE = 500
         /** Commands.hs mkValidName keeps at most 50 characters (code points) of a display name. */
         const val MAX_NAME_CHARS = 50
-        /**
-         * Protocol.hs: a message body over maxEncodedMsgLength (15602 bytes) is refused, and on PQ connections a
-         * body over maxCompressedMsgLength (13380) must compress below 13380. Staying under 13380 including the
-         * ~200-byte x.msg.new envelope never depends on compression: 13380 - 380 reserved.
-         */
-        const val MAX_TEXT_BYTES = 13_000
+        /** Local-only archive flags ([ArchiveStore]), next to the databases. */
+        const val ARCHIVE_FILE = "archived_chats"
 
         /** The unreachable SOCKS proxy for the first-run lock (port 9 is privileged: no app can listen on it). */
         const val LOCK_SOCKS_ADDR = "127.0.0.1:9"
@@ -821,7 +1153,7 @@ internal class SimplexSecuredEngine(
         val CHAT_LIST_EVENTS = setOf(
             "contactConnecting", "contactConnected", "contactSndReady", "contactUpdated", "contactDeletedByContact",
             "contactAnotherClient", "contactDisabled", "contactRatchetSync", "acceptingContactRequest",
-            "chatInfoUpdated", "chatItemUpdated", "chatItemsDeleted",
+            "chatInfoUpdated",
         )
     }
 }

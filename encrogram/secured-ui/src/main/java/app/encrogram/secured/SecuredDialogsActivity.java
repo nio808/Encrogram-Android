@@ -3,43 +3,57 @@ package app.encrogram.secured;
 import static org.telegram.messenger.AndroidUtilities.dp;
 
 import android.content.Context;
-import android.graphics.Canvas;
-import android.graphics.Outline;
-import android.graphics.Paint;
-import android.graphics.drawable.GradientDrawable;
+import android.content.DialogInterface;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewOutlineProvider;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.ui.ActionBar.ActionBar;
+import org.telegram.ui.ActionBar.ActionBarMenu;
+import org.telegram.ui.ActionBar.ActionBarMenuItem;
+import org.telegram.ui.ActionBar.AlertDialog;
+import org.telegram.ui.ActionBar.BackDrawable;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.INavigationLayout;
 import org.telegram.ui.ActionBar.Theme;
+import org.telegram.ui.Cells.CheckBoxCell;
 import org.telegram.ui.Cells.DialogCell;
+import org.telegram.ui.Components.FragmentFloatingButton;
+import org.telegram.ui.Components.FragmentSearchField;
 import org.telegram.ui.Components.LayoutHelper;
+import org.telegram.ui.Components.NumberTextView;
 import org.telegram.ui.Components.RadialProgressView;
 import org.telegram.ui.Components.RecyclerListView;
 import org.telegram.ui.DialogsActivity;
 import org.telegram.ui.MainTabsActivity;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
+import app.encrogram.core.api.ChatAction;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.MessageStatus;
@@ -52,8 +66,10 @@ import app.encrogram.core.api.SecuredResult;
 
 /**
  * The Secured page of the Chats tab: first-run profile, engine state, the list of Secured chats and the two ways
- * to start one (create an invite, connect with a link). Rows are Telegram's own DialogCell fed through its
- * CustomDialog path, which carries only the strings and numbers we put in.
+ * to start one (create an invite, connect with a link). Rows are Telegram's own DialogCell (through
+ * {@link SecuredDialogCell}) fed through its CustomDialog path, which carries only the strings and numbers we put in.
+ * The list has a local search row, long-press selection with pin, mute, mark read, archive and delete, swipe to
+ * archive, an "Archived chats" row and Telegram's floating button. Everything is wired to {@link SecuredEngine} only.
  */
 public class SecuredDialogsActivity extends BaseFragment implements MainTabsActivity.TabFragmentDelegate {
 
@@ -77,9 +93,35 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private TextView profileButton;
     private RecyclerListView listView;
     private LinearLayout emptyView;
-    private View fab;
+    private FragmentFloatingButton fab;
     private final List<ChatSummary> chats = new ArrayList<>();
     private RecyclerView.Adapter<RecyclerView.ViewHolder> adapter;
+
+    // ---- list state (local only; never persisted, never sent anywhere) ----
+    private static final int T_SEARCH = 0, T_CHAT = 1, T_ARCHIVE = 2, T_TEXT = 3;
+    private static final int TEXT_BACK = 1, TEXT_NO_RESULTS = 2;
+    private static final int ID_PIN = 1, ID_MUTE = 2, ID_ARCHIVE = 3, ID_DELETE = 4, ID_READ = 5;
+    private static final String ACTION_MODE_TAG = "secured_list";
+
+    /** One row of the list. */
+    private static final class Item {
+        int type;
+        long id;
+        ChatRowMapper.Row row;   // T_CHAT and T_ARCHIVE
+        int textKind;            // T_TEXT
+    }
+
+    private final List<Item> items = new ArrayList<>();
+    private final Set<Long> selected = new LinkedHashSet<>();
+    private final Set<Long> hidden = new HashSet<>();   // removed from view while an engine command is in flight
+    private boolean showingArchived;
+    private String query = "";
+    private FrameLayout searchRow;
+    private FragmentSearchField searchField;
+    private NumberTextView selectedCount;
+    private ActionBarMenuItem pinItem, muteItem, archiveItem, otherItem;
+    private ImageView actionModeClose;
+    private ChatRowMapper.Labels labels;
 
     SecuredDialogsActivity(EncrogramChatsHost host) {
         super();
@@ -227,6 +269,13 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         for (int i = actionBar.getChildCount() - 1; i >= 0; i--) {
             if (actionBar.getChildAt(i) instanceof ChatsSwitcherView) actionBar.removeViewAt(i);
         }
+        actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
+            @Override
+            public void onItemClick(int id) {
+                if (id >= ID_PIN && id <= ID_READ) onSelectionAction(id);
+            }
+        });
+        labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet));
         final ChatsSwitcherView switcher = new ChatsSwitcherView(context, host);
         actionBar.addView(switcher, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 48, Gravity.LEFT | Gravity.BOTTOM, 22, 0, 0, 4));
 
@@ -248,7 +297,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         body.addView(listFrame, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
 
         fab = buildFab(context);
-        body.addView(fab, LayoutHelper.createFrame(56, 56, Gravity.RIGHT | Gravity.BOTTOM, 0, 0, 16, 16));
+        body.addView(fab, FragmentFloatingButton.createDefaultLayoutParams());
 
         root = new FrameLayout(context);
         root.addView(column, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
@@ -402,15 +451,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         listView.setLayoutManager(new LinearLayoutManager(context));
         listView.setClipToPadding(false);
         listView.setVerticalScrollBarEnabled(false);
+        searchRow = buildSearchRow(context);
         adapter = new ChatsAdapter(context);
         listView.setAdapter(adapter);
-        listView.setOnItemClickListener((view, position) -> {
-            if (position >= 0 && position < chats.size()) {
-                // Open like a native chat: in the right-hand pane on tablets, not the floating layers window.
-                presentFragment(new INavigationLayout.NavigationParams(
-                        new SecuredChatActivity(chats.get(position).getChatId())).forceRightLayout());
-            }
-        });
+        listView.setOnItemClickListener((view, position) -> onRowClick(view, position));
+        listView.setOnItemLongClickListener((view, position) -> onRowLongClick(view, position));
+        new ItemTouchHelper(new ArchiveSwipe()).attachToRecyclerView(listView);
         frame.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
 
         emptyView = new LinearLayout(context);
@@ -432,36 +478,52 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         return frame;
     }
 
-    private View buildFab(Context context) {
-        final View v = new View(context) {
-            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private FragmentFloatingButton buildFab(Context context) {
+        // Telegram's own floating button (reuse level 1). Its colours come from our provider (Encro Indigo).
+        final FragmentFloatingButton b = new FragmentFloatingButton(context, SecuredResourcesProvider.get());
+        b.setImageResource(org.telegram.messenger.R.drawable.msg_add);
+        b.setContentDescription(context.getString(R.string.sec_new_chat));
+        b.setOnClickListener(x -> showFabMenu());
+        return b;
+    }
+
+    /** Telegram's search field as the first row of the list, so it scrolls away and comes back like any row. */
+    private FrameLayout buildSearchRow(Context context) {
+        final FrameLayout row = new FrameLayout(context);
+        row.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+        searchField = new FragmentSearchField(context, SecuredResourcesProvider.get());
+        searchField.setPadding(dp(4), dp(4), dp(4), dp(4));
+        searchField.setHintText(context.getString(R.string.sec_list_search_hint), false);
+        searchField.editText.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
 
             @Override
-            protected void onDraw(@NonNull Canvas canvas) {
-                final float cx = getWidth() / 2f, cy = getHeight() / 2f, r = dp(11);
-                p.setColor(Kit.color(Theme.key_chats_actionIcon));
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(dp(2));
-                p.setStrokeCap(Paint.Cap.ROUND);
-                canvas.drawLine(cx - r, cy, cx + r, cy, p);
-                canvas.drawLine(cx, cy - r, cx, cy + r, p);
-            }
-        };
-        final GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Kit.color(Theme.key_chats_actionBackground));
-        v.setBackground(bg);
-        v.setElevation(dp(6));
-        v.setOutlineProvider(new ViewOutlineProvider() {
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
             @Override
-            public void getOutline(View view, Outline outline) {
-                outline.setOval(0, 0, view.getWidth(), view.getHeight());
+            public void afterTextChanged(Editable s) {
+                final String next = s == null ? "" : s.toString();
+                if (!next.equals(query)) {
+                    query = next;   // local only: filters the list below, goes nowhere else
+                    rebuildAndNotify();
+                }
             }
         });
-        v.setContentDescription(context.getString(R.string.sec_new_chat));
-        v.setClickable(true);
-        v.setOnClickListener(x -> showFabMenu());
-        return v;
+        searchField.editText.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                AndroidUtilities.hideKeyboard(searchField.editText);
+                return true;
+            }
+            return false;
+        });
+        searchField.setCloseButtonOnClickListener(() -> {
+            searchField.editText.getText().clear();
+            AndroidUtilities.hideKeyboard(searchField.editText);
+            searchField.editText.clearFocus();
+        });
+        row.addView(searchField, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        return row;
     }
 
     private void showFabMenu() {
@@ -508,6 +570,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
     private void showMode(Mode m) {
         mode = m;
+        if (m != Mode.LIST) clearSelection();
         if (fragmentView == null || startingView == null || failedView == null || profileView == null
                 || listFrame == null || fab == null || failedText == null) return;
         final Context c = fragmentView.getContext();
@@ -539,12 +602,419 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         }
         chats.clear();
         chats.addAll(fresh);
-        adapter.notifyDataSetChanged();
+        rebuildAndNotify();
         emptyView.setVisibility(chats.isEmpty() ? View.VISIBLE : View.GONE);
         listView.setVisibility(chats.isEmpty() ? View.GONE : View.VISIBLE);
         int unread = 0;
-        for (ChatSummary c : chats) unread += c.getUnreadCount();
+        for (ChatSummary c : chats) {
+            if (!c.getMuted() && !c.getArchived()) unread += c.getUnreadCount();
+        }
         host.setSecuredUnread(unread);
+    }
+
+    // ---- list model ------------------------------------------------------------------------------------------
+
+    private ChatSummary find(long chatId) {
+        for (ChatSummary c : chats) {
+            if (c.getChatId() == chatId) return c;
+        }
+        return null;
+    }
+
+    private boolean matches(ChatSummary c, String q) {
+        final String name = c.getDisplayName();
+        final String text = c.getLastMessageText();
+        return (name != null && name.toLowerCase(Locale.ROOT).contains(q))
+                || (text != null && text.toLowerCase(Locale.ROOT).contains(q));
+    }
+
+    private Item chatItem(ChatSummary c) {
+        final Item it = new Item();
+        it.type = T_CHAT;
+        it.id = c.getChatId();
+        it.row = ChatRowMapper.map(c, labels, System.currentTimeMillis());
+        return it;
+    }
+
+    private void rebuildItems() {
+        items.clear();
+        final Item search = new Item();
+        search.type = T_SEARCH;
+        search.id = -1;
+        items.add(search);
+
+        final String q = query.trim().toLowerCase(Locale.ROOT);
+        int archivedCount = 0, archivedUnread = 0;
+        long archivedTime = 0;
+        for (ChatSummary c : chats) {
+            if (c.getArchived() && !hidden.contains(c.getChatId())) {
+                archivedCount++;
+                archivedUnread += c.getUnreadCount();
+                archivedTime = Math.max(archivedTime, c.getLastMessageTimeMs());
+            }
+        }
+        if (archivedCount == 0) showingArchived = false;
+
+        if (!q.isEmpty()) {
+            boolean any = false;
+            for (ChatSummary c : chats) {
+                if (hidden.contains(c.getChatId()) || !matches(c, q)) continue;
+                items.add(chatItem(c));
+                any = true;
+            }
+            if (!any) items.add(textItem(TEXT_NO_RESULTS));
+        } else if (showingArchived) {
+            items.add(textItem(TEXT_BACK));
+            for (ChatSummary c : chats) {
+                if (c.getArchived() && !hidden.contains(c.getChatId())) items.add(chatItem(c));
+            }
+        } else {
+            if (archivedCount > 0) {
+                final Context ctx = fragmentView != null ? fragmentView.getContext() : null;
+                final Item a = new Item();
+                a.type = T_ARCHIVE;
+                a.id = -2;
+                final ChatRowMapper.Row r = new ChatRowMapper.Row();
+                r.chatId = -2;
+                r.name = ctx != null ? ctx.getString(R.string.sec_list_archived) : "";
+                r.message = ctx != null ? ctx.getString(R.string.sec_list_archived_count, archivedCount) : "";
+                r.unread = archivedUnread;
+                r.dateSeconds = (int) ((archivedTime > 0 ? archivedTime : System.currentTimeMillis()) / 1000L);
+                a.row = r;
+                items.add(a);
+            }
+            for (ChatSummary c : chats) {
+                if (!c.getArchived() && !hidden.contains(c.getChatId())) items.add(chatItem(c));
+            }
+        }
+
+        // Selection only keeps chats that are still listed.
+        if (!selected.isEmpty()) {
+            final Set<Long> live = new HashSet<>();
+            for (ChatSummary c : chats) {
+                if (!hidden.contains(c.getChatId())) live.add(c.getChatId());
+            }
+            selected.retainAll(live);
+        }
+    }
+
+    private Item textItem(int kind) {
+        final Item t = new Item();
+        t.type = T_TEXT;
+        t.id = -10 - kind;
+        t.textKind = kind;
+        return t;
+    }
+
+    private void rebuildAndNotify() {
+        if (adapter == null) return;
+        rebuildItems();
+        adapter.notifyDataSetChanged();
+        updateActionMode();
+    }
+
+    private void setShowingArchived(boolean value) {
+        showingArchived = value;
+        rebuildAndNotify();
+        if (listView != null) listView.scrollToPosition(0);
+    }
+
+    private void onRowClick(View view, int position) {
+        if (position < 0 || position >= items.size()) return;
+        final Item it = items.get(position);
+        switch (it.type) {
+            case T_CHAT:
+                if (!selected.isEmpty()) {
+                    toggleSelected(it.id, view);
+                } else {
+                    // Open like a native chat: in the right-hand pane on tablets, not the floating layers window.
+                    presentFragment(new INavigationLayout.NavigationParams(
+                            new SecuredChatActivity(it.id)).forceRightLayout());
+                }
+                break;
+            case T_ARCHIVE:
+                if (selected.isEmpty()) setShowingArchived(true);
+                break;
+            case T_TEXT:
+                if (it.textKind == TEXT_BACK && selected.isEmpty()) setShowingArchived(false);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private boolean onRowLongClick(View view, int position) {
+        if (position < 0 || position >= items.size()) return false;
+        final Item it = items.get(position);
+        if (it.type != T_CHAT) return false;
+        view.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+        toggleSelected(it.id, view);
+        return true;
+    }
+
+    // ---- selection mode --------------------------------------------------------------------------------------
+
+    private void toggleSelected(long chatId, View view) {
+        if (!selected.remove(chatId)) selected.add(chatId);
+        if (view instanceof DialogCell) ((DialogCell) view).setChecked(selected.contains(chatId), true);
+        updateActionMode();
+    }
+
+    private void ensureActionMode() {
+        if (actionBar.actionModeIsExist(ACTION_MODE_TAG)) return;
+        final Context context = actionBar.getContext();
+        final ActionBarMenu mode = actionBar.createActionMode(false, ACTION_MODE_TAG);
+
+        // Same construction as Telegram's chat list action mode (DialogsActivity.createActionMode), our items only.
+        actionModeClose = new ImageView(context);
+        actionModeClose.setScaleType(ImageView.ScaleType.CENTER);
+        actionModeClose.setImageDrawable(new BackDrawable(true));
+        actionModeClose.setColorFilter(new android.graphics.PorterDuffColorFilter(getThemedColor(Theme.key_actionBarActionModeDefaultIcon), android.graphics.PorterDuff.Mode.MULTIPLY));
+        actionModeClose.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_actionBarActionModeDefaultSelector)));
+        actionModeClose.setOnClickListener(v -> clearSelection());
+        mode.addView(actionModeClose, LayoutHelper.createLinear(54, 54, Gravity.CENTER_VERTICAL));
+
+        selectedCount = new NumberTextView(context);
+        selectedCount.setTextSize(18);
+        selectedCount.setTypeface(AndroidUtilities.bold());
+        selectedCount.setTextColor(getThemedColor(Theme.key_actionBarActionModeDefaultIcon));
+        mode.addView(selectedCount, LayoutHelper.createLinear(0, LayoutHelper.MATCH_PARENT, 1.0f, 18, 0, 0, 0));
+        selectedCount.setOnTouchListener((v, event) -> true);
+
+        pinItem = mode.addItemWithWidth(ID_PIN, org.telegram.messenger.R.drawable.msg_pin, dp(48), context.getString(R.string.sec_list_pin));
+        muteItem = mode.addItemWithWidth(ID_MUTE, org.telegram.messenger.R.drawable.msg_mute, dp(48), context.getString(R.string.sec_list_mute));
+        archiveItem = mode.addItemWithWidth(ID_ARCHIVE, org.telegram.messenger.R.drawable.msg_archive, dp(48), context.getString(R.string.sec_list_archive));
+        mode.addItemWithWidth(ID_DELETE, org.telegram.messenger.R.drawable.msg_delete, dp(48), context.getString(R.string.sec_list_delete));
+        otherItem = mode.addItemWithWidth(0, org.telegram.messenger.R.drawable.ic_ab_other, dp(48), context.getString(R.string.sec_list_more));
+        otherItem.addSubItem(ID_READ, org.telegram.messenger.R.drawable.msg_markread, context.getString(R.string.sec_list_mark_read));
+    }
+
+    private void updateActionMode() {
+        if (destroyed || actionBar == null) return;
+        if (selected.isEmpty()) {
+            if (actionBar.isActionModeShowed(ACTION_MODE_TAG)) actionBar.hideActionMode();
+            if (fab != null && !fab.getButtonVisible()) fab.setButtonVisible(true, true);
+            return;
+        }
+        ensureActionMode();
+        selectedCount.setNumber(selected.size(), actionBar.isActionModeShowed(ACTION_MODE_TAG));
+        boolean allPinned = true, allMuted = true, anyUnread = false;
+        for (long id : selected) {
+            final ChatSummary c = find(id);
+            if (c == null) continue;
+            allPinned &= c.getPinned();
+            allMuted &= c.getMuted();
+            anyUnread |= c.getUnreadCount() > 0;
+        }
+        final Context ctx = actionBar.getContext();
+        pinItem.setIcon(allPinned ? org.telegram.messenger.R.drawable.msg_unpin : org.telegram.messenger.R.drawable.msg_pin);
+        pinItem.setContentDescription(ctx.getString(allPinned ? R.string.sec_list_unpin : R.string.sec_list_pin));
+        muteItem.setIcon(allMuted ? org.telegram.messenger.R.drawable.msg_unmute : org.telegram.messenger.R.drawable.msg_mute);
+        muteItem.setContentDescription(ctx.getString(allMuted ? R.string.sec_list_unmute : R.string.sec_list_mute));
+        archiveItem.setIcon(showingArchived ? org.telegram.messenger.R.drawable.msg_unarchive : org.telegram.messenger.R.drawable.msg_archive);
+        archiveItem.setContentDescription(ctx.getString(showingArchived ? R.string.sec_list_unarchive : R.string.sec_list_archive));
+        if (anyUnread) otherItem.showSubItem(ID_READ);
+        else otherItem.hideSubItem(ID_READ);
+        if (!actionBar.isActionModeShowed(ACTION_MODE_TAG)) actionBar.showActionMode(true);
+        if (fab != null && fab.getButtonVisible()) fab.setButtonVisible(false, true);
+    }
+
+    private void clearSelection() {
+        if (selected.isEmpty()) return;
+        selected.clear();
+        if (listView != null) {
+            for (int i = 0; i < listView.getChildCount(); i++) {
+                final View v = listView.getChildAt(i);
+                if (v instanceof DialogCell) ((DialogCell) v).setChecked(false, true);
+            }
+        }
+        updateActionMode();
+    }
+
+    @Override
+    public boolean onBackPressed(boolean invoked) {
+        if (!selected.isEmpty()) {
+            if (invoked) clearSelection();
+            return false;
+        }
+        if (!query.isEmpty() && searchField != null) {
+            if (invoked) searchField.editText.getText().clear();
+            return false;
+        }
+        if (showingArchived) {
+            if (invoked) setShowingArchived(false);
+            return false;
+        }
+        return super.onBackPressed(invoked);
+    }
+
+    private void onSelectionAction(int id) {
+        final List<Long> ids = new ArrayList<>(selected);
+        if (ids.isEmpty()) return;
+        switch (id) {
+            case ID_PIN: {
+                boolean all = true;
+                for (long c : ids) {
+                    final ChatSummary s = find(c);
+                    all &= s != null && s.getPinned();
+                }
+                for (long c : ids) act(c, new ChatAction.SetPinned(!all), false);
+                break;
+            }
+            case ID_MUTE: {
+                boolean all = true;
+                for (long c : ids) {
+                    final ChatSummary s = find(c);
+                    all &= s != null && s.getMuted();
+                }
+                for (long c : ids) act(c, new ChatAction.SetMuted(!all), false);
+                break;
+            }
+            case ID_ARCHIVE:
+                for (long c : ids) act(c, new ChatAction.SetArchived(!showingArchived), true);
+                break;
+            case ID_READ:
+                for (long c : ids) markRead(c);
+                break;
+            case ID_DELETE:
+                confirmDelete(ids);
+                return;   // the selection stays until the user confirms
+            default:
+                return;
+        }
+        clearSelection();
+    }
+
+    // ---- engine commands (every call is guarded: nothing may crash Telegram's Chats tab) ----------------------
+
+    /** Sends one chat command. {@code hide} removes the row at once and restores it if the engine says no. */
+    private void act(long chatId, ChatAction action, boolean hide) {
+        final SecuredEngine e = engine;
+        if (e == null || destroyed) return;
+        if (hide) {
+            hidden.add(chatId);
+            rebuildAndNotify();
+        }
+        try {
+            e.chatAction(chatId, action, result -> {
+                hidden.remove(chatId);
+                if (destroyed) return;
+                if (result instanceof SecuredResult.Err) {
+                    toast(((SecuredResult.Err) result).getError().getMessage());
+                }
+                refreshChats();
+            });
+        } catch (Throwable t) {
+            hidden.remove(chatId);
+            engineFailed(t);
+        }
+    }
+
+    private void markRead(long chatId) {
+        final SecuredEngine e = engine;
+        if (e == null || destroyed) return;
+        try {
+            e.markRead(chatId);
+            refreshChats();
+        } catch (Throwable t) {
+            engineFailed(t);
+        }
+    }
+
+    private void toast(String message) {
+        final Context c = getParentActivity();
+        if (c == null || message == null) return;
+        Toast.makeText(c, c.getString(R.string.sec_list_action_failed, message), Toast.LENGTH_LONG).show();
+    }
+
+    private void confirmDelete(List<Long> ids) {
+        final Context context = getParentActivity();
+        if (context == null || engine == null) return;
+        final boolean one = ids.size() == 1;
+        final AlertDialog.Builder b = new AlertDialog.Builder(context, SecuredResourcesProvider.get());
+        b.setTitle(one ? context.getString(R.string.sec_list_delete_title) : context.getString(R.string.sec_list_delete_title_n, ids.size()));
+        b.setMessage(context.getString(one ? R.string.sec_list_delete_text : R.string.sec_list_delete_text_n));
+        final CheckBoxCell also = new CheckBoxCell(context, CheckBoxCell.TYPE_CHECK_BOX_DEFAULT, SecuredResourcesProvider.get());
+        also.setText(context.getString(R.string.sec_list_delete_also), "", false, false);
+        also.setOnClickListener(v -> also.setChecked(!also.isChecked(), true));
+        final FrameLayout holder = new FrameLayout(context);
+        holder.addView(also, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 8, 0, 8, 0));
+        b.setView(holder);
+        b.setNegativeButton(context.getString(R.string.sec_list_cancel), null);
+        b.setPositiveButton(context.getString(R.string.sec_list_delete_confirm), (d, w) -> {
+            final boolean notify = also.isChecked();
+            for (long id : ids) act(id, new ChatAction.Delete(notify), true);
+            clearSelection();
+        });
+        final AlertDialog dialog = b.create();
+        showDialog(dialog);
+        final View ok = dialog.getButton(DialogInterface.BUTTON_POSITIVE);
+        if (ok instanceof TextView) ((TextView) ok).setTextColor(Theme.getColor(Theme.key_text_RedBold, SecuredResourcesProvider.get()));
+    }
+
+    // ---- swipe to archive (callback copied from DialogsActivity.SwipeController, archive only) ---------------
+
+    private final class ArchiveSwipe extends ItemTouchHelper.Callback {
+
+        @Override
+        public int getMovementFlags(RecyclerView recyclerView, RecyclerView.ViewHolder viewHolder) {
+            if (!selected.isEmpty() || viewHolder.getItemViewType() != T_CHAT || !(viewHolder.itemView instanceof DialogCell)) {
+                return 0;
+            }
+            ((DialogCell) viewHolder.itemView).setSliding(true);
+            return makeMovementFlags(0, ItemTouchHelper.LEFT);
+        }
+
+        @Override
+        public boolean onMove(RecyclerView recyclerView, RecyclerView.ViewHolder source, RecyclerView.ViewHolder target) {
+            return false;
+        }
+
+        @Override
+        public void onSwiped(RecyclerView.ViewHolder viewHolder, int direction) {
+            if (viewHolder == null) return;
+            final int position = viewHolder.getAdapterPosition();
+            if (position < 0 || position >= items.size() || items.get(position).type != T_CHAT) return;
+            final long chatId = items.get(position).id;
+            // Take the row out right away so the swiped view does not stay half open, then let the engine decide.
+            hidden.add(chatId);   // act() clears it when the engine answers
+            items.remove(position);
+            adapter.notifyItemRemoved(position);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!destroyed) rebuildAndNotify();   // archive row count, empty states
+            }, 300);
+            act(chatId, new ChatAction.SetArchived(!showingArchived), false);
+        }
+
+        @Override
+        public void onSelectedChanged(RecyclerView.ViewHolder viewHolder, int actionState) {
+            if (viewHolder != null) {
+                listView.hideSelector(false);
+                if (viewHolder.itemView instanceof DialogCell) ((DialogCell) viewHolder.itemView).swipeCanceled = false;
+            }
+            super.onSelectedChanged(viewHolder, actionState);
+        }
+
+        @Override
+        public long getAnimationDuration(RecyclerView recyclerView, int animationType, float animateDx, float animateDy) {
+            if (animationType == ItemTouchHelper.ANIMATION_TYPE_SWIPE_CANCEL) return 200;
+            return super.getAnimationDuration(recyclerView, animationType, animateDx, animateDy);
+        }
+
+        @Override
+        public float getSwipeThreshold(RecyclerView.ViewHolder viewHolder) {
+            return 0.45f;
+        }
+
+        @Override
+        public float getSwipeEscapeVelocity(float defaultValue) {
+            return 3500;
+        }
+
+        @Override
+        public float getSwipeVelocityThreshold(float defaultValue) {
+            return Float.MAX_VALUE;
+        }
     }
 
     // ---- deep links ------------------------------------------------------------------------------------------
@@ -569,46 +1039,76 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
         ChatsAdapter(Context context) {
             this.context = context;
+            setHasStableIds(true);   // keeps the search field (and its keyboard focus) alive while the rows below change
         }
 
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
-            return true;
+            return holder.getItemViewType() != T_SEARCH;
         }
 
         @Override
         public int getItemCount() {
-            return chats.size();
+            return items.size();
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return items.get(position).id;
+        }
+
+        @Override
+        public int getItemViewType(int position) {
+            return items.get(position).type;
         }
 
         @Override
         public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-            // Telegram's own row, with no fragment and our theme overlay. It only ever sees the CustomDialog below.
-            final DialogCell cell = new DialogCell(null, context, false, false, org.telegram.messenger.UserConfig.selectedAccount, SecuredResourcesProvider.get());
-            cell.useSeparator = true;
-            cell.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-            return new RecyclerListView.Holder(cell);
+            final View v;
+            if (viewType == T_SEARCH) {
+                AndroidUtilities.removeFromParent(searchRow);
+                v = searchRow;
+            } else if (viewType == T_TEXT) {
+                final TextView t = Kit.text(context, "", 15, Kit.color(Theme.key_windowBackgroundWhiteGrayText), false);
+                t.setGravity(Gravity.CENTER_VERTICAL);
+                t.setPadding(dp(22), 0, dp(22), 0);
+                t.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+                v = t;
+            } else {
+                // Telegram's own row, with no fragment and our theme overlay. It only ever sees the CustomDialog.
+                v = new SecuredDialogCell(context);
+                v.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            }
+            return new RecyclerListView.Holder(v);
         }
 
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
-            final ChatSummary c = chats.get(position);
-            final DialogCell.CustomDialog d = new DialogCell.CustomDialog();
-            d.name = c.getDisplayName();
-            if (!c.getReady()) {
-                d.message = context.getString(R.string.sec_waiting_contact);
-            } else if (c.getLastMessageText() != null) {
-                d.message = c.getLastMessageText();
-            } else {
-                d.message = context.getString(R.string.sec_no_messages_yet);
+            final Item it = items.get(position);
+            switch (it.type) {
+                case T_CHAT: {
+                    final SecuredDialogCell cell = (SecuredDialogCell) holder.itemView;
+                    cell.bind(it.row, showingArchived, true);
+                    cell.setChecked(selected.contains(it.id), false);
+                    break;
+                }
+                case T_ARCHIVE:
+                    ((SecuredDialogCell) holder.itemView).bind(it.row, false, false);
+                    break;
+                case T_TEXT: {
+                    final TextView t = (TextView) holder.itemView;
+                    if (it.textKind == TEXT_BACK) {
+                        t.setText(R.string.sec_list_archived_back);
+                        t.setTextColor(Kit.color(Theme.key_windowBackgroundWhiteBlueText));
+                    } else {
+                        t.setText(R.string.sec_list_no_results);
+                        t.setTextColor(Kit.color(Theme.key_windowBackgroundWhiteGrayText));
+                    }
+                    break;
+                }
+                default:
+                    break;
             }
-            d.id = (int) c.getChatId();
-            d.unread_count = c.getUnreadCount();
-            final long t = c.getLastMessageTimeMs() > 0 ? c.getLastMessageTimeMs() : System.currentTimeMillis();
-            d.date = (int) (t / 1000L);
-            d.type = 0;     // never 1 with isMedia (that combination crashes DialogCell) and never 2 (Telegram secret-chat look)
-            d.sent = -1;
-            ((DialogCell) holder.itemView).setDialog(d);
         }
     }
 }

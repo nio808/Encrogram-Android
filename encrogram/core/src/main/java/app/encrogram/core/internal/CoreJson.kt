@@ -1,6 +1,8 @@
 package app.encrogram.core.internal
 
 import app.encrogram.core.api.MessageStatus
+import app.encrogram.core.api.ReactionCount
+import app.encrogram.core.api.SECURED_REACTIONS
 import org.json.JSONException
 import org.json.JSONObject
 import java.time.Instant
@@ -46,6 +48,14 @@ internal data class CoreContact(
     val isContactCard: Boolean,
     val removed: Boolean,
     val activityTimeMs: Long,
+    /** chatSettings.favorite: backs "pinned". */
+    val favorite: Boolean = false,
+    /** chatSettings.enableNtfs is not "all": backs "muted". */
+    val muted: Boolean = false,
+    /** mergedPreferences.timedMessages enabled for both sides. */
+    val timedEnabled: Boolean = false,
+    /** Our own disappearing-message timer for this contact, when [timedEnabled]; else null. */
+    val timedTtlSeconds: Int? = null,
 )
 
 internal data class CoreItem(
@@ -59,7 +69,28 @@ internal data class CoreItem(
     val statusTag: String?,
     val status: MessageStatus,
     val unread: Boolean,
+    /** msgContent.type, e.g. "text"; null for service items. */
+    val msgContentType: String? = null,
+    val quote: CoreQuote? = null,
+    val edited: Boolean = false,
+    /** meta.itemDeleted is set (or a legacy deleted item). [text] is then always empty. */
+    val deleted: Boolean = false,
+    /** meta.editable: our own, under 24 h, not forwarded (Messages.hs mkCIMeta). */
+    val editable: Boolean = false,
+    /** meta.deletable: our own, under 24 h. */
+    val deletable: Boolean = false,
+    /** meta.itemSharedMsgId is set: without it an item can't be edited, deleted for everyone or reacted to. */
+    val shared: Boolean = false,
+    val forwarded: Boolean = false,
+    val reactions: List<ReactionCount> = emptyList(),
+    val expiresAtMs: Long? = null,
 )
+
+/** chatItem.quotedItem: [itemId] is null when the quoted message is not stored on this device. */
+internal data class CoreQuote(val itemId: Long?, val text: String, val outgoing: Boolean)
+
+/** One entry of chatItemsDeleted: [replacement] is the item as it is now when it was only marked deleted. */
+internal data class CoreDeletion(val chatId: Long, val itemId: Long, val replacement: CoreItem?)
 
 internal data class CoreChat(val contact: CoreContact, val lastItem: CoreItem?, val unreadCount: Int)
 
@@ -159,7 +190,95 @@ internal object CoreJson {
         val ts = timeMs(c.str("chatTs")).takeIf { it > 0 }
             ?: timeMs(c.str("updatedAt")).takeIf { it > 0 }
             ?: timeMs(c.str("createdAt"))
-        return CoreContact(c.optLong("contactId"), name, ready, verified, isCard, removed, ts)
+        val settings = c.optJSONObject("chatSettings")
+        val ntfs = tagOf(settings?.opt("enableNtfs"))
+        // ContactUserPreference {enabled {forUser, forContact}, userPreference {type, preference {allow, ttl?}}}
+        val timed = c.optJSONObject("mergedPreferences")?.optJSONObject("timedMessages")
+        val enabled = timed?.optJSONObject("enabled")
+        val timedEnabled = enabled != null && enabled.optBoolean("forUser", false) && enabled.optBoolean("forContact", false)
+        val ourTimed = timed?.optJSONObject("userPreference")?.optJSONObject("preference")
+        val ttl = if (timedEnabled && ourTimed != null && ourTimed.has("ttl") && !ourTimed.isNull("ttl")) {
+            ourTimed.optInt("ttl", 0).takeIf { it > 0 }
+        } else {
+            null
+        }
+        return CoreContact(
+            contactId = c.optLong("contactId"),
+            displayName = name,
+            ready = ready,
+            verified = verified,
+            isContactCard = isCard,
+            removed = removed,
+            activityTimeMs = ts,
+            favorite = settings?.optBoolean("favorite", false) ?: false,
+            muted = ntfs != null && ntfs != "all",
+            timedEnabled = timedEnabled,
+            timedTtlSeconds = ttl,
+        )
+    }
+
+    /** The raw contact of an `apiChat` body (for read-modify-write of its settings and preferences). */
+    fun contactOfChat(body: JSONObject): JSONObject? {
+        val info = body.optJSONObject("chat")?.optJSONObject("chatInfo") ?: return null
+        if (tagOf(info) != "direct") return null
+        return info.optJSONObject("contact")
+    }
+
+    /**
+     * The contact's whole ChatSettings {enableNtfs, sendRcpts?, favorite} with [edit] applied, for `/_settings`.
+     * The core replaces all of it, so every field we don't change is copied from the current one.
+     */
+    fun chatSettingsUpdate(contact: JSONObject, edit: (JSONObject) -> Unit): JSONObject {
+        val s = contact.optJSONObject("chatSettings")?.deepCopy() ?: JSONObject()
+        if (!s.has("enableNtfs") || s.isNull("enableNtfs")) s.put("enableNtfs", "all")
+        if (!s.has("favorite") || s.isNull("favorite")) s.put("favorite", false)
+        edit(s)
+        return s
+    }
+
+    /**
+     * The contact's own Preferences (`userPreferences`) with the disappearing-message timer set, for
+     * `/_set prefs`. On: `{"allow":"yes","ttl":n}`; off: `{"allow":"yes"}` (the contact may still use its own).
+     * Every other feature is copied, since the core replaces the whole object.
+     */
+    fun contactPrefsUpdate(contact: JSONObject, ttlSeconds: Int?): JSONObject {
+        val prefs = contact.optJSONObject("userPreferences")?.deepCopy() ?: JSONObject()
+        val timed = JSONObject().put("allow", "yes")
+        if (ttlSeconds != null) timed.put("ttl", ttlSeconds)
+        prefs.put("timedMessages", timed)
+        return prefs
+    }
+
+    /** The preferences every Secured profile has (simplex-chat-api-for-ui.md §5.2). */
+    val SECURED_PROFILE_PREFS: Map<String, String> = linkedMapOf("fullDelete" to "yes", "calls" to "no")
+
+    /** LocalProfile fields that are not part of Profile (Types.hs): never sent back in `/_profile`. */
+    private val LOCAL_ONLY_PROFILE_KEYS = listOf("profileId", "localAlias", "localBadge", "contactDomainVerified")
+
+    /**
+     * The Profile to send with `/_profile`, from the user's current LocalProfile (`/u` -> user.profile), with
+     * [displayName] (when given) and [SECURED_PROFILE_PREFS] applied. The core replaces the whole profile
+     * (gotcha G4), so every other field is kept as it is. Null when nothing would change.
+     */
+    fun profileUpdate(localProfile: JSONObject, displayName: String? = null): JSONObject? {
+        val p = localProfile.deepCopy()
+        for (k in LOCAL_ONLY_PROFILE_KEYS) p.remove(k)
+        var changed = false
+        if (displayName != null && p.str("displayName") != displayName) {
+            p.put("displayName", displayName)
+            changed = true
+        }
+        if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
+        val prefs = p.optJSONObject("preferences") ?: JSONObject()
+        for ((feature, allow) in SECURED_PROFILE_PREFS) {
+            val current = prefs.optJSONObject(feature)
+            if (current?.str("allow") != allow) {
+                prefs.put(feature, (current ?: JSONObject()).put("allow", allow))
+                changed = true
+            }
+        }
+        p.put("preferences", prefs)
+        return if (changed) p else null
     }
 
     /** The contact of a direct ChatInfo, or null for groups, notes, requests and pending connections. */
@@ -187,10 +306,17 @@ internal object CoreJson {
             "directRcv", "groupRcv", "channelRcv", "localRcv" -> false
             else -> contentType?.startsWith("snd") == true
         }
-        val isMessage = contentType == "sndMsgContent" || contentType == "rcvMsgContent"
-        val msgText = content?.optJSONObject("msgContent")?.str("text").orEmpty()
-        val text = msgText.ifEmpty { meta.str("itemText").orEmpty() }
+        // sndDeleted/rcvDeleted: legacy deleted items (before meta.itemDeleted existed). Shown as deleted messages.
+        val legacyDeleted = contentType == "sndDeleted" || contentType == "rcvDeleted"
+        val isMessage = contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted
+        val deleted = legacyDeleted || present(meta, "itemDeleted")
+        val msgContent = content?.optJSONObject("msgContent")
+        val msgText = msgContent?.str("text").orEmpty()
+        // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
+        val text = if (deleted) "" else msgText.ifEmpty { meta.str("itemText").orEmpty() }
         val statusTag = tagOf(meta.opt("itemStatus"))
+        val timed = meta.optJSONObject("itemTimed")
+        val expiresAt = timeMs(timed?.str("deleteAt")).takeIf { it > 0 }
         return CoreItem(
             chatId = chatId,
             itemId = meta.optLong("itemId"),
@@ -201,7 +327,61 @@ internal object CoreJson {
             statusTag = statusTag,
             status = StatusMapper.map(statusTag, outgoing),
             unread = !outgoing && statusTag == "rcvNew",
+            msgContentType = tagOf(msgContent),
+            quote = if (deleted) null else parseQuote(item.optJSONObject("quotedItem")),
+            edited = meta.optBoolean("itemEdited", false),
+            deleted = deleted,
+            editable = !deleted && meta.optBoolean("editable", false),
+            deletable = !deleted && meta.optBoolean("deletable", false),
+            shared = meta.str("itemSharedMsgId") != null,
+            forwarded = present(meta, "itemForwarded"),
+            reactions = if (deleted) emptyList() else parseReactions(item),
+            expiresAtMs = expiresAt,
         )
+    }
+
+    /** CIQuote {chatDir, itemId?, sharedMsgId?, sentAt, content: MsgContent}. */
+    private fun parseQuote(q: JSONObject?): CoreQuote? {
+        if (q == null) return null
+        val itemId = if (present(q, "itemId")) q.optLong("itemId") else null
+        val outgoing = when (tagOf(q.opt("chatDir"))) {
+            "directSnd", "groupSnd", "localSnd" -> true
+            else -> false
+        }
+        return CoreQuote(itemId, q.optJSONObject("content")?.str("text").orEmpty(), outgoing)
+    }
+
+    /** reactions: [{reaction: {type: "emoji", emoji}, userReacted, totalReacted}]; only the known eight. */
+    private fun parseReactions(item: JSONObject): List<ReactionCount> {
+        val out = ArrayList<ReactionCount>()
+        item.optJSONArray("reactions").forEachObject { r ->
+            val reaction = r.optJSONObject("reaction") ?: return@forEachObject
+            if (reaction.str("type") != "emoji") return@forEachObject
+            val emoji = reaction.str("emoji") ?: return@forEachObject
+            if (emoji !in SECURED_REACTIONS) return@forEachObject
+            val total = r.optInt("totalReacted", 0)
+            if (total > 0) out.add(ReactionCount(emoji, total, r.optBoolean("userReacted", false)))
+        }
+        return out
+    }
+
+    /** `chatItemReaction` body {added, reaction: {chatInfo, chatReaction: {chatDir, chatItem, sentAt, reaction}}}. */
+    fun parseReactionItem(body: JSONObject): CoreItem? {
+        val reaction = body.optJSONObject("reaction") ?: return null
+        val contact = directContact(reaction.optJSONObject("chatInfo")) ?: return null
+        return parseChatItem(contact.contactId, reaction.optJSONObject("chatReaction")?.optJSONObject("chatItem"))
+    }
+
+    /** `chatItemsDeleted` body {chatItemDeletions: [{deletedChatItem, toChatItem?}], byUser, timed}: messages only. */
+    fun parseDeletions(body: JSONObject): List<CoreDeletion> {
+        val out = ArrayList<CoreDeletion>()
+        body.optJSONArray("chatItemDeletions").forEachObject { d ->
+            val gone = parseAChatItem(d.optJSONObject("deletedChatItem")) ?: return@forEachObject
+            if (!gone.isMessage) return@forEachObject
+            val now = parseAChatItem(d.optJSONObject("toChatItem"))
+            out.add(CoreDeletion(gone.chatId, gone.itemId, now))
+        }
+        return out
     }
 
     /** All AChatItems of a `newChatItems` / `chatItemsStatusesUpdated` body that belong to direct chats. */
@@ -244,6 +424,12 @@ internal object CoreJson {
         return out
     }
 
+    /** `contactCode` body {contact, connectionCode}: the code to compare in person (digits in groups of five). */
+    fun contactCode(body: JSONObject): String? = body.str("connectionCode")?.ifEmpty { null }
+
+    /** `connectionVerified` body {verified, expectedCode}. */
+    fun connectionVerified(body: JSONObject): Boolean = body.optBoolean("verified", false)
+
     /** `invitation` body: `connLinkInvitation {connFullLink, connShortLink?}` and the pending connection id. */
     fun parseInvitation(body: JSONObject): CreatedLink {
         val links = body.optJSONObject("connLinkInvitation")
@@ -279,4 +465,6 @@ internal object CoreJson {
     }
 
     private fun isNullOrAbsent(o: JSONObject, key: String) = !o.has(key) || o.isNull(key)
+
+    private fun present(o: JSONObject, key: String) = o.has(key) && !o.isNull(key)
 }

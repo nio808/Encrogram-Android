@@ -1,6 +1,8 @@
 package app.encrogram.secured;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.util.Log;
@@ -14,7 +16,10 @@ import android.widget.ImageView;
 
 import androidx.annotation.NonNull;
 
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.EncrogramHooks;
+import org.telegram.messenger.SharedConfig;
+import org.telegram.messenger.UserConfig;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.Components.LayoutHelper;
@@ -146,6 +151,33 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
             return logo instanceof ChatsSwitcherView ? 0f : titleVisibility;
         } catch (Throwable t) {
             return titleVisibility;
+        }
+    }
+
+    /**
+     * A tap on a Secured notification. Only our own action is touched; everything else is Telegram's.
+     * Passcode: if Telegram's passcode is showing or due, return false untouched, so Telegram's own flow runs and
+     * re-delivers this intent (needShowPasscode(false): the reset variant would clear the state Telegram checks next).
+     * No Telegram account: the id stays pending (in memory) and Telegram carries on; step 4 routes that case.
+     */
+    @Override
+    public boolean handleIntent(Activity activity, Intent intent) {
+        try {
+            if (intent == null || !SecuredUi.ACTION_OPEN_CHAT.equals(intent.getAction())) {
+                return false;
+            }
+            // Reopened from Recents: Android re-delivers the old notification intent; don't reopen that chat again.
+            if ((intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
+                return false;
+            }
+            if (AndroidUtilities.needShowPasscode(false) || SharedConfig.isWaitingForPasscodeEnter) {
+                return false;
+            }
+            SecuredUi.deliverOpenChat(intent.getLongExtra(SecuredUi.EXTRA_CHAT_ID, SecuredUi.NO_CHAT));
+            return UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated();
+        } catch (Throwable t) {
+            fail("handleIntent", t);
+            return false;
         }
     }
 

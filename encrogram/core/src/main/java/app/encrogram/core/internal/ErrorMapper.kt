@@ -14,8 +14,26 @@ internal object ErrorMapper {
     const val NETWORK = "Can't reach the Secured server. Check your internet connection and try again."
     const val LINK_USED = "This invite link was already used or has expired. Ask for a new one."
     const val LINK_INVALID = "This isn't a valid Secured invite link."
+    const val CHAT_GONE = "This chat is no longer available."
+    const val MESSAGE_GONE = "This message is no longer available."
+    const val TOO_LONG = "The message is too long."
+    const val CANT_EDIT = "This message can't be edited. Only your own messages can be edited, within 24 hours of sending."
+    const val CANT_DELETE_FOR_EVERYONE = "This message can't be deleted for everyone. Only your own messages can be, within a day of sending."
+    const val CANT_REACT = "This reaction can't be used here."
+    const val CANT_REPLY = "This message can't be replied to."
+    const val STORAGE = "Secured storage couldn't be written. Try again."
 
-    enum class Op { START, PROFILE, INVITE, CONNECT, SEND, LOAD, READ, OTHER }
+    enum class Op { START, PROFILE, INVITE, CONNECT, SEND, LOAD, READ, EDIT, DELETE, REACT, FORWARD, CHAT, VERIFY, OTHER }
+
+    /** A refusal by our own rules or the protocol's (time limits, the reaction set). [message] is a fixed sentence. */
+    fun notAllowed(message: String): SecuredError = SecuredError(Kind.NOT_ALLOWED, message)
+
+    /** Malformed input from the UI (empty, too long, bad page). */
+    fun invalid(message: String): SecuredError = SecuredError(Kind.UNKNOWN, message)
+
+    fun chatGone(): SecuredError = SecuredError(Kind.ENGINE, CHAT_GONE)
+
+    fun messageGone(): SecuredError = SecuredError(Kind.ENGINE, MESSAGE_GONE)
 
     fun notRunning(state: app.encrogram.core.api.EngineState): SecuredError =
         if (state == app.encrogram.core.api.EngineState.NEEDS_PROFILE) SecuredError(Kind.NO_PROFILE, NO_PROFILE)
@@ -39,11 +57,18 @@ internal object ErrorMapper {
                     return SecuredError(Kind.ENGINE, "This contact isn't ready to receive messages yet.")
                 "userExists", "invalidDisplayName" ->
                     return SecuredError(Kind.ENGINE, "This name can't be used. Try a different name.")
+                "invalidChatItemUpdate" -> return notAllowed(CANT_EDIT)
+                "invalidChatItemDelete" -> return notAllowed(CANT_DELETE_FOR_EVERYONE)
+                // throwCmdError: "reaction already added/removed", "too many reactions", "no shared item ID".
+                "commandError" -> if (op == Op.REACT) return notAllowed(CANT_REACT)
             }
             "errorStore" -> when (e.detail) {
                 "duplicateName" -> return SecuredError(Kind.ENGINE, "This name can't be used. Try a different name.")
-                "contactNotFound", "contactNotReady" ->
-                    return SecuredError(Kind.ENGINE, "This chat is no longer available.")
+                "contactNotFound", "contactNotReady" -> return chatGone()
+                "chatItemNotFound" -> return messageGone()
+                "invalidQuote" -> return notAllowed(CANT_REPLY)
+                // encodeChatMessage: the whole message would be over maxEncodedMsgLength.
+                "largeMsg" -> return invalid(TOO_LONG)
             }
             "errorAgent" -> return fromAgent(e, op)
         }

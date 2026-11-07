@@ -1092,7 +1092,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         if (LoginActivity.loadCurrentState(false, currentAccount).getInt("currentViewNum", 0) != 0) {
             return new LoginActivity();
         }
-        return new IntroActivity();
+        return org.telegram.messenger.EncrogramHooks.get().loggedOutIntro(new IntroActivity()); // ENCROGRAM-HOOK(loggedOut)
     }
 
     public FireworksOverlay getFireworksOverlay() {
@@ -1261,7 +1261,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 layersActionBarLayout.rebuildLogout();
                 rightActionBarLayout.rebuildLogout();
             }
-            presentFragment(new IntroActivity().setOnLogout());
+            presentFragment(org.telegram.messenger.EncrogramHooks.get().loggedOutIntro(new IntroActivity().setOnLogout())); // ENCROGRAM-HOOK(loggedOut)
         }
     }
 
@@ -1532,6 +1532,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         int flags = intent.getFlags();
         String action = intent.getAction();
         final int[] intentAccount = new int[]{intent.getIntExtra("currentAccount", UserConfig.selectedAccount)};
+        if (org.telegram.messenger.EncrogramHooks.get().handleIntent(this, intent)) return true; // ENCROGRAM-HOOK(openSecured)
         switchToAccount(intentAccount[0], true);
         final boolean isVoipIntent = action != null && action.equals("voip");
         final boolean isVoipAnswerIntent = action != null && action.equals("voip_answer");

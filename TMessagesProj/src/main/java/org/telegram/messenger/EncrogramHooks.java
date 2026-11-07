@@ -11,7 +11,9 @@
 
 package org.telegram.messenger;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.view.View;
 import android.widget.ImageView;
 
@@ -60,6 +62,23 @@ public final class EncrogramHooks {
         /** DialogStoriesCell swaps the logo for a text title. Encrogram keeps its control visible (returns 0). */
         default float storiesTitleVisibility(View logo, float titleVisibility) {
             return titleVisibility;
+        }
+
+        /**
+         * LaunchActivity.handleIntent, before any Telegram account switch. Return true when Encrogram handled the
+         * intent (for example a tap on a Secured notification). The default returns false: Telegram handles it.
+         */
+        default boolean handleIntent(Activity activity, Intent intent) {
+            return false;
+        }
+
+        /**
+         * LaunchActivity's start screen when no Telegram account is activated (first start and after the last
+         * logout). The default returns Telegram's intro unchanged. Encrogram returns a welcome screen with both
+         * doors: "Continue with Telegram" (which opens {@code intro}) and "Continue without Telegram".
+         */
+        default BaseFragment loggedOutIntro(BaseFragment intro) {
+            return intro;
         }
     }
 

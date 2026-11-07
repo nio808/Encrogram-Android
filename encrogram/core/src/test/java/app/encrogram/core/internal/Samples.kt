@@ -11,7 +11,17 @@ object Samples {
         "activeUser":true,"activeOrder":1,"showNtfs":true,"sendRcptsContacts":true,"sendRcptsSmallGroups":true,
         "autoAcceptMemberContacts":false,"userChatRelay":false,"clientService":false,"futureField":{"x":1}}"""
 
-    fun contact(id: Long, name: String, connStatus: String?, code: Boolean = false, contactLink: String? = null) = """
+    fun contact(
+        id: Long,
+        name: String,
+        connStatus: String?,
+        code: Boolean = false,
+        contactLink: String? = null,
+        favorite: Boolean = false,
+        ntfs: String = "all",
+        mergedPrefs: String = "{}",
+        userPrefs: String = "{}",
+    ) = """
         {"contactId":$id,"localDisplayName":"${name.lowercase()}",
          "profile":{"profileId":${id + 10},"displayName":"$name","fullName":"","localAlias":""${
             if (contactLink != null) ""","contactLink":"$contactLink"""" else ""}},
@@ -21,8 +31,8 @@ object Samples {
            "connectionCode":${if (code) """{"securityCode":"12345","verifiedAt":"2026-11-07T10:00:00Z"}""" else "null"},
            "pqSupport":true,"pqEncryption":true,"authErrCounter":0,"quotaErrCounter":0,"createdAt":"2026-11-07T09:00:00Z"},"""
            else ""}
-         "contactUsed":true,"contactStatus":"active","chatSettings":{"enableNtfs":"all","favorite":false},
-         "userPreferences":{},"mergedPreferences":{},"createdAt":"2026-11-07T09:00:00Z","updatedAt":"2026-11-07T09:30:00Z",
+         "contactUsed":true,"contactStatus":"active","chatSettings":{"enableNtfs":"$ntfs","sendRcpts":true,"favorite":$favorite},
+         "userPreferences":$userPrefs,"mergedPreferences":$mergedPrefs,"createdAt":"2026-11-07T09:00:00Z","updatedAt":"2026-11-07T09:30:00Z",
          "chatTs":null,"preparedContact":null,"contactRequestId":null,"contactGrpInvSent":false,"chatTags":[],
          "chatItemTTL":null,"chatDeleted":false}"""
 
@@ -34,6 +44,82 @@ object Samples {
            "showGroupAsSender":false,"createdAt":"$ts","updatedAt":"$ts"},
          "content":{"type":"$contentType","msgContent":{"type":"text","text":"$text"}},
          "mentions":{},"reactions":[]}"""
+
+    /**
+     * A v2 chat item (Messages.hs ChatItem/CIMeta, TYPES.md): quote, reactions, edited, deleted, timed, forwarded.
+     * The content keeps its text even when [deleted], as the core's JSON does for "marked deleted" items.
+     */
+    fun item(
+        itemId: Long,
+        dir: String,
+        contentType: String,
+        text: String,
+        status: String,
+        ts: String = "2026-11-07T10:20:30.123456Z",
+        edited: Boolean = false,
+        editable: Boolean = false,
+        deletable: Boolean = false,
+        shared: Boolean = true,
+        deleted: Boolean = false,
+        timedDeleteAt: String? = null,
+        forwarded: Boolean = false,
+        quote: String? = null,
+        reactions: String = "[]",
+    ) = """
+        {"chatDir":{"type":"$dir"},
+         "meta":{"itemId":$itemId,"itemTs":"$ts","itemText":"$text","itemStatus":{"type":"$status"},
+           ${if (shared) "\"itemSharedMsgId\":\"c2hhcmVkLWlk\"," else ""}
+           ${if (forwarded) "\"itemForwarded\":{\"type\":\"contact\",\"chatName\":\"Carol\",\"msgDir\":\"rcv\",\"contactId\":6,\"chatItemId\":3}," else ""}
+           ${if (deleted) "\"itemDeleted\":{\"type\":\"deleted\",\"deletedTs\":\"2026-11-07T11:00:00Z\",\"chatType\":\"direct\"}," else ""}
+           ${if (timedDeleteAt != null) "\"itemTimed\":{\"ttl\":86400,\"deleteAt\":\"$timedDeleteAt\"}," else ""}
+           "itemEdited":$edited,"userMention":false,"hasLink":false,"deletable":$deletable,"editable":$editable,
+           "showGroupAsSender":false,"createdAt":"$ts","updatedAt":"$ts"},
+         "content":{"type":"$contentType","msgContent":{"type":"text","text":"$text"}},
+         "mentions":{},${if (quote != null) "\"quotedItem\":$quote," else ""}"reactions":$reactions}"""
+
+    /** CIQuote {chatDir, itemId?, sharedMsgId?, sentAt, content}. */
+    fun quote(itemId: Long?, text: String, dir: String = "directRcv") = """
+        {"chatDir":{"type":"$dir"},${if (itemId != null) "\"itemId\":$itemId," else ""}"sharedMsgId":"cXVvdGVk",
+         "sentAt":"2026-11-07T10:00:00Z","content":{"type":"text","text":"$text"}}"""
+
+    /** CIReactionCount list: 👍 ×2 (one ours), ❤ ×1, plus an unknown reaction the core may pass on. */
+    const val REACTIONS = """[
+        {"reaction":{"type":"emoji","emoji":"👍"},"userReacted":true,"totalReacted":2},
+        {"reaction":{"type":"emoji","emoji":"❤"},"userReacted":false,"totalReacted":1},
+        {"reaction":{"type":"custom","id":"x"},"userReacted":false,"totalReacted":4}]"""
+
+    fun aChatItem(contactId: Long, item: String) =
+        """{"chatInfo":{"type":"direct","contact":${contact(contactId, "Bob", "ready")}},"chatItem":$item}"""
+
+    /** chatItemUpdated, as a reply to /_update item and as the contact's edit event. */
+    fun chatItemUpdated(item: String) = """{"result":{"type":"chatItemUpdated","user":$USER,"chatItem":${aChatItem(5, item)}}}"""
+
+    /** chatItemReaction: ACIReaction {chatInfo, chatReaction {chatDir, chatItem, sentAt, reaction}}. */
+    fun chatItemReaction(item: String, added: Boolean = true) = """{"result":{"type":"chatItemReaction","user":$USER,
+        "added":$added,"reaction":{"chatInfo":{"type":"direct","contact":${contact(5, "Bob", "ready")}},
+        "chatReaction":{"chatDir":{"type":"directRcv"},"chatItem":$item,"sentAt":"2026-11-07T10:30:00Z",
+        "reaction":{"type":"emoji","emoji":"❤"}}}}}"""
+
+    /** chatItemsDeleted {chatItemDeletions: [{deletedChatItem, toChatItem?}], byUser, timed}. */
+    fun chatItemsDeleted(deletions: List<Pair<String, String?>>, byUser: Boolean = false, timed: Boolean = false) =
+        """{"result":{"type":"chatItemsDeleted","user":$USER,"chatItemDeletions":[${
+            deletions.joinToString(",") { (gone, now) ->
+                """{"deletedChatItem":${aChatItem(5, gone)},"toChatItem":${if (now != null) aChatItem(5, now) else "null"}}"""
+            }}],"byUser":$byUser,"timed":$timed}}"""
+
+    val CONTACT_CODE = """{"result":{"type":"contactCode","user":$USER,"contact":${contact(5, "Bob", "ready")},
+        "connectionCode":"12345 67890 12345 67890"}}"""
+
+    val CONNECTION_VERIFIED = """{"result":{"type":"connectionVerified","user":$USER,"verified":true,
+        "expectedCode":"12345 67890 12345 67890"}}"""
+
+    val CONNECTION_NOT_VERIFIED = CONNECTION_VERIFIED.replace("\"verified\":true", "\"verified\":false")
+
+    /** LocalProfile of a pre-v2 user: an avatar, a short description, an address link and own preferences. */
+    const val LOCAL_PROFILE = """{"profileId":1,"displayName":"Alice","fullName":"Alice A","shortDescr":"hi",
+        "image":"data:image/jpg;base64,QUJD","contactLink":"https://encrogram.nytmanager.com/a#xyz",
+        "preferences":{"timedMessages":{"allow":"yes","ttl":3600},"reactions":{"allow":"yes"},"calls":{"allow":"yes"}},
+        "peerType":"human","localAlias":"","futureField":{"keep":true}}"""
 
     val ACTIVE_USER = """{"result":{"type":"activeUser","user":$USER}}"""
 
@@ -74,6 +160,25 @@ object Samples {
          "pccConnStatus":{"type":"new"},"viaContactUri":false,"localAlias":"","createdAt":"2026-11-07T09:00:00Z",
          "updatedAt":"2026-11-07T09:00:00Z"}},"chatItems":[],
          "chatStats":{"unreadCount":0,"unreadMentions":0,"reportsCount":0,"minUnreadItemId":0,"unreadChat":false}}
+        ]}}"""
+
+    /** Pinned + muted Ann (timer on for both), Bob (last message ours, delivered), Cat (last message deleted). */
+    val API_CHATS_V2 = """{"result":{"type":"apiChats","user":$USER,"chats":[
+        {"chatInfo":{"type":"direct","contact":${contact(5, "Bob", "ready")}},
+         "chatItems":[${item(41, "directSnd", "sndMsgContent", "hi", "sndRcvd", ts = "2026-11-07T12:00:00Z")}],
+         "chatStats":{"unreadCount":0,"unreadMentions":0,"reportsCount":0,"minUnreadItemId":0,"unreadChat":false}},
+        {"chatInfo":{"type":"direct","contact":${contact(7, "Ann", "ready", favorite = true, ntfs = "none",
+            mergedPrefs = """{"timedMessages":{"enabled":{"forUser":true,"forContact":true},
+              "userPreference":{"type":"contact","preference":{"allow":"yes","ttl":86400}},
+              "contactPreference":{"allow":"yes"}}}""")}},
+         "chatItems":[${item(50, "directRcv", "rcvMsgContent", "old", "rcvRead", ts = "2026-11-01T08:00:00Z")}],
+         "chatStats":{"unreadCount":0,"unreadMentions":0,"reportsCount":0,"minUnreadItemId":0,"unreadChat":false}},
+        {"chatInfo":{"type":"direct","contact":${contact(8, "Cat", "ready",
+            mergedPrefs = """{"timedMessages":{"enabled":{"forUser":true,"forContact":false},
+              "userPreference":{"type":"contact","preference":{"allow":"yes","ttl":600}},
+              "contactPreference":{"allow":"no"}}}""")}},
+         "chatItems":[${item(60, "directRcv", "rcvMsgContent", "secret words", "rcvRead", ts = "2026-11-07T13:00:00Z", deleted = true)}],
+         "chatStats":{"unreadCount":1,"unreadMentions":0,"reportsCount":0,"minUnreadItemId":0,"unreadChat":false}}
         ]}}"""
 
     val API_CHAT = """{"result":{"type":"apiChat","user":$USER,"chat":{

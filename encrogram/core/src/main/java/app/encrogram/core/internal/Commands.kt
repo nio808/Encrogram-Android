@@ -46,12 +46,24 @@ internal object Commands {
         return "/set file paths " + asciiJson(o.toString())
     }
 
-    /** CreateActiveUser -> `activeUser`. NewUser {profile, pastTimestamp}; userChatRelay/clientService default off. */
+    /**
+     * CreateActiveUser -> `activeUser`. NewUser {profile, pastTimestamp}; userChatRelay/clientService default off.
+     * The profile carries [CoreJson.SECURED_PROFILE_PREFS] (fullDelete yes, calls no) from the start, so every
+     * contact receives them at connection time.
+     */
     fun createUser(displayName: String): String {
-        val profile = JSONObject().put("displayName", displayName).put("fullName", "")
+        val prefs = JSONObject()
+        for ((feature, allow) in CoreJson.SECURED_PROFILE_PREFS) prefs.put(feature, JSONObject().put("allow", allow))
+        val profile = JSONObject().put("displayName", displayName).put("fullName", "").put("preferences", prefs)
         val newUser = JSONObject().put("profile", profile).put("pastTimestamp", false)
         return "/_create user " + asciiJson(newUser.toString())
     }
+
+    /**
+     * APIUpdateProfile -> `userProfileUpdated` | `userProfileNoChange`. [profile] is the WHOLE Profile (the core
+     * replaces it): build it with [CoreJson.profileUpdate]. Sent to every contact.
+     */
+    fun updateProfile(userId: Long, profile: JSONObject): String = "/_profile $userId " + asciiJson(profile.toString())
 
     /** APISetServerOperators -> `serverOperatorConditions`. */
     fun setOperators(operators: JSONArray): String = "/_operators " + asciiJson(operators.toString())
@@ -65,8 +77,31 @@ internal object Commands {
     /** APIGetChats -> `apiChats` (each chat with its last item). */
     fun getChats(userId: Long): String = "/_get chats $userId"
 
-    /** APIGetChat with ChatPagination CPLast -> `apiChat`. */
-    fun getChat(contactId: Long, count: Int): String = "/_get chat @$contactId count=$count"
+    /**
+     * APIGetChat -> `apiChat`. ChatPagination: `count=N` (CPLast), `before=<id> count=N`, `after=<id> count=N`,
+     * `around=<id> count=N` (N before, the item, N after). `search=` must be last: it takes the rest of the line
+     * as plain text (no JSON escaping), so it must come from [InputRules.searchQuery].
+     */
+    fun getChat(
+        contactId: Long,
+        count: Int,
+        beforeId: Long? = null,
+        afterId: Long? = null,
+        aroundId: Long? = null,
+        search: String? = null,
+    ): String {
+        require(listOfNotNull(beforeId, afterId, aroundId).size <= 1) { "one cursor at most" }
+        val pagination = when {
+            beforeId != null -> "before=$beforeId count=$count"
+            afterId != null -> "after=$afterId count=$count"
+            aroundId != null -> "around=$aroundId count=$count"
+            else -> "count=$count"
+        }
+        val cmd = "/_get chat @$contactId $pagination"
+        if (search == null) return cmd
+        require(search.isNotEmpty() && search == InputRules.searchQuery(search)) { "search must be sanitised first" }
+        return "$cmd search=$search"
+    }
 
     /** APIAddContact: one-time invitation -> `invitation` {connLinkInvitation {connFullLink, connShortLink}}. */
     fun addContact(userId: Long): String = "/_connect $userId"
@@ -81,11 +116,67 @@ internal object Commands {
         return "/connect $link"
     }
 
-    /** APISendMessages to a contact -> `newChatItems`. */
-    fun sendText(contactId: Long, text: String): String {
+    /**
+     * APISendMessages to a contact -> `newChatItems`. With [quotedItemId] the message is a reply; the core copies
+     * the quoted item's content into the message itself. Per-message ttl stays default: the contact's timer applies.
+     */
+    fun sendText(contactId: Long, text: String, quotedItemId: Long? = null): String {
         val msgContent = JSONObject().put("type", "text").put("text", text)
         val composed = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
+        if (quotedItemId != null) composed.put("quotedItemId", quotedItemId)
         return "/_send @$contactId json " + asciiJson(JSONArray().put(composed).toString())
+    }
+
+    /** APIUpdateChatItem -> `chatItemUpdated` | `chatItemNotChanged`; error `invalidChatItemUpdate` when not editable. */
+    fun updateItem(contactId: Long, itemId: Long, text: String): String {
+        val msgContent = JSONObject().put("type", "text").put("text", text)
+        val updated = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
+        return "/_update item @$contactId $itemId live=off json " + asciiJson(updated.toString())
+    }
+
+    /** CIDeleteMode for [deleteItems]: `internal` (for me), `broadcast` (for everyone). */
+    enum class DeleteMode(val word: String) { INTERNAL("internal"), BROADCAST("broadcast") }
+
+    /** APIDeleteChatItem -> `chatItemsDeleted`. `broadcast` errors with `invalidChatItemDelete` when not allowed. */
+    fun deleteItems(contactId: Long, itemIds: List<Long>, mode: DeleteMode): String {
+        require(itemIds.isNotEmpty()) { "no items" }
+        return "/_delete item @$contactId ${itemIds.joinToString(",")} ${mode.word}"
+    }
+
+    /** APIChatItemReaction -> `chatItemReaction`. [emoji] must pass [InputRules.reactionAllowed]. */
+    fun reaction(contactId: Long, itemId: Long, add: Boolean, emoji: String): String {
+        require(InputRules.reactionAllowed(emoji)) { "unknown reaction" }
+        val reaction = JSONObject().put("type", "emoji").put("emoji", emoji)
+        return "/_reaction @$contactId $itemId ${if (add) "on" else "off"} " + asciiJson(reaction.toString())
+    }
+
+    /** APIForwardChatItems -> `newChatItems` for the destination (empty when nothing could be forwarded). */
+    fun forward(toContactId: Long, fromContactId: Long, itemIds: List<Long>): String {
+        require(itemIds.isNotEmpty()) { "no items" }
+        return "/_forward @$toContactId @$fromContactId ${itemIds.joinToString(",")} ttl=default"
+    }
+
+    /** APISetChatSettings -> `cmdOk`. [settings] is the WHOLE ChatSettings: build it with [CoreJson.chatSettingsUpdate]. */
+    fun chatSettings(contactId: Long, settings: JSONObject): String = "/_settings @$contactId " + asciiJson(settings.toString())
+
+    /** APIClearChat -> `chatCleared`. Local only: nothing is sent to the contact. */
+    fun clearChat(contactId: Long): String = "/_clear chat @$contactId"
+
+    /** APIDeleteChat, full -> `contactDeleted`. notify=on first tells the contact (x.directDel). */
+    fun deleteContact(contactId: Long, notify: Boolean): String =
+        "/_delete @$contactId full notify=${if (notify) "on" else "off"}"
+
+    /** APISetContactPrefs -> `contactPrefsUpdated`. [prefs] is the WHOLE Preferences: see [CoreJson.contactPrefsUpdate]. */
+    fun setContactPrefs(contactId: Long, prefs: JSONObject): String = "/_set prefs @$contactId " + asciiJson(prefs.toString())
+
+    /** APIGetContactCode -> `contactCode` {contact, connectionCode}. */
+    fun getCode(contactId: Long): String = "/_get code @$contactId"
+
+    /** APIVerifyContact -> `connectionVerified` {verified, expectedCode}. Null [code] clears the verification. */
+    fun verifyCode(contactId: Long, code: String?): String {
+        if (code == null) return "/_verify code @$contactId"
+        require(code == InputRules.securityCode(code)) { "code must be checked first" }
+        return "/_verify code @$contactId $code"
     }
 
     /** APIChatRead -> `cmdOk`. */

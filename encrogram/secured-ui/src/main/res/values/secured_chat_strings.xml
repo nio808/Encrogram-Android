@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings for the Secured chat screen (SecuredChatActivity, SecuredMessageMapper, SecuredReactionsView).
+     Generic verbs (Reply, Copy, Edit, Delete, Forward, Select, Cancel, Open) reuse Telegram's own LocaleController strings. -->
+<resources>
+    <string name="secchat_connecting">Connecting…</string>
+    <string name="secchat_deleted">Message deleted</string>
+    <string name="secchat_forwarded">Forwarded</string>
+    <string name="secchat_empty_message">Empty message</string>
+    <string name="secchat_quote_fallback">Message</string>
+    <string name="secchat_you">You</string>
+    <string name="secchat_reply_to">Reply to %1$s</string>
+    <string name="secchat_link_outside">It opens outside Encrogram, in another app.</string>
+    <string name="secchat_forwarded_to">Forwarded to %1$s</string>
+    <string name="secchat_no_forward_targets">No other Secured chats yet</string>
+    <string name="secchat_action_failed">Could not complete: %1$s</string>
+    <string name="secchat_quote_not_loaded">The original message is not loaded</string>
+    <string name="secchat_reaction_a11y">%1$s, %2$d</string>
+    <string name="secchat_reaction_mine_a11y">%1$s, %2$d, including yours</string>
+</resources>

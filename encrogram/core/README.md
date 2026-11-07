@@ -4,7 +4,9 @@ Implements `app.encrogram.core.api.SecuredEngine` over the embedded SimpleX chat
 7.0.0.12, from the official v7.0.4 release). Kotlin Android library. It has **no dependency on Telegram code**
 (`:TMessagesProj`): it is meant to become the shared core.
 
-MVP scope: one local profile, one-time invite links, 1:1 text chats, honest delivery ticks.
+Scope (v2, text): one local profile, one-time invite links, 1:1 text chats with reply, edit, delete (for me and
+for everyone), reactions, forward, paging and in-chat search, disappearing messages, pin, mute, archive, security
+codes, honest delivery ticks.
 
 ## Layout
 
@@ -17,6 +19,9 @@ MVP scope: one local profile, one-time invite links, 1:1 text chats, honest deli
 | `internal/ServerConfigPlanner.kt` | Pure logic that restricts the engine to our relays and verifies it. |
 | `internal/LinkChecker.kt` | Offline link check against the allowlist. |
 | `internal/CoreJson.kt`, `Commands.kt`, `StatusMapper.kt`, `ErrorMapper.kt` | Small JSON layer (org.json, tolerant of unknown fields), command strings, status and error mapping. |
+| `internal/MessageMapper.kt` | Parsed items and chats -> `SecuredMessage` / `ChatSummary`; chat-list order. |
+| `internal/InputRules.kt` | Input limits and checks: text and reply size, reaction set, search sanitising (G1), security codes, page windows. |
+| `internal/ArchiveStore.kt` | The local-only archive flags (a small file in the no-backup folder). |
 | `internal/DbKeyStore.kt` | Database passphrase, wrapped by an Android Keystore key. |
 | `internal/NativeCore.kt` | Loads the native libraries once per process. |
 | `internal/SecuredLog.kt` | The only logger. |
@@ -82,13 +87,96 @@ parameter name, a repeated name or control characters are rejected, so the link 
 host in the link must be one of our SMP servers, with matching port (default 5223) and fingerprint when given.
 
 Other commands: invite `/_connect <userId>` (the short `https://<our SMP host>/i#…` link is returned; the
-invite is discarded if it fails our own link check), connect `/connect <checked link>`, messages
-`/_get chat @<id> count=<n>`, send `/_send @<id> json [{"msgContent":{"type":"text","text":…},"mentions":{}}]`,
-read `/_read chat @<id>`. Commands are made pure ASCII (non-ASCII escaped as `\uXXXX` in JSON) because the JNI
-glue passes Java's modified UTF-8.
+invite is discarded if it fails our own link check), connect `/connect <checked link>`, read `/_read chat @<id>`.
+Commands are made pure ASCII (non-ASCII escaped as `\uXXXX` in JSON) because the JNI glue passes Java's modified
+UTF-8. Source of every shape: `research/simplex-chat-api-for-ui.md` §1, checked against the core source.
+
+## v2 commands
+
+| Contract call | Engine command | Reply |
+|---|---|---|
+| `createProfile` | `/_create user {"profile":{…,"preferences":{"fullDelete":{"allow":"yes"},"calls":{"allow":"no"}}},…}` | `activeUser` |
+| `updateProfile` | `/u`, then `/_profile <userId> {whole Profile}` (read-modify-write) | `userProfileUpdated` / `userProfileNoChange` |
+| `messages(chatId, page)` | `/_get chat @<id> [before=\|after=\|around=<itemId>] count=<n> [search=<text>]` | `apiChat` |
+| `sendMessage` | `/_send @<id> json [{"msgContent":{"type":"text","text":…},"quotedItemId":<id>?,"mentions":{}}]` | `newChatItems` |
+| `itemAction(Edit)` | `/_update item @<id> <itemId> live=off json {"msgContent":{…},"mentions":{}}` | `chatItemUpdated` / `chatItemNotChanged` |
+| `itemAction(DeleteForMe)` | `/_delete item @<id> <id1>,<id2> internal` | `chatItemsDeleted` |
+| `itemAction(DeleteForEveryone)` | `/_delete item @<id> <ids> broadcast` | `chatItemsDeleted` |
+| `itemAction(React)` | `/_reaction @<id> <itemId> on\|off {"type":"emoji","emoji":…}` | `chatItemReaction` |
+| `itemAction(ForwardTo)` | `/_forward @<to> @<from> <ids> ttl=default` | `newChatItems` (target chat) |
+| `chatAction(SetPinned / SetMuted)` | `/_get chat @<id> count=1` (current settings), then `/_settings @<id> {whole ChatSettings}` | `cmdOk` |
+| `chatAction(SetArchived)` | none: local only | - |
+| `chatAction(ClearHistory)` | `/_clear chat @<id>` (local) | `chatCleared` |
+| `chatAction(Delete)` | `/_delete @<id> full notify=on\|off` | `contactDeleted` |
+| `chatAction(SetDisappearing)` | `/_set prefs @<id> {whole userPreferences, timedMessages {allow:yes, ttl?}}` | `contactPrefsUpdated` |
+| `securityCode` | `/_get code @<id>` | `contactCode` |
+| `verifyContact` | `/_verify code @<id> [<digits and spaces>]` | `connectionVerified` |
+
+`sendText` is `sendMessage(…, null, …)`; `messages(chatId, limit)` is `messages(chatId, MessagePage(limit))`.
+Every action result also arrives through the listener; callbacks only say whether the action was accepted.
+
+### Behaviour
+
+- **Pin** is SimpleX's `favorite`, **mute** is `enableNtfs` (`none` / `all`). `/_settings` replaces the whole
+  ChatSettings, so the current one is read first and only one field changes (`sendRcpts` and future fields stay).
+- **Archive** is local only: a set of contact ids in `noBackupFilesDir/encrogram-secured/archived_chats`, never
+  sent. Not SharedPreferences: those can be backed up (Telegram's manifest allows backup) and a restored list would
+  mark the wrong chats, because contact ids start again on a new device. Ids of chats that are gone are dropped at
+  every list reload.
+- **Order:** `chats()` is pinned first, then newest activity, then id.
+- **Profile preferences:** new profiles get `fullDelete: yes` and `calls: no` in `/_create user`. At every start,
+  after the relay lock-down is verified, a profile without them gets one read-modify-write `/_profile` that keeps
+  every other field (the core replaces the whole profile, gotcha G4). It is a no-op once merged and never fails the
+  start. `updateProfile` uses the same merge.
+- **Delete:** for me = `internal` (row removed, `onMessagesRemoved`). For everyone = `broadcast`: the core removes
+  the row when `fullDelete` is on for us (`onMessagesRemoved`) or only marks it (`onMessageChanged` with
+  `deleted=true`). A deleted message never carries text, a quote or reactions, even though the core keeps them in a
+  marked item's JSON. A deleted last message shows no text in the chat list.
+- **React:** only `SECURED_REACTIONS` (heart = U+2764 alone), else `NOT_ALLOWED` before anything is sent. Adding a
+  reaction we already have, or removing one we don't, is a no-op; a fourth own reaction is `NOT_ALLOWED`.
+- **Edit:** the message is read first; only our own text message with `meta.editable` (under 24 h, not forwarded,
+  sent) can be edited, else `NOT_ALLOWED`. The core's `invalidChatItemUpdate` maps to `NOT_ALLOWED` as well.
+- **Reply size:** the core copies the whole quoted text into the reply (`/_send` has no way to shorten it), so a
+  reply is refused when new text + quoted text + 300 bytes of quote overhead exceeds the 13,000-byte text cap.
+  `QuotePreview.text` is cut to 300 characters for the UI.
+- **Search (G1):** `search=` is plain text, and JNI's modified UTF-8 mangles characters outside the BMP. Such
+  characters and control characters split the query and the longest remaining run is searched (a wider match,
+  never a missed one). An emoji-only query is `NOT_ALLOWED`. Queries are capped at 256 characters.
+- **Disappearing messages:** `SetDisappearing(ttl)` sets OUR timer for the contact (`allow: yes, ttl`); `null`
+  keeps `allow: yes` without a timer, so the contact can still use theirs. `ChatSummary.disappearingTtlSeconds` is
+  our timer when the feature is on for both sides. Marking a chat read starts the countdown of received timed
+  messages; the engine then reports them with `onMessageChanged` (`expiresAtMs` set).
+- **Security code:** `securityCode` returns the core's code (digit groups). `verifyContact(code)` accepts digits and
+  spaces only; `null` clears verification. Both reload the list so `verified` follows the core.
+
+### Events handled
+
+| Event | Listener |
+|---|---|
+| `newChatItems` | `onMessageReceived` (incoming), row update |
+| `chatItemsStatusesUpdated` | `onMessageStatusChanged`, last-message ticks in the row |
+| `chatItemUpdated` (contact's edit) | `onMessageChanged`; list reload when it is the row's last message |
+| `chatItemReaction` | `onMessageChanged` with the full reaction list |
+| `chatItemsDeleted` (contact's delete, or `timed:true` expiry) | `onMessagesRemoved` (row gone) or `onMessageChanged` (marked) |
+| contact and chat-info events (`CHAT_LIST_EVENTS`) | list reload, `onChatsChanged` |
+
+Replies to our own actions are applied the same way (the core does not echo them as events). Forwarded copies
+arrive with `onMessageReceived` in the target chat.
 
 Status mapping: `sndNew`/`sndWarning` -> SENDING, `sndSent` -> SENT_TO_SERVER, `sndRcvd` -> DELIVERED,
 `sndError*` -> FAILED, `rcvNew`/`rcvRead` -> RECEIVED. Unknown states never claim progress.
+
+Errors: `NOT_ALLOWED` is a refusal by the protocol's or our rules (edit after 24 h, delete for everyone too late,
+unknown reaction, reaction limit, reply to a deleted message, emoji-only search, nothing forwardable). Malformed
+input (empty, too long, bad page) is `UNKNOWN`, as before.
+
+## Background receiving
+
+Package `app.encrogram.core.background`. No Telegram imports; the app passes the small icon, accent colour and the tap intent through `NotificationConfig` (`SecuredBackground.install`).
+- **What runs:** `SecuredService`, a foreground service of type `remoteMessaging`, keeps the process alive so the engine's relay connections stay open. It starts the engine (idempotent), never stops it, and turns incoming messages (not outgoing, not from muted chats, not the chat on screen) into notifications. `SecuredBootReceiver` restarts it after boot or an update, only if the saved flag `background_enabled` is on (own prefs file `encrogram_secured_bg`, no message data). `BatteryHelper` has the battery-exemption checks and request intent.
+- **Channels:** group `encrogram_secured`; `encrogram_secured_messages` (high) and `encrogram_secured_service` (low, no badge). Posted with tag `encrogram_secured`, id = the local chat id's hash, so Telegram's untagged ids cannot touch them.
+- **What a notification shows:** hidden mode only. Title "Encrogram", text "New Secured message" ("3 new Secured messages" for several), no sender, no text, no actions, private on the lock screen. The tap intent carries only the local chat id.
+- **Known limits:** force-stop stops it until the app is opened again. No reply or mark-read actions yet. Prompt delivery while the phone is idle (Doze) needs the battery exemption. After the user swipes the app away, the restart alarm may be refused by Android 12+ and then the service returns only at the next app launch or boot. Battery cost is not measured yet.
 
 ## Fetching the native libraries
 
@@ -103,7 +191,11 @@ Downloads `simplex-aarch64.apk` from the simplex-chat v7.0.4 GitHub release, che
 ## Tests
 
 `encrogram/tools/build.sh :encrogram-core:testDebugUnitTest` — JVM tests for reply/event parsing (samples shaped
-after `bots/api`), status mapping, link checks, command strings and the relay lock-down planner.
+after `bots/api` and the core's types), status mapping, link checks, command strings, the relay lock-down planner,
+and for v2: every new command string (`CommandsTest`), item replies and events including "a deleted message never
+carries text" (`ItemEventsTest`), row fields, sort order, archive store and read-modify-write of settings and
+preferences (`ChatListTest`), the profile preference merge (`ProfileMergeTest`), and input rules: reactions,
+search sanitising, reply budget, security codes, page windows (`InputRulesTest`).
 
 ## Logging
 
@@ -141,5 +233,11 @@ addresses or keys.
   wrapped passphrase in `encrogram_secured_keys` may be backed up, but it is useless without the device-bound
   Keystore key, and the databases live in `noBackupFilesDir`.
 - The JNI glue's returned C strings are never freed (upstream defect, small leak per call).
+- A reply keeps the quoted text (it is part of the reply's own message), so `replyTo.text` can still show text of a
+  message that was later deleted. Hiding it needs a lookup per quote; not done yet.
+- `/_profile` merge drops `localBadge` (it has a different shape from Profile's `badge`). Encrogram never sets a
+  badge, so nothing is lost today; revisit if badges are ever used.
+- Action commands that go over the network (send, edit, delete for everyone, reactions, forward, profile and
+  preference updates) hold the engine thread like sends do.
 
 SimpleX Chat is AGPL v3: keep its notices and publish the source of what we ship.

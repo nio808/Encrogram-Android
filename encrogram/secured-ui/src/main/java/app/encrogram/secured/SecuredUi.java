@@ -27,6 +27,17 @@ public final class SecuredUi {
         void onSecuredLink();
     }
 
+    /** Told when a Secured notification was tapped while the Chats page may be on screen. */
+    public interface OpenChatListener {
+        void onSecuredOpenChat();
+    }
+
+    /** Action and extra of a Secured notification's tap intent (built in the app module). */
+    public static final String ACTION_OPEN_CHAT = "app.encrogram.secured.OPEN_CHAT";
+    public static final String EXTRA_CHAT_ID = "secured_chat_id";
+    /** "Open the Secured tab, no particular chat" (the notification summary). */
+    static final long NO_CHAT = Long.MIN_VALUE;
+
     private static Application app;
     private static EngineProvider provider;
     private static SecuredEngine engine;
@@ -34,6 +45,8 @@ public final class SecuredUi {
 
     private static String pendingLink;
     private static LinkListener linkListener;
+    private static Long pendingOpenChat;
+    private static OpenChatListener openChatListener;
 
     private SecuredUi() {}
 
@@ -84,5 +97,47 @@ public final class SecuredUi {
 
     static void setLinkListener(LinkListener listener) {
         linkListener = listener;
+    }
+
+    // ---- notification taps -----------------------------------------------------------------------------------
+
+    /** Called by the intent hook. The chat id is kept in memory only; {@link #NO_CHAT} means just the Secured tab. */
+    public static void deliverOpenChat(long chatId) {
+        synchronized (SecuredUi.class) {
+            pendingOpenChat = chatId;
+        }
+        final OpenChatListener l = openChatListener;
+        if (l != null) {
+            new Handler(Looper.getMainLooper()).post(l::onSecuredOpenChat);
+        }
+    }
+
+    static synchronized Long takePendingOpenChat() {
+        final Long id = pendingOpenChat;
+        pendingOpenChat = null;
+        return id;
+    }
+
+    static void setOpenChatListener(OpenChatListener listener) {
+        openChatListener = listener;
+    }
+
+    // ---- debug self-check -------------------------------------------------------------------------------------
+
+    private static boolean selfChecked;
+
+    /**
+     * Debug builds only: runs the row and message mapper self-checks once per process and logs PASS or the failed
+     * check names to logcat (tag EncrogramSelfCheck). The checks use made-up text, never user data.
+     */
+    static void debugSelfCheck(Context context, int account) {
+        if (selfChecked || context == null
+                || (context.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            return;
+        }
+        selfChecked = true;
+        final java.util.ArrayList<String> failed = new java.util.ArrayList<>(ChatRowMapper.selfCheck());
+        failed.addAll(SecuredMessageMapper.selfCheck(context, account));
+        android.util.Log.i("EncrogramSelfCheck", failed.isEmpty() ? "PASS" : "FAIL " + failed);
     }
 }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_bg_title">Receive Secured messages in the background</string>
+    <string name="sec_bg_text">Secured stays connected to Encrogram\'s servers instead of using push notifications. This uses some battery. Without this, messages may arrive late while your phone is idle.</string>
+    <string name="sec_bg_allow">Allow</string>
+    <string name="sec_bg_not_now">Not now</string>
+</resources>
