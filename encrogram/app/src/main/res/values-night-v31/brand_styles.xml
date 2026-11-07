@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Encrogram splash, Android 12+ in dark mode. Same as values-night/brand_styles.xml, except the window background
+    is a plain colour, because Android 12+ draws the splash from the windowSplashScreen* attributes.
+    TMessagesProj has no values-night-v31, so this adds a configuration rather than replacing one. See docs/brand/BRAND.md.
+-->
+<resources>
+    <style name="Theme.TMessages.Start" parent="Theme.AppCompat.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:actionBarStyle">@style/ActionBar.Transparent.TMessages.Start</item>
+        <item name="android:colorBackground">#1f2732</item>
+        <item name="android:windowBackground">@color/brand_splash_background</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:colorPrimaryDark">@color/brand_splash_background</item>
+        <item name="android:colorPrimary">@color/brand_splash_background</item>
+        <item name="android:navigationBarColor">@color/brand_splash_background</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>
+        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>
+        <item name="android:windowSplashScreenBackground">@color/brand_splash_background</item>
+    </style>
+</resources>

@@ -43,5 +43,8 @@ public class EncrogramApplication extends ApplicationLoader {
         // These only work for upstream's official package names.
         BuildVars.SUPPORTS_PASSKEYS = false;
         BuildVars.IS_BILLING_UNAVAILABLE = true;
+        // Debug builds of Telegram show a "Test Backend" box on login and write request logs to disk; Encrogram wants neither.
+        BuildVars.DEBUG_VERSION = false;
+        BuildVars.LOGS_ENABLED = false;
     }
 }

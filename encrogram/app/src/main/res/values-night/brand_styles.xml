@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Encrogram splash, dark mode. Overrides Telegram's Theme.TMessages.Start from
+    TMessagesProj/src/main/res/values-night/styles.xml by name; all items are copied from there.
+    Night mode outranks the API level when Android picks resources, so this style serves Android 8 to 11 at night;
+    values-night-v31 serves Android 12+ at night. Changed: the deep indigo splash with the light indigo mark
+    (colours from values-night/brand_colors.xml) and matching bars. See docs/brand/BRAND.md.
+-->
+<resources>
+    <style name="Theme.TMessages.Start" parent="Theme.AppCompat.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:actionBarStyle">@style/ActionBar.Transparent.TMessages.Start</item>
+        <item name="android:colorBackground">#1f2732</item>
+        <item name="android:windowBackground">@drawable/brand_splash_window</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:colorPrimaryDark">@color/brand_splash_background</item>
+        <item name="android:colorPrimary">@color/brand_splash_background</item>
+        <item name="android:navigationBarColor">@color/brand_splash_background</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>
+        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>
+        <item name="android:windowSplashScreenBackground">@color/brand_splash_background</item>
+    </style>
+</resources>

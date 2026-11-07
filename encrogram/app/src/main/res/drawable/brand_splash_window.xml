@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash for Android 8 to 11: the starting window of Theme.TMessages.Start. Encro Indigo field with the mark in
+     the centre (night: deep indigo with a light indigo mark, through the colour resources). Android 12+ uses the
+     SplashScreen attributes in values-v31 and values-night-v31 instead. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/brand_splash_background" />
+    <item
+        android:width="180dp"
+        android:height="180dp"
+        android:gravity="center"
+        android:drawable="@drawable/brand_mark_splash" />
+</layer-list>

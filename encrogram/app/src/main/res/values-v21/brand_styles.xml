@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Encrogram splash, Android 8 to 11 (day). Overrides Telegram's Theme.TMessages.Start from
+    TMessagesProj/src/main/res/values-v21/styles.xml by name; all items are copied from there.
+    Changed: windowBackground (indigo field with the mark), and the status bar, navigation bar and primary colours
+    so the bars match the splash instead of Telegram's blue-grey. See docs/brand/BRAND.md.
+-->
+<resources>
+    <style name="Theme.TMessages.Start" parent="Theme.AppCompat.Light">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:actionBarStyle">@style/ActionBar.Transparent.TMessages.Start</item>
+        <item name="android:colorBackground">@android:color/white</item>
+        <item name="android:windowBackground">@drawable/brand_splash_window</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:colorPrimaryDark">@color/brand_splash_background</item>
+        <item name="android:colorPrimary">@color/brand_splash_background</item>
+        <item name="android:navigationBarColor">@color/brand_splash_background</item>
+        <item name="android:textViewStyle">@style/MyTextViewStyle</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>

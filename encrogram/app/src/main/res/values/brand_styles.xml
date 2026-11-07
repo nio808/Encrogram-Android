@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Encrogram splash. Overrides Telegram's Theme.TMessages.Start by name (app resources win over TMessagesProj at
+    merge, so TMessagesProj stays untouched). A style override replaces the whole style, so every item below is
+    copied from TMessagesProj/src/main/res/values/styles.xml; only windowBackground changes.
+    LaunchActivity calls setTheme(Theme_TMessages) in onCreate, so this background only paints the starting window.
+    When merging a new Telegram release, compare these items with upstream's. See docs/brand/BRAND.md.
+-->
+<resources>
+    <style name="Theme.TMessages.Start" parent="Theme.AppCompat.Light">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:actionBarStyle">@style/ActionBar.Transparent.TMessages.Start</item>
+        <item name="android:colorBackground">@android:color/white</item>
+        <item name="android:windowBackground">@drawable/brand_splash_window</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:textViewStyle">@style/MyTextViewStyle</item>
+    </style>
+</resources>

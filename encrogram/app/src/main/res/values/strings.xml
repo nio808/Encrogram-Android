@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Encrogram overrides of Telegram strings (same names as TMessagesProj/src/main/res/values/strings.xml; app resources
+    win at merge). Only places where "Telegram" means this app's own name are changed. Where "Telegram" means the
+    Telegram network or the Telegram tab, it stays. Wording rules: docs/brand/BRAND.md (honest-wording checklist).
+
+    Limit: Telegram's LocaleController prefers its cloud language pack over these resources once that pack has loaded
+    (BuildVars.USE_CLOUD_STRINGS), so these show on a fresh install and may revert to Telegram's text later.
+-->
+<resources>
+    <string name="AppName">Encrogram</string>
+    <string name="AppNameBeta">Encrogram Beta</string>
+
+    <!-- IntroActivity. The page 1 title is drawn as the "encrogram" wordmark (drawable telegram_logo); the text below
+         is what screen readers announce. -->
+    <string name="Page1Title">Encrogram</string>
+    <string name="Page1Message">Your **Telegram** chats, plus **Secured**:\na separate end-to-end encrypted messenger.</string>
+    <string name="Page2Title">Familiar</string>
+    <string name="Page2Message">The **Telegram** tab works just like\nthe Telegram app you know.</string>
+    <string name="Page3Title">Separate</string>
+    <string name="Page3Message">**Secured** never uses your Telegram\naccount or Telegram\'s servers.</string>
+    <string name="Page4Title">Encrypted</string>
+    <string name="Page4Message">**Secured** messages are end-to-end encrypted.\nOur servers pass them on but can\'t read them.</string>
+    <string name="Page5Title">Independent</string>
+    <string name="Page5Message">**Secured** runs on our own servers,\nso it works even when Telegram is blocked.</string>
+    <string name="Page6Title">Unofficial</string>
+    <string name="Page6Message">**Encrogram** is built on the Telegram API.\nIt is not affiliated with Telegram.</string>
+
+    <!-- Settings > Appearance > App icon. Telegram's alternate icons are re-skinned as Encrogram variants
+         (mipmap-anydpi-v26/icon_N_launcher.xml), so their names change too. -->
+    <string name="AppIconDefault">Indigo</string>
+    <string name="AppIconVintage">Daylight</string>
+    <string name="AppIconAqua">Midnight</string>
+    <string name="AppIconPremium">Lavender</string>
+    <string name="AppIconTurbo">Ink</string>
+    <string name="AppIconNox">Onyx</string>
+</resources>
