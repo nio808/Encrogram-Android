@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="encrogram_app_name" translatable="false">Encrogram</string>
+    <color name="encrogram_icon_background">#4A4FD6</color>
+</resources>

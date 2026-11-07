@@ -1,0 +1,8 @@
+# SimpleX native libraries are fetched by tools/fetch-simplex-libs.sh (too big for git; pinned by checksum)
+core/src/main/jniLibs/
+# Local secrets: Telegram API ID/hash, signing passwords
+local.properties
+*.keystore
+*.jks
+build/
+build-times.log

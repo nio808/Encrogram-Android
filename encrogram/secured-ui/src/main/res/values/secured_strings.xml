@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secured strings are plain Android resources, not Telegram's LocaleController keys. English only for the MVP. -->
+<resources>
+    <string name="sec_segment_telegram">Telegram</string>
+    <string name="sec_segment_secured">Secured</string>
+    <string name="sec_a11y_telegram">Telegram chats, tab 1 of 2</string>
+    <string name="sec_a11y_telegram_selected">Telegram chats, tab 1 of 2, selected</string>
+    <string name="sec_a11y_telegram_connecting">, Telegram is connecting</string>
+    <string name="sec_a11y_secured">Secured chats, private network, tab 2 of 2</string>
+    <string name="sec_a11y_secured_selected">Secured chats, private network, tab 2 of 2, selected</string>
+    <string name="sec_a11y_secured_unread">, %1$d unread</string>
+    <string name="sec_a11y_switcher">Telegram or Secured</string>
+
+    <string name="sec_profile_title">Set up Secured</string>
+    <string name="sec_profile_explain">Secured runs on Encrogram\'s own servers, separate from Telegram. Your Secured profile lives only on this phone.</string>
+    <string name="sec_profile_hint">Pick a name people will see. It doesn\'t have to be your Telegram name.</string>
+    <string name="sec_profile_name_hint">Secured name</string>
+    <string name="sec_profile_continue">Continue</string>
+    <string name="sec_profile_creating">Creating profile…</string>
+
+    <string name="sec_engine_starting">Starting Secured…</string>
+    <string name="sec_engine_failed_title">Can\'t start Secured</string>
+    <string name="sec_engine_failed_unknown">Secured could not start on this phone.</string>
+    <string name="sec_engine_missing">Secured is not available in this build.</string>
+    <string name="sec_try_again">Try again</string>
+
+    <string name="sec_empty_title">No Secured chats yet</string>
+    <string name="sec_empty_text">Secured is a separate private network inside Encrogram. Invite someone with a one-time link, or connect with a link you received.</string>
+    <string name="sec_create_invite">Create invite</string>
+    <string name="sec_connect_link">Connect with a link</string>
+    <string name="sec_new_chat">New Secured chat</string>
+    <string name="sec_waiting_contact">Waiting for your contact to connect</string>
+    <string name="sec_no_messages_yet">No messages yet</string>
+
+    <string name="sec_invite_title">Invite link</string>
+    <string name="sec_invite_creating">Creating a one-time link…</string>
+    <string name="sec_invite_explain">Anyone who sees this link can connect with you, so send it only to the person you want to chat with. It works once.</string>
+    <string name="sec_invite_failed">Could not create the link: %1$s</string>
+    <string name="sec_copy">Copy</string>
+    <string name="sec_share">Share</string>
+    <string name="sec_link_copied">Link copied</string>
+    <string name="sec_share_chooser">Share invite link</string>
+    <string name="sec_share_subject">Encrogram Secured invite</string>
+
+    <string name="sec_connect_title">Connect with a link</string>
+    <string name="sec_connect_hint">Paste an Encrogram link</string>
+    <string name="sec_paste">Paste</string>
+    <string name="sec_connect">Connect</string>
+    <string name="sec_connecting">Connecting…</string>
+    <string name="sec_connect_unapproved">This link points to a server Encrogram doesn\'t use (%1$s), so it was not opened.</string>
+    <string name="sec_connect_malformed">That doesn\'t look like an Encrogram Secured link.</string>
+    <string name="sec_connect_failed">Could not connect: %1$s</string>
+    <string name="sec_connect_sent">Request sent. The chat appears once the other person\'s app answers.</string>
+
+    <string name="sec_chat_status_not_verified">Secured · Not verified</string>
+    <string name="sec_chat_status_verified">Secured · Verified</string>
+    <string name="sec_chat_status_waiting">Secured · Waiting for %1$s to connect</string>
+    <string name="sec_composer_hint">Secured message</string>
+    <string name="sec_send">Send</string>
+    <string name="sec_chat_empty">No messages yet. Say hello.</string>
+    <string name="sec_send_failed">Could not send: %1$s</string>
+    <string name="sec_today">Today</string>
+    <string name="sec_yesterday">Yesterday</string>
+
+    <string name="sec_tick_sending">Sending</string>
+    <string name="sec_tick_sent">Sent to server</string>
+    <string name="sec_tick_delivered">Delivered</string>
+    <string name="sec_tick_failed">Not sent</string>
+    <string name="sec_message_out">You, %1$s, %2$s</string>
+    <string name="sec_message_in">%1$s, %2$s</string>
+</resources>

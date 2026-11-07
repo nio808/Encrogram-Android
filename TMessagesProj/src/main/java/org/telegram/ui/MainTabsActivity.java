@@ -801,7 +801,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         bundle.putBoolean("hasMainTabs", true);
         dialogsActivity = new DialogsActivity(bundle);
         dialogsActivity.setMainTabsActivityController(new MainTabsActivityControllerImpl());
-        putFragmentAtPosition(POSITION_CHATS, dialogsActivity);
+        putFragmentAtPosition(POSITION_CHATS, org.telegram.messenger.EncrogramHooks.get().wrapChats(dialogsActivity)); // ENCROGRAM-HOOK(chatsHost)
         return dialogsActivity;
     }
 
@@ -828,7 +828,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
             args.putBoolean("hasMainTabs", true);
             dialogsActivity = new DialogsActivity(args);
             dialogsActivity.setMainTabsActivityController(new MainTabsActivityControllerImpl());
-            return dialogsActivity;
+            return org.telegram.messenger.EncrogramHooks.get().wrapChats(dialogsActivity); // ENCROGRAM-HOOK(chatsHost)
         } else if (position == POSITION_PROFILE) {
             Bundle args = new Bundle();
             args.putLong("user_id", UserConfig.getInstance(currentAccount).getClientUserId());

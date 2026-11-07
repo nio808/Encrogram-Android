@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Two overlapping speech bubbles; the front one has a keyhole. Flat, no resemblance to Telegram's mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#B3FFFFFF"
+        android:pathData="M30,32h34a6,6 0,0 1,6 6v16a6,6 0,0 1,-6 6h-20l-9,8v-8h-5a6,6 0,0 1,-6 -6v-16a6,6 0,0 1,6 -6z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,46h34a6,6 0,0 1,6 6v16a6,6 0,0 1,-6 6h-5v8l-9,-8h-20a6,6 0,0 1,-6 -6v-16a6,6 0,0 1,6 -6z" />
+    <path
+        android:fillColor="#4A4FD6"
+        android:pathData="M63,54.5a4,4 0,0 1,2 7.5l1.5,6h-7l1.5,-6a4,4 0,0 1,2 -7.5z" />
+</vector>

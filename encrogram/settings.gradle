@@ -1,0 +1,9 @@
+// Encrogram modules. Included from the root settings.gradle by one ENCROGRAM-HOOK line.
+include ':encrogram-core'
+project(':encrogram-core').projectDir = new File(settingsDir, 'encrogram/core')
+
+include ':encrogram-secured-ui'
+project(':encrogram-secured-ui').projectDir = new File(settingsDir, 'encrogram/secured-ui')
+
+include ':Encrogram_App'
+project(':Encrogram_App').projectDir = new File(settingsDir, 'encrogram/app')

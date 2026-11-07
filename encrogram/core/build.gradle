@@ -1,0 +1,37 @@
+// :encrogram-core — the Secured engine. Kotlin, Android library, NO dependency on Telegram code.
+// Native libraries (src/main/jniLibs/arm64-v8a, git-ignored) come from encrogram/tools/fetch-simplex-libs.sh.
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'app.encrogram.core'
+    compileSdkVersion 36
+
+    defaultConfig {
+        minSdkVersion 26          // SimpleX core requires Android 8.0+
+        targetSdkVersion 36
+        ndk { abiFilters 'arm64-v8a' }   // SimpleX ships ARM libraries; MVP is arm64 only
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    packagingOptions {
+        jniLibs {
+            // Prebuilt and pinned by SHA-256: ship them byte for byte, don't re-strip.
+            keepDebugSymbols += ['**/libsimplex.so', '**/libsupport.so', '**/libapp-lib.so']
+        }
+    }
+
+    testOptions { unitTests.returnDefaultValues = true }
+}
+
+dependencies {
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'   // real org.json for JVM unit tests (Android's is a stub)
+}

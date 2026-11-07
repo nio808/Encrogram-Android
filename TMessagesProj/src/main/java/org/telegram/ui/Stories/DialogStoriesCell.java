@@ -332,7 +332,7 @@ public class DialogStoriesCell extends FrameLayout implements NotificationCenter
         titleView.setFocusableInTouchMode(true);
         addView(titleView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        telegramLogoView = new ImageView(context);
+        telegramLogoView = org.telegram.messenger.EncrogramHooks.get().storiesTitleView(context, fragment, new ImageView(context)); // ENCROGRAM-HOOK(storiesTitle)
         telegramLogoView.setContentDescription(getString(R.string.AppName));
         telegramLogoView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
         telegramLogoView.setImageResource(R.drawable.telegram_logo_2);
@@ -2207,7 +2207,7 @@ public class DialogStoriesCell extends FrameLayout implements NotificationCenter
 
     private void checkUi_titleVisibility() {
         final float progress = MathUtils.clamp(Math.min(collapsedProgress, collapsedProgress2), 0, 1);
-        final float titleVisibility = animatorHasTitleText.getFloatValue();
+        final float titleVisibility = org.telegram.messenger.EncrogramHooks.get().storiesTitleVisibility(telegramLogoView, animatorHasTitleText.getFloatValue()); // ENCROGRAM-HOOK(storiesTitle)
         final float logoVisibility = 1f - titleVisibility;
         final float titleAlpha = titleVisibility * progress;
         final float logoAlpha = logoVisibility * progress;

@@ -1,0 +1,191 @@
+// :Encrogram_App — Encrogram's application module: identity, signing, version codes.
+// Modelled on TMessagesProj_App/build.gradle (which stays untouched as the upstream reference).
+apply plugin: 'com.android.application'
+apply plugin: 'org.telegram.build-app-plugin'
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+configurations {
+    compile.exclude module: 'support-v4'
+}
+
+configurations.all {
+    exclude group: 'com.google.firebase', module: 'firebase-core'
+    exclude group: 'androidx.recyclerview', module: 'recyclerview'
+}
+
+// Encrogram's own version (never touch upstream's gradle.properties).
+def loadProps = { File f ->
+    def p = new Properties()
+    if (f.exists()) { f.withInputStream { p.load(it) } }
+    return p
+}
+def encProps = loadProps(rootProject.file('encrogram/encrogram.properties'))
+// Git-ignored, per machine: TELEGRAM_API_ID, TELEGRAM_API_HASH, SECURED_SMP_SERVER, SECURED_XFTP_SERVER.
+def localProps = loadProps(rootProject.file('encrogram/local.properties'))
+
+def encVersionCode = Integer.parseInt(encProps.getProperty('ENC_VERSION_CODE', '1'))
+def encVersionName = encProps.getProperty('ENC_VERSION_NAME', '0.1.0-mvp')
+def smpHost = (loadProps(rootProject.file('encrogram/secured.properties')).getProperty('SECURED_SMP_HOST') ?: '').trim()
+def q = { String s -> '"' + (s ?: '').replace('\\', '\\\\').replace('"', '\\"') + '"' }
+
+dependencies {
+    implementation project(':TMessagesProj')
+    implementation project(':encrogram-core')
+    implementation project(':encrogram-secured-ui')
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+}
+
+android {
+    namespace 'app.encrogram.android'
+    compileSdkVersion 36
+    buildToolsVersion '36.0.0'
+
+    lintOptions {
+        disable 'MissingTranslation'
+        disable 'ExtraTranslation'
+        disable 'BlockedPrivateApi'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+
+    androidResources {
+        noCompress += "pack"
+        localeFilters += ["zz"]
+    }
+
+    signingConfigs {
+        // Debug: our own key, whose path and password live in the git-ignored encrogram/local.properties
+        // (ENCROGRAM_DEBUG_STORE_FILE, _STORE_PASSWORD, _KEY_ALIAS). Its fingerprint is published in
+        // web/.well-known/assetlinks.json so invite links open Encrogram directly. Without it we fall back to
+        // upstream's public test key, and links won't verify (never publish that key's fingerprint).
+        debug {
+            def ownKey = (localProps.getProperty('ENCROGRAM_DEBUG_STORE_FILE') ?: '').trim()
+            if (ownKey) {
+                def pw = (localProps.getProperty('ENCROGRAM_DEBUG_STORE_PASSWORD') ?: '').trim()
+                storeFile file(ownKey)
+                storePassword pw
+                keyAlias((localProps.getProperty('ENCROGRAM_DEBUG_KEY_ALIAS') ?: 'encrogram-debug').trim())
+                keyPassword pw
+            } else {
+                logger.warn("WARNING: ENCROGRAM_DEBUG_STORE_FILE missing from encrogram/local.properties; " +
+                        "signing with upstream's public test key, so invite links will open the browser.")
+                storeFile file("../../TMessagesProj/config/release.keystore")
+                storePassword RELEASE_STORE_PASSWORD
+                keyAlias RELEASE_KEY_ALIAS
+                keyPassword RELEASE_KEY_PASSWORD
+            }
+        }
+        // Release: still upstream's dummy key; the build is blocked until our own API ID and release key exist.
+        release {
+            storeFile file("../../TMessagesProj/config/release.keystore")
+            storePassword RELEASE_STORE_PASSWORD
+            keyAlias RELEASE_KEY_ALIAS
+            keyPassword RELEASE_KEY_PASSWORD
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    defaultConfig {
+        applicationId 'app.encrogram.android'
+        minSdkVersion 26          // SimpleX core requires Android 8.0+
+        targetSdkVersion 36
+        versionCode encVersionCode * 10 + 9
+        versionName encVersionName
+        ndkVersion "27.2.12479018"
+        multiDexEnabled true
+
+        vectorDrawables.generatedDensities = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi']
+
+        ndk { abiFilters 'arm64-v8a' }   // MVP is arm64 only (SimpleX libraries are ARM)
+
+        externalNativeBuild {
+            cmake {
+                version '3.22.1'
+                arguments '-DANDROID_STL=c++_static', '-DANDROID_PLATFORM=android-23'
+                targets 'tmessages.49'
+            }
+        }
+
+        // Secured configuration from encrogram/local.properties (empty when absent).
+        buildConfigField 'int', 'TELEGRAM_API_ID', (localProps.getProperty('TELEGRAM_API_ID') ?: '0').trim()
+        buildConfigField 'String', 'TELEGRAM_API_HASH', q((localProps.getProperty('TELEGRAM_API_HASH') ?: '').trim())
+        buildConfigField 'String', 'SECURED_LINK_HOST', q(smpHost)
+        buildConfigField 'String', 'SECURED_SMP_SERVER', q((localProps.getProperty('SECURED_SMP_SERVER') ?: '').trim())
+        buildConfigField 'String', 'SECURED_XFTP_SERVER', q((localProps.getProperty('SECURED_XFTP_SERVER') ?: '').trim())
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+            signingConfig signingConfigs.debug
+            applicationIdSuffix ".debug"
+            minifyEnabled false
+            shrinkResources false
+            multiDexEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), '../../TMessagesProj/proguard-rules.pro'
+            ndk.debugSymbolLevel = 'FULL'
+        }
+
+        release {
+            debuggable false
+            jniDebuggable false
+            signingConfig signingConfigs.release
+            minifyEnabled true
+            shrinkResources true
+            multiDexEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), '../../TMessagesProj/proguard-rules.pro'
+            ndk.debugSymbolLevel = 'FULL'
+        }
+    }
+
+    // Upstream's per-build-type manifests carry the permissions and services Telegram needs.
+    // The debug one is copied into src/debug (our app name and label). Release has its own copy in
+    // src/release (upstream's release manifest with our label instead of "Telegram").
+    sourceSets.release {
+        manifest.srcFile 'src/release/AndroidManifest.xml'
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "encrogram.apk"
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+}
+
+// Dummy upstream google-services.json plus client entries for our package names (see encrogram/app/README.md).
+apply plugin: 'com.google.gms.google-services'
+
+// Rule 6: releases need our own Telegram API ID. Debug builds only warn (values are never printed).
+def missingApiKeys = []
+if (!(localProps.getProperty('TELEGRAM_API_ID') ?: '').trim()) missingApiKeys << 'TELEGRAM_API_ID'
+if (!(localProps.getProperty('TELEGRAM_API_HASH') ?: '').trim()) missingApiKeys << 'TELEGRAM_API_HASH'
+if (!missingApiKeys.isEmpty()) {
+    logger.warn("WARNING: ${missingApiKeys.join(', ')} missing from encrogram/local.properties; " +
+            "this build uses upstream's sample Telegram API ID. Fine for debug, not allowed for release.")
+    gradle.taskGraph.whenReady { graph ->
+        def rel = graph.allTasks.find { it.project == project && it.name.toLowerCase().contains('release') }
+        if (rel != null) {
+            throw new GradleException("Release build blocked: ${missingApiKeys.join(', ')} missing from " +
+                    "encrogram/local.properties. Register our own Telegram API ID first (AGENTS.md rule 6).")
+        }
+    }
+}

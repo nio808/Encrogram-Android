@@ -1,0 +1,37 @@
+// :encrogram-secured-ui — the Secured screens (Java, to match Telegram's code style).
+// Depends on Telegram's UI classes (:TMessagesProj) only for look and scaffolding, and on :encrogram-core
+// (the engine contract) for data. Secured data never goes through Telegram's network or storage classes;
+// see .claude/skills/secured-boundary/SKILL.md.
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'app.encrogram.secured'
+    compileSdkVersion 36
+
+    defaultConfig {
+        minSdkVersion 26
+        targetSdkVersion 36
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    compileOptions {
+        // :encrogram-core is compiled for Java 17 (Kotlin jvmTarget 17), so javac must read class version 61.
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lintOptions {
+        disable 'MissingTranslation'
+        disable 'ExtraTranslation'
+    }
+}
+
+dependencies {
+    implementation project(':TMessagesProj')
+    implementation project(':encrogram-core')
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
+    // TMessagesProj declares these as implementation dependencies, so they are not visible to us transitively.
+    implementation 'androidx.core:core:1.16.0'
+    implementation 'androidx.customview:customview:1.1.0'
+    implementation 'androidx.annotation:annotation:1.9.1'
+}

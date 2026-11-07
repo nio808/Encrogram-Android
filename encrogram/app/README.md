@@ -1,0 +1,24 @@
+# :Encrogram_App
+
+Application module (`app.encrogram.android`, debug `app.encrogram.android.debug`, name "Encrogram", minSdk 26, arm64-v8a only).
+Modelled on `TMessagesProj_App/build.gradle`, which stays untouched. Output: `encrogram.apk`.
+
+## Contents
+- `build.gradle` - identity, signing (upstream dummy keystore, debug only), `versionCode = ENC_VERSION_CODE*10+9` from `encrogram/encrogram.properties`,
+  BuildConfig fields from git-ignored `encrogram/local.properties`: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `SECURED_SMP_SERVER`, `SECURED_XFTP_SERVER`.
+- `src/debug/AndroidManifest.xml` - copy of upstream's debug SDK23 manifest with our label.
+- `src/main/AndroidManifest.xml` - `EncrogramApplication`, and the exported `SecuredLinkActivity` (autoVerify for https://encrogram.nytmanager.com/i and /a).
+- `EncrogramApplication` - sets `BuildVars.APP_ID/APP_HASH` (if provided) before Telegram starts, installs the hooks.
+- `EngineBootstrap` - builds `RelayConfig` and the engine; derives allowed hosts from the relay addresses.
+- `google-services.json` - upstream's dummy file plus client entries for our package names. FCM push will not work (sender mismatch); MVP has no push.
+- Resources: own adaptive icon (no Telegram mark), app name.
+- Not copied: Google voice search client (GoogleVoiceClientActivity/Service).
+
+## Upstream hooks (all marked `ENCROGRAM-HOOK`)
+Upstream files changed: settings.gradle, MainTabsActivity, DialogsActivity, DialogStoriesCell (4) plus new file `messenger/EncrogramHooks.java`.
+- `settings.gradle:19` settings - include encrogram modules.
+- `ui/MainTabsActivity.java:805` and `:832` chatsHost - wrap DialogsActivity in the two-page host.
+- `ui/DialogsActivity.java:3192` titleOverlay - route Telegram's connection text to the control.
+- `ui/DialogsActivity.java:3523` titleSwitcher - install the control in the action-bar title.
+- `ui/Stories/DialogStoriesCell.java:336` and `:2211` storiesTitle - control in the stories title slot; keep it visible.
+- Each of the three files also has one `import` line marked `ENCROGRAM-HOOK(import)`.

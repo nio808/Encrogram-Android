@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:installLocation="auto">
+
+    <application
+        android:name="app.encrogram.android.EncrogramApplication"
+        tools:replace="name">
+
+        <!--
+            Secured invite / address links (https://encrogram.nytmanager.com/i#... and /a#...).
+            A tiny activity of our own, not a LaunchActivity hook. The activity is exported, so explicit intents
+            can bypass this filter; the code re-checks https, our host, no user info, default port, exact path
+            /i or /a and a length limit, and drops anything else. A valid link goes to the Secured connect
+            flow in memory only (which still runs the engine's checkLink) and the normal app opens.
+        -->
+        <activity
+            android:name="app.encrogram.android.SecuredLinkActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:host="encrogram.nytmanager.com" />
+                <data android:path="/i" />
+                <data android:path="/a" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
