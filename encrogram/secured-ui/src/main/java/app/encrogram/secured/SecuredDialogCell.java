@@ -127,7 +127,7 @@ final class SecuredDialogCell extends DialogCell {
     }
 
     /** A thin-stroke tick in the box DialogCell lays out for its own tick drawable. Honest: not the filled "read" look. */
-    private static final class OutlineTick extends Drawable {
+    static final class OutlineTick extends Drawable {
         private final int w, h;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path path = new Path();

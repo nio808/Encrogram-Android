@@ -28,6 +28,7 @@ import org.telegram.ui.DialogsActivity;
 import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.WeakHashMap;
+import app.encrogram.core.background.SecuredBackground;
 
 /**
  * The real implementation behind EncrogramHooks. Each method is the target of a one-line call in Telegram's code
@@ -167,6 +168,10 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
             if (intent == null || !SecuredUi.ACTION_OPEN_CHAT.equals(intent.getAction())) {
                 return false;
             }
+            // LaunchActivity is exported: only intents from our own notifications (per-install token) open a chat.
+            if (!SecuredBackground.isOwnTapIntent(activity, intent)) {
+                return false;
+            }
             // Reopened from Recents: Android re-delivers the old notification intent; don't reopen that chat again.
             if ((intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
                 return false;
@@ -175,7 +180,11 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 return false;
             }
             SecuredUi.deliverOpenChat(intent.getLongExtra(SecuredUi.EXTRA_CHAT_ID, SecuredUi.NO_CHAT));
-            return UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated() || SecuredUi.securedOnly();
+            final boolean handled = UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated() || SecuredUi.securedOnly();
+            if (handled) {
+                intent.setAction(null); // as Telegram does: an activity restored after process death must not reopen the chat
+            }
+            return handled;
         } catch (Throwable t) {
             fail("handleIntent", t);
             return false;

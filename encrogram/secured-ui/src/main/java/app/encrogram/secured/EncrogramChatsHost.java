@@ -216,7 +216,8 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     // ---- notification taps -----------------------------------------------------------------------------------
 
     private void onOpenChatAvailable() {
-        if (!resumed || viewPager == null) {
+        // No "resumed" check: a tap must open the chat even while another screen (another chat) is on top.
+        if (viewPager == null) {
             return;
         }
         final Long chatId = SecuredUi.takePendingOpenChat();

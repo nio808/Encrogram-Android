@@ -4,14 +4,11 @@ package app.encrogram.core.background
 // licensed under AGPL-3.0; modifications by Encrogram. SimplexService itself is based on the robertohuertas.com
 // foreground-service tutorial and ntfy-android SubscriberService.kt (Apache-2.0).
 
-import android.app.AlarmManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import app.encrogram.core.api.SecuredEngine
 import app.encrogram.core.api.SecuredListener
@@ -57,22 +54,6 @@ class SecuredService : Service() {
         // A started service must call startForeground again on every start, or Android may kill the app.
         if (stopped || !startForegroundNow()) return START_NOT_STICKY
         return START_STICKY
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        if (stopped || !BackgroundState.isEnabled(this)) return
-        // Restart in 1 s if the system tears the process down with the task (inexact alarm, no permission needed).
-        try {
-            val pi = PendingIntent.getService(
-                this, 0, Intent(this, SecuredService::class.java),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-            getSystemService(AlarmManager::class.java)
-                .set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000, pi)
-        } catch (t: Throwable) {
-            SecuredLog.crash(SecuredLog.Ev.BG_START_REFUSED, t)
-        }
     }
 
     override fun onDestroy() {

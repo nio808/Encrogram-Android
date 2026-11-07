@@ -43,6 +43,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.FlagSecureReason;
 import org.telegram.messenger.ChatMessageSharedResources;
 import org.telegram.messenger.Emoji;
 import org.telegram.messenger.LocaleController;
@@ -136,6 +137,7 @@ public class SecuredChatActivity extends BaseFragment {
     private static final int MENU_DELETE = 12;
 
     private final long chatId;
+    private FlagSecureReason flagSecure;
     private final SecuredChatResources chatResources = new SecuredChatResources();
     private SecuredEngine engine;
     private boolean destroyed;   // isPaused is BaseFragment's, also set in onResume/onPause below
@@ -1489,6 +1491,11 @@ public class SecuredChatActivity extends BaseFragment {
     public void onResume() {
         super.onResume();
         isPaused = false;
+        // Secured screens stay out of Recents thumbnails and screenshots (SPEC: protect screen, on by default).
+        if (flagSecure == null && getParentActivity() != null) {
+            flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
+        }
+        if (flagSecure != null) flagSecure.attach();
         AndroidUtilities.requestAdjustResize(getParentActivity(), classGuid);
         if (engine != null) engine.markRead(chatId);
         SecuredBackground.setOpenChat(chatId);
@@ -1500,6 +1507,7 @@ public class SecuredChatActivity extends BaseFragment {
     public void onPause() {
         super.onPause();
         isPaused = true;
+        if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
         SecuredBackground.setOpenChat(null);
     }

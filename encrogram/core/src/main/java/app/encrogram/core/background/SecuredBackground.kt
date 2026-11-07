@@ -23,6 +23,14 @@ class NotificationConfig(
 /** Entry point of background receiving. One call from Application.onCreate, one from the UI when Secured is first used. */
 object SecuredBackground {
 
+    /** Extra on our notification tap intents; [isOwnTapIntent] checks it. */
+    const val EXTRA_OPEN_TOKEN = "secured_open_token"
+
+    /** True only for intents built by our own notifications (they carry this install's random token). */
+    @JvmStatic
+    fun isOwnTapIntent(context: Context, intent: Intent?): Boolean =
+        intent != null && BackgroundState.isOpenToken(context, intent.getStringExtra(EXTRA_OPEN_TOKEN))
+
     internal var engineProvider: () -> SecuredEngine? = { null }
         private set
     internal var config: NotificationConfig? = null

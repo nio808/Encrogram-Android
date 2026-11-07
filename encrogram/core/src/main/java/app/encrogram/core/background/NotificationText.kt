@@ -8,7 +8,7 @@ internal object NotificationText {
 
     const val TITLE = "Encrogram"
     const val SERVICE_TITLE = "Encrogram Secured"
-    const val SERVICE_TEXT = "Secured is connected"
+    const val SERVICE_TEXT = "Receiving Secured messages in the background"  // not "connected": shown in every engine state
     const val GROUP_NAME = "Encrogram Secured"
     const val MESSAGES_CHANNEL_NAME = "Secured messages"
     const val SERVICE_CHANNEL_NAME = "Secured connection"

@@ -26,6 +26,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.FlagSecureReason;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
@@ -126,6 +127,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private ActionBarMenuItem pinItem, muteItem, archiveItem, otherItem;
     private ImageView actionModeClose;
     private ChatRowMapper.Labels labels;
+    private FlagSecureReason flagSecure;
 
     SecuredDialogsActivity(EncrogramChatsHost host) {
         super();
@@ -184,17 +186,21 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     }
 
     private void consumePending() {
-        if (host != null || !resumed || destroyed) {
+        if (host != null || destroyed) {
+            return;
+        }
+        // A notification tap opens the chat even while another screen is on top; a link waits for this page.
+        final Long chatId = SecuredUi.takePendingOpenChat();
+        if (chatId != null && chatId != SecuredUi.NO_CHAT) {
+            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
+        }
+        if (!resumed) {
             return;
         }
         final String link = SecuredUi.takePendingLink();
         if (link != null) {
             setPendingLink(link);
             showPendingLinkIfReady();
-        }
-        final Long chatId = SecuredUi.takePendingOpenChat();
-        if (chatId != null && chatId != SecuredUi.NO_CHAT) {
-            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
         }
     }
 
@@ -294,6 +300,11 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onResume() {
         super.onResume();
         resumed = true;
+        // Secured screens stay out of Recents thumbnails and screenshots (SPEC: protect screen, on by default).
+        if (flagSecure == null && getParentActivity() != null) {
+            flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
+        }
+        if (flagSecure != null) flagSecure.attach();
         ensureEngine();
         if (host == null) {
             background.arm();
@@ -310,6 +321,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onPause() {
         super.onPause();
         resumed = false;
+        if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
     }
 
@@ -475,7 +487,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         nameInput.setSingleLine(true);
         nameInput.setMaxLines(1);
         nameInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        nameInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        nameInput.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING); // keyboard doesn't learn Secured names
         nameInput.setPadding(dp(16), dp(12), dp(16), dp(12));
         nameInput.setBackground(Kit.roundRect(Theme.multAlpha(Kit.color(Theme.key_windowBackgroundWhiteBlackText), 0.06f), 12));
         nameInput.setOnEditorActionListener((v, actionId, event) -> {
@@ -573,6 +585,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         searchField = new FragmentSearchField(context, SecuredResourcesProvider.get());
         searchField.setPadding(dp(4), dp(4), dp(4), dp(4));
         searchField.setHintText(context.getString(R.string.sec_list_search_hint), false);
+        searchField.editText.setImeOptions(searchField.editText.getImeOptions() | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         searchField.editText.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}

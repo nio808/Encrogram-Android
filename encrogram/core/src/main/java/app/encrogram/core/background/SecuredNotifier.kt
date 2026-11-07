@@ -49,7 +49,8 @@ internal object SecuredNotifier {
 
     private fun tap(context: Context, config: NotificationConfig, chatId: Long?, requestCode: Int): PendingIntent =
         PendingIntent.getActivity(
-            context, requestCode, config.openIntent(chatId),
+            context, requestCode,
+            config.openIntent(chatId).putExtra(SecuredBackground.EXTRA_OPEN_TOKEN, BackgroundState.openToken(context)),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 

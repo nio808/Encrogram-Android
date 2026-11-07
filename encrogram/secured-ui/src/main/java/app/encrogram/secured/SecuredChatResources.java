@@ -24,10 +24,11 @@ final class SecuredChatResources implements Theme.ResourcesProvider {
     private MessageDrawable msgOut, msgOutSelected, msgOutMedia, msgOutMediaSelected;
     private final TintedIcon check = new TintedIcon(Theme.key_drawable_msgOutCheck, Theme.key_chat_outSentCheck);
     private final TintedIcon checkSelected = new TintedIcon(Theme.key_drawable_msgOutCheckSelected, Theme.key_chat_outSentCheckSelected);
-    private final TintedIcon checkRead = new TintedIcon(Theme.key_drawable_msgOutCheckRead, Theme.key_chat_outSentCheckRead);
-    private final TintedIcon checkReadSelected = new TintedIcon(Theme.key_drawable_msgOutCheckReadSelected, Theme.key_chat_outSentCheckReadSelected);
-    private final TintedIcon halfCheck = new TintedIcon(Theme.key_drawable_msgOutHalfCheck, Theme.key_chat_outSentCheckRead);
-    private final TintedIcon halfCheckSelected = new TintedIcon(Theme.key_drawable_msgOutHalfCheckSelected, Theme.key_chat_outSentCheckReadSelected);
+    // "Delivered" (Telegram draws its read pair here) uses our outline ticks, as in the chat list: never the filled read look.
+    private final OutlineIcon checkRead = new OutlineIcon(Theme.key_drawable_msgOutCheckRead, Theme.key_chat_outSentCheckRead);
+    private final OutlineIcon checkReadSelected = new OutlineIcon(Theme.key_drawable_msgOutCheckReadSelected, Theme.key_chat_outSentCheckReadSelected);
+    private final OutlineIcon halfCheck = new OutlineIcon(Theme.key_drawable_msgOutHalfCheck, Theme.key_chat_outSentCheckRead);
+    private final OutlineIcon halfCheckSelected = new OutlineIcon(Theme.key_drawable_msgOutHalfCheckSelected, Theme.key_chat_outSentCheckReadSelected);
 
     @Override
     public int getColor(int key) {
@@ -115,6 +116,30 @@ final class SecuredChatResources implements Theme.ResourcesProvider {
                 tint = color;
                 drawable.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.MULTIPLY));
             }
+            return drawable;
+        }
+    }
+
+    /** Our outline tick in the size of Telegram's tick drawable for {@code drawableKey}, coloured by {@code colorKey}. */
+    private final class OutlineIcon {
+        private final String drawableKey;
+        private final int colorKey;
+        private SecuredDialogCell.OutlineTick drawable;
+
+        OutlineIcon(String drawableKey, int colorKey) {
+            this.drawableKey = drawableKey;
+            this.colorKey = colorKey;
+        }
+
+        Drawable get() {
+            if (drawable == null) {
+                final Drawable global = Theme.getThemeDrawable(drawableKey);
+                if (global == null) {
+                    return null;
+                }
+                drawable = new SecuredDialogCell.OutlineTick(global.getIntrinsicWidth(), global.getIntrinsicHeight());
+            }
+            drawable.setColor(getColor(colorKey));
             return drawable;
         }
     }
