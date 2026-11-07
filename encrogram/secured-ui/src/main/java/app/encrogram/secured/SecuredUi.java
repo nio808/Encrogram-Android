@@ -101,6 +101,11 @@ public final class SecuredUi {
         linkListener = listener;
     }
 
+    /** Clears the link listener only if it is still {@code listener} (a newer owner may have replaced it). */
+    static void clearLinkListener(LinkListener listener) {
+        if (linkListener == listener) linkListener = null;
+    }
+
     // ---- notification taps -----------------------------------------------------------------------------------
 
     /** Called by the intent hook. The chat id is kept in memory only; {@link #NO_CHAT} means just the Secured tab. */
@@ -122,6 +127,16 @@ public final class SecuredUi {
 
     static void setOpenChatListener(OpenChatListener listener) {
         openChatListener = listener;
+    }
+
+    /** Clears the open-chat listener only if it is still {@code listener}. */
+    static void clearOpenChatListener(OpenChatListener listener) {
+        if (openChatListener == listener) openChatListener = null;
+    }
+
+    /** True while a Secured screen is alive to consume a notification tap. */
+    static boolean hasOpenChatListener() {
+        return openChatListener != null;
     }
 
     // ---- logged-out doors ------------------------------------------------------------------------------------

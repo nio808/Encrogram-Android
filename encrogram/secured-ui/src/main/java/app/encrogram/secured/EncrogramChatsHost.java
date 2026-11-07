@@ -83,17 +83,21 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         return false;
     }
 
+    // Kept as fields: a method reference makes a new object each time, and clearing must match the one we set.
+    private final SecuredUi.LinkListener linkListener = this::onLinkAvailable;
+    private final SecuredUi.OpenChatListener openChatListener = this::onOpenChatAvailable;
+
     @Override
     public boolean onFragmentCreate() {
-        SecuredUi.setLinkListener(this::onLinkAvailable);
-        SecuredUi.setOpenChatListener(this::onOpenChatAvailable);
+        SecuredUi.setLinkListener(linkListener);
+        SecuredUi.setOpenChatListener(openChatListener);
         return super.onFragmentCreate();
     }
 
     @Override
     public void onFragmentDestroy() {
-        SecuredUi.setLinkListener(null);
-        SecuredUi.setOpenChatListener(null);
+        SecuredUi.clearLinkListener(linkListener);
+        SecuredUi.clearOpenChatListener(openChatListener);
         background.stop();
         final Runnable release = onDestroy;
         onDestroy = null;
@@ -118,6 +122,27 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     public void onPause() {
         super.onPause();
         resumed = false;
+    }
+
+    @Override
+    public void onBecomeFullyVisible() {
+        super.onBecomeFullyVisible();
+        removeDoors();
+    }
+
+    /**
+     * After a Telegram login from the welcome screen or the standalone Secured list, that door stays below the main
+     * tabs (LoginActivity replaces only itself). Remove it so Back never lands on a logged-out screen.
+     */
+    private void removeDoors() {
+        final INavigationLayout layout = getParentLayout();
+        if (layout == null || layout.getFragmentStack() == null) return;
+        for (BaseFragment f : new ArrayList<>(layout.getFragmentStack())) {
+            if (f instanceof SecuredWelcomeActivity
+                    || f instanceof SecuredDialogsActivity && ((SecuredDialogsActivity) f).isStandalone()) {
+                layout.removeFragmentFromStack(f);
+            }
+        }
     }
 
     // ---- switching (Owner) -----------------------------------------------------------------------------------

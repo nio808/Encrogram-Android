@@ -179,10 +179,31 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     @Override
     public boolean onFragmentCreate() {
         if (host == null) {
-            SecuredUi.setLinkListener(this::consumePending);
-            SecuredUi.setOpenChatListener(this::consumePending);
+            SecuredUi.setLinkListener(pendingLinkListener);
+            SecuredUi.setOpenChatListener(pendingChatListener);
         }
         return super.onFragmentCreate();
+    }
+
+    private final SecuredUi.LinkListener pendingLinkListener = this::consumePending;
+    private final SecuredUi.OpenChatListener pendingChatListener = this::consumePending;
+
+    /**
+     * Opens a chat like a native one: in the right-hand pane on tablets when inside the tabs host. Standalone (logged
+     * out) the list lives in the tablet layers stack, where forceRightLayout would close the list and then the app.
+     */
+    /** True when shown on its own (no Telegram login), not as the Secured page of the tabs host. */
+    boolean isStandalone() {
+        return host == null;
+    }
+
+    private void openChat(long chatId) {
+        final SecuredChatActivity chat = new SecuredChatActivity(chatId);
+        if (host != null) {
+            presentFragment(new INavigationLayout.NavigationParams(chat).forceRightLayout());
+        } else {
+            presentFragment(chat);
+        }
     }
 
     private void consumePending() {
@@ -192,7 +213,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         // A notification tap opens the chat even while another screen is on top; a link waits for this page.
         final Long chatId = SecuredUi.takePendingOpenChat();
         if (chatId != null && chatId != SecuredUi.NO_CHAT) {
-            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
+            openChat(chatId);
         }
         if (!resumed) {
             return;
@@ -330,8 +351,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onFragmentDestroy() {
         destroyed = true;
         if (host == null) {
-            SecuredUi.setLinkListener(null);
-            SecuredUi.setOpenChatListener(null);
+            SecuredUi.clearLinkListener(pendingLinkListener);
+            SecuredUi.clearOpenChatListener(pendingChatListener);
             background.stop();
         }
         if (engine != null && listening) {
@@ -401,7 +422,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
     private void applyInsets() {
         // The floating bottom bar of the tabs sits over this page: keep the list and the button clear of it.
-        final int bottom = AndroidUtilities.navigationBarHeight + dp(DialogsActivity.MAIN_TABS_HEIGHT_WITH_MARGINS);
+        final int bottom = AndroidUtilities.navigationBarHeight + (host != null ? dp(DialogsActivity.MAIN_TABS_HEIGHT_WITH_MARGINS) : 0); // standalone: no tab bar
         if (listView != null) {
             listView.setPadding(0, 0, 0, bottom + dp(72));
         }
@@ -825,9 +846,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                 if (!selected.isEmpty()) {
                     toggleSelected(it.id, view);
                 } else {
-                    // Open like a native chat: in the right-hand pane on tablets, not the floating layers window.
-                    presentFragment(new INavigationLayout.NavigationParams(
-                            new SecuredChatActivity(it.id)).forceRightLayout());
+                    openChat(it.id);
                 }
                 break;
             case T_ARCHIVE:

@@ -180,7 +180,9 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 return false;
             }
             SecuredUi.deliverOpenChat(intent.getLongExtra(SecuredUi.EXTRA_CHAT_ID, SecuredUi.NO_CHAT));
-            final boolean handled = UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated() || SecuredUi.securedOnly();
+            // Logged out, only a live standalone Secured list consumes it (mid-login, Telegram's LoginActivity is the start screen).
+            final boolean handled = UserConfig.getInstance(UserConfig.selectedAccount).isClientActivated()
+                    || (SecuredUi.securedOnly() && SecuredUi.hasOpenChatListener());
             if (handled) {
                 intent.setAction(null); // as Telegram does: an activity restored after process death must not reopen the chat
             }

@@ -316,10 +316,11 @@ internal class SimplexSecuredEngine(
             is CoreReply.Result -> {
                 val code = if (r.type == "contactCode") CoreJson.contactCode(r.body) else null
                 if (code == null) return@post err(callback, unexpected(r))
-                ok(callback, code)
-                // The core clears the verified mark here when the keys changed since verification.
+                // The core clears the verified mark here when the keys changed since verification. Refresh the
+                // cache first, so a caller reading chats() in the callback never sees a stale "verified".
                 val verified = CoreJson.parseContact(r.body.optJSONObject("contact"))?.verified
                 if (verified != null && verified != chatCache[chatId]?.verified) refreshChats(notify = true)
+                ok(callback, code)
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.VERIFY))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
