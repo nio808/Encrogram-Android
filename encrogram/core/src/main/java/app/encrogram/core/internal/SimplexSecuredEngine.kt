@@ -13,6 +13,7 @@ import app.encrogram.core.api.GroupMember
 import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
 import app.encrogram.core.api.MemberRole
+import app.encrogram.core.api.MemberStatus
 import app.encrogram.core.api.MessagePage
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.RelayConfig
@@ -107,6 +108,13 @@ internal class SimplexSecuredEngine(
     private var noteFolderId: Long? = null
     /** Each group row's GroupInfo as of the last chat list load, by our chat id (membership status, channel marker). */
     private val groupCache = HashMap<Long, CoreGroup>()
+    /**
+     * Old group rows left out of [chats] because a rejoin made a newer row for the same group ([GroupRules.successors]).
+     * They stay in [chatCache] and [groupCache], so their history can still be opened and deleted.
+     */
+    private var hiddenChats: Set<Long> = emptySet()
+    /** The other members' memberIds per groupId ([CoreJson.otherMemberIds]), with the member count they were read at. */
+    private val memberIdCache = HashMap<Long, Pair<Int, Set<String>>>()
     private var receiver: Receiver? = null
 
     // ---- the phone's network ([NetworkWatch]): engine thread, except [online] ----
@@ -573,18 +581,21 @@ internal class SimplexSecuredEngine(
 
     /**
      * `/_members #g`, with us first. [GroupMember.contactChatId] is the member's 1:1 chat when the core links them to
-     * one of our contacts (memberContactId) that is in our chat list.
+     * one of our contacts (memberContactId) that is in our chat list. In a group its owner deleted nobody is a member
+     * any more: the core keeps the others' rows as they were (xGrpDel changes only ours, Subscriber.hs:3717-3727), so
+     * they are reported REMOVED, matching the row's member count of 0.
      */
     override fun members(chatId: Long, callback: SecuredCallback<List<GroupMember>>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val groupId = CoreJson.groupIdFromChatId(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
-        if (groupCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
         when (val r = send(Commands.listMembers(groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "groupMembers") return@post err(callback, unexpected(r))
                 val list = CoreJson.parseMembers(r.body).map { m ->
                     val contactChat = m.memberContactId?.takeIf { id -> chatCache[id]?.kind == ChatKind.DIRECT && !isGroupChatId(id) }
-                    GroupMember(m.groupMemberId, m.displayName, m.role, m.status, m.isMe, contactChat)
+                    val status = if (g.deleted) MemberStatus.REMOVED else m.status
+                    GroupMember(m.groupMemberId, m.displayName, m.role, status, m.isMe, contactChat)
                 }
                 ok(callback, list)
             }
@@ -1342,6 +1353,8 @@ internal class SimplexSecuredEngine(
         lastItemIds.clear()
         timedChats.clear()
         groupCache.clear()
+        hiddenChats = emptySet()
+        memberIdCache.clear()
         noteFolderId = null
         publishChats()
         notifyChatsChanged()
@@ -2686,8 +2699,9 @@ internal class SimplexSecuredEngine(
             SecuredLog.crash(Ev.DB_OPEN_FAILED, t)
             throw StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured storage couldn't be opened (setup)."), "db_setup")
         }
-        // A new store (first open, restore): item ids from an earlier one mean nothing here.
+        // A new store (first open, restore): item ids and group ids from an earlier one mean nothing here.
         previewCache.clear()
+        memberIdCache.clear()
         watchNetwork()
     }
 
@@ -2880,6 +2894,8 @@ internal class SimplexSecuredEngine(
         lastItemIds.clear()
         timedChats.clear()
         groupCache.clear()
+        hiddenChats = emptySet()
+        memberIdCache.clear()
         previewCache.clear()
         refreshWindowOpen = false
         refreshOwed = false
@@ -3175,6 +3191,10 @@ internal class SimplexSecuredEngine(
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
         }
+        // One row per group, like Telegram: a rejoin's new row replaces the old left or removed one.
+        val hidden = rejoinedRows(groups.map { it.group })
+        if (hidden != hiddenChats) SecuredLog.i(Ev.GROUP_ACTION, "rejoin_rows_hidden", hidden.size)
+        hiddenChats = hidden
         // Saved Messages: the user's note folder (the core creates one with every user).
         val notes = CoreJson.parseNoteChat(r.body)
         noteFolderId = notes?.folder?.noteFolderId
@@ -3280,7 +3300,29 @@ internal class SimplexSecuredEngine(
     }
 
     private fun publishChats() {
-        chatSnapshot = MessageMapper.sortChats(chatCache.values)
+        val hidden = hiddenChats
+        chatSnapshot = MessageMapper.sortChats(if (hidden.isEmpty()) chatCache.values else chatCache.values.filter { it.chatId !in hidden })
+    }
+
+    /**
+     * The chat ids of old group rows that a rejoin replaced ([GroupRules.successors]). Asks the core for member lists
+     * only when an ended membership and a newer row share a name, and again only when that row's member count changes.
+     */
+    private fun rejoinedRows(groups: List<CoreGroup>): Set<Long> {
+        memberIdCache.keys.retainAll(groups.mapTo(HashSet()) { it.groupId })
+        val replaced = GroupRules.successors(groups) { memberIdsOf(it) }
+        if (replaced.isEmpty()) return emptySet()
+        return replaced.keys.mapTo(HashSet()) { CoreJson.groupChatId(it) }
+    }
+
+    private fun memberIdsOf(g: CoreGroup): Set<String>? {
+        memberIdCache[g.groupId]?.let { (count, ids) -> if (count == g.memberCount) return ids }
+        val r = send(Commands.listMembers(g.groupId))
+        // Not cached: the next reload asks again.
+        if (r !is CoreReply.Result || r.type != "groupMembers") return null
+        val ids = CoreJson.otherMemberIds(r.body)
+        memberIdCache[g.groupId] = g.memberCount to ids
+        return ids
     }
 
     // =============================================================================================================

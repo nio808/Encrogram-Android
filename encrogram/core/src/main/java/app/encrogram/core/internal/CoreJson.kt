@@ -12,6 +12,7 @@ import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.backup.RestoreRepair
 import org.json.JSONException
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.format.DateTimeParseException
 
@@ -105,6 +106,12 @@ internal data class CoreItem(
      * their later join row as a link join ([CoreJson.parseChatItemsOfChat]).
      */
     val linkJoinOf: Long? = null,
+    /**
+     * A `memberConnected` row: the groupMemberId of its sender, whose connection came up. Only such a row can become
+     * "joined via invite link" ([CoreJson.markLinkJoins]); rows about someone else (memberAdded, memberAccepted name
+     * the new member but come from the member who let them in) never can.
+     */
+    val connectedOf: Long? = null,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -132,12 +139,25 @@ internal data class CoreGroup(
     /** Our channel marker ([CoreJson.isChannel]). */
     val channel: Boolean = false,
     val activityTimeMs: Long = 0,
+    /** groupProfile.displayName as the group's owner set it (never our local alias): one hint that two rows are one group. */
+    val profileName: String = "",
+    /**
+     * SHA-256 of the link we joined by (viaGroupLinkUri, else preparedGroup's full link), from its `#` part so the
+     * scheme and host don't matter; null when we didn't join by link. The link itself is never kept.
+     */
+    val linkKey: String? = null,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
 
     /** Our membership is over (Types.hs:1442-1447 memberRemoved): we can't leave, post or be repaired any more. */
     val gone: Boolean get() = myStatus in GONE_STATUSES
+
+    /**
+     * The owner deleted the group (membership GSMemGroupDeleted, written by xGrpDel, Subscriber.hs:3717-3727): nobody
+     * is a member any more. The core's member count still counts the others (their rows keep their status).
+     */
+    val deleted: Boolean get() = myStatus == "deleted"
 
     companion object {
         private val GONE_STATUSES = setOf("left", "removed", "rejected", "deleted")
@@ -484,7 +504,9 @@ internal object CoreJson {
         val isMessage = !moderated && (contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted)
         val deleted = moderated || legacyDeleted || present(meta, "itemDeleted")
         val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, senderJson, joinedByLink, peerName)
-        val linkJoinOf = if (contentType == "rcvGroupEvent" && tagOf(content?.opt("rcvGroupEvent")) == "invitedViaGroupLink") sender?.memberId else null
+        val rcvEventTag = if (contentType == "rcvGroupEvent") tagOf(content?.opt("rcvGroupEvent")) else null
+        val linkJoinOf = if (rcvEventTag == "invitedViaGroupLink") sender?.memberId else null
+        val connectedOf = if (rcvEventTag == "memberConnected") sender?.memberId else null
         val msgContent = content?.optJSONObject("msgContent")
         val msgText = msgContent?.str("text").orEmpty()
         // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
@@ -518,6 +540,7 @@ internal object CoreJson {
             sender = sender,
             event = event,
             linkJoinOf = linkJoinOf,
+            connectedOf = connectedOf,
         )
     }
 
@@ -561,18 +584,25 @@ internal object CoreJson {
      * [senderJson]: the sending GroupMember (its memberCategory is GroupMemberCategory, Types.hs:1321-1326).
      * [joinedByLink]: we joined this group through its link.
      *
-     * A link join is one row, "X joined the group via invite link": on the link owner's side the core makes two items
-     * for it, `invitedViaGroupLink` when it accepts the request (Subscriber.hs:1626-1629) and `memberConnected` when
-     * the joiner's connection comes up (:950); only the second is shown, marked from the first ([markLinkJoins]).
-     * Members other than the link owner get the
-     * same `memberAdded` + `memberConnected` pair for a link join as for an admin's invitation (XGrpMemNew carries no
-     * marker, Subscriber.hs:3185-3189, Types.hs:1043-1050), so for them it stays "invited" then "joined".
+     * Every join is one row, like Telegram's:
+     * - The joiner: the host's `memberConnected` (category host) is "You joined", or "You joined the group via invite
+     *   link" when we joined by link.
+     * - The member who let them in: by link, the core makes `invitedViaGroupLink` when it accepts the request
+     *   (Subscriber.hs:1626-1629) and `memberConnected` when the joiner's connection comes up (:950); only the second
+     *   is shown, marked "joined the group via invite link" from the first ([markLinkJoins]).
+     * - Everyone else: the host announces the new member (XGrpMemNew -> `memberAdded`, Subscriber.hs:3185-3189) once the
+     *   joiner is already connected to the host (Internal.hs:1138-1159, called from the host's CON, Subscriber.hs:964-967),
+     *   then the joiner's own connection to us comes up (`memberConnected`, category post, :979, :1841-1845). That pair is the
+     *   same for a link join and for an admin's invitation (MemberInfo carries no marker, Types.hs:1043-1050; nothing is
+     *   sent to the group when an admin invites, Commands.hs:2744-2764), so it is one plain "X joined": `memberAdded`
+     *   as JOINED (by then X has joined; "was invited" was wrong for link joins), the later `memberConnected` hidden.
      */
     private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?, senderJson: JSONObject?, joinedByLink: Boolean): GroupEvent? {
         if (e == null) return null
         val about = profileName(e)
         return when (tagOf(e)) {
-            "memberAdded" -> about?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
+            // The host announcing someone who has just joined (only made by xGrpMemNew, Subscriber.hs:3187).
+            "memberAdded" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
             // The member the item is from finished connecting ("X joined"), except when we are the one joining.
             "memberConnected" -> when (senderJson?.str("memberCategory")) {
                 // The member who let us in (by invitation or link): their connection coming up is our own join
@@ -580,7 +610,12 @@ internal object CoreJson {
                 "host" -> GroupEvent(if (joinedByLink) GroupEvent.Kind.JOINED_BY_LINK else GroupEvent.Kind.JOINED)
                 // Members who were there before us, connecting after our join (:1835-1845): they didn't just join.
                 "pre" -> null
-                // Anyone else, including someone we let in. Whether that was through our link is not in the member
+                // Someone a host introduced to us: their memberAdded row already said "X joined" (xGrpMemNew creates
+                // post members with that row, Subscriber.hs:3167-3189), so no second row. Only if the host's
+                // introduction overtook its announcement (xGrpMemFwd's fallback, :3259-3266, an error case per the
+                // core) is there no memberAdded row; then this join has no row rather than two.
+                "post" -> null
+                // Someone we let in (invitee). Whether that was through our link is not in the member
                 // (memberContactId changes with contact deletes and merges), only in their invitedViaGroupLink row:
                 // [markLinkJoins] turns this into JOINED_BY_LINK from those rows.
                 else -> sender?.let { GroupEvent(GroupEvent.Kind.JOINED, it.displayName) }
@@ -721,7 +756,22 @@ internal object CoreJson {
             muted = ntfs != null && ntfs != "all",
             channel = isChannel(g),
             activityTimeMs = ts,
+            profileName = profile?.str("displayName").orEmpty(),
+            linkKey = joinLinkKey(g),
         )
+    }
+
+    /**
+     * [CoreGroup.linkKey]: the link we joined this group by, as SimpleX itself matches it (via_group_link_uri_hash over
+     * both URI schemes, Store/Groups.hs:2888-2903, Commands.hs:4602-4606), so only the part after `#` counts.
+     */
+    fun joinLinkKey(groupInfo: JSONObject): String? {
+        val uri = groupInfo.str("viaGroupLinkUri")?.ifEmpty { null }
+            ?: groupInfo.optJSONObject("preparedGroup")?.optJSONObject("connLinkToConnect")?.str("connFullLink")?.ifEmpty { null }
+            ?: return null
+        val fragment = uri.substringAfter('#', "").ifEmpty { return null }
+        val digest = MessageDigest.getInstance("SHA-256").digest(fragment.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
     /** chatDir groupRcv's GroupMember -> the sender we show. */
@@ -764,6 +814,21 @@ internal object CoreJson {
         // The core's list leaves us out (Store/Groups.hs:1230-1237): our membership comes from groupInfo.
         parseMember(group.optJSONObject("groupInfo")?.optJSONObject("membership"), isMe = true)?.let { out.add(it) }
         group.optJSONArray("members").forEachObject { m -> parseMember(m, isMe = false)?.let { out.add(it) } }
+        return out
+    }
+
+    /**
+     * The group-wide memberIds (GroupMember.memberId, Types.hs:1118: random, made once per member per group and the
+     * same in every member's copy) of the other members in a `groupMembers` body, whatever their status now; relays
+     * and `unknown` members are left out like in [parseMembers]. Our own membership is never in the core's list, and
+     * a rejoin gets us a new memberId anyway. Two group rows sharing one of these are the same group.
+     */
+    fun otherMemberIds(body: JSONObject): Set<String> {
+        val out = HashSet<String>()
+        body.optJSONObject("group")?.optJSONArray("members").forEachObject { m ->
+            if (parseMember(m, isMe = false) == null) return@forEachObject
+            m.str("memberId")?.ifEmpty { null }?.let { out.add(it) }
+        }
         return out
     }
 
@@ -963,13 +1028,15 @@ internal object CoreJson {
     }
 
     /**
-     * Someone else's join row ("X joined") becomes "X joined via invite link" when [viaLink] says that member of that
-     * chat came in through our group link (an invitedViaGroupLink row was seen for them). Only the link owner has such
-     * rows (Subscriber.hs:1626-1629), and a member id is never reused within a group, so nothing else can match.
+     * Someone else's join row ("X joined", their own memberConnected row, [CoreItem.connectedOf]) becomes "X joined via
+     * invite link" when [viaLink] says that member of that chat came in through our group link (an invitedViaGroupLink
+     * row was seen for them). Only the link owner has such rows (Subscriber.hs:1626-1629), and a member id is never
+     * reused within a group, so nothing else can match. A row a member sent about someone else ("Y joined" announced
+     * by X) is never marked, even when X once came in through our link.
      */
     fun markLinkJoins(items: List<CoreItem>, viaLink: (chatId: Long, memberId: Long) -> Boolean): List<CoreItem> = items.map { i ->
         val e = i.event
-        val member = i.sender?.memberId
+        val member = i.connectedOf
         if (e != null && member != null && e.kind == GroupEvent.Kind.JOINED && e.memberName != null && viaLink(i.chatId, member)) {
             i.copy(event = e.copy(kind = GroupEvent.Kind.JOINED_BY_LINK))
         } else {

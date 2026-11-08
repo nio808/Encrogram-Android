@@ -6,6 +6,7 @@ import app.encrogram.core.api.MemberStatus
 /**
  * The core's own rules for roles, removal and group links, checked before anything is sent so the UI gets a
  * readable refusal instead of a core error. Pure logic. Each returns the refusal text, or null when allowed.
+ * Also which group rows are one group after a rejoin ([successors]).
  * Sources: reference/simplex-chat 7.0.0.12, Library/Commands.hs.
  */
 internal object GroupRules {
@@ -50,6 +51,44 @@ internal object GroupRules {
      */
     fun linkRefusal(g: CoreGroup): String? = statusRefusal(CoreJson.memberStatus(g.myStatus))
         ?: if (g.myRole < MemberRole.ADMIN) ErrorMapper.ONLY_ADMINS_LINK else null
+
+    /**
+     * Rejoins. SimpleX groups have no shared id, so joining again after leaving or being removed makes a new group row
+     * (the link plan ignores groups we left or were removed from, Store/Groups.hs:2888-2903, so the join goes ahead).
+     * Telegram shows one chat; so an old row whose membership ended (left, removed or rejected, not deleted: a deleted
+     * group can't be joined again) is replaced in the list by the next newer row of the same group that isn't a pending
+     * invitation. Its history stays on the phone and comes back if the newer row is deleted.
+     *
+     * Same group: joined by the same link ([CoreGroup.linkKey], how the core itself recognises a group link), or the
+     * same profile name and at least one shared memberId ([memberIds]: the other members' group-wide memberIds, null
+     * when they couldn't be read). Member ids are random per member and group (Types.hs:1118), so two different groups
+     * never share one; the name only limits how often [memberIds] is asked. Newer means a higher groupId (the core's
+     * row id). Result: old groupId -> newer groupId.
+     */
+    fun successors(groups: List<CoreGroup>, memberIds: (CoreGroup) -> Set<String>?): Map<Long, Long> {
+        val old = groups.filter { it.gone && !it.deleted }
+        if (old.isEmpty()) return emptyMap()
+        val newer = groups.filter { !it.invited }.sortedBy { it.groupId }
+        val out = HashMap<Long, Long>()
+        for (o in old) {
+            for (n in newer) {
+                if (n.groupId <= o.groupId) continue
+                if (sameGroup(o, n, memberIds)) {
+                    out[o.groupId] = n.groupId
+                    break
+                }
+            }
+        }
+        return out
+    }
+
+    private fun sameGroup(a: CoreGroup, b: CoreGroup, memberIds: (CoreGroup) -> Set<String>?): Boolean {
+        if (a.linkKey != null && a.linkKey == b.linkKey) return true
+        if (a.profileName.isEmpty() || a.profileName != b.profileName) return false
+        val ia = memberIds(a)?.takeIf { it.isNotEmpty() } ?: return false
+        val ib = memberIds(b) ?: return false
+        return ib.any { it in ia }
+    }
 
     /** We must be a connected member (assertUserGroupRole :4063-4068: joined, not removed, active). */
     private fun membershipRefusal(me: CoreMember?): String? = if (me == null) ErrorMapper.NOT_A_MEMBER else statusRefusal(me.status)

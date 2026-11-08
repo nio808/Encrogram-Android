@@ -81,6 +81,14 @@ final class ChatRowMapper {
         boolean group;
         boolean invited;
         boolean channel;
+
+        /** Same everything: the chat list's DiffUtil leaves such a row alone (H2/P1). */
+        boolean sameAs(Row o) {
+            return o != null && chatId == o.chatId && outgoing == o.outgoing && tick == o.tick && pinned == o.pinned
+                    && muted == o.muted && unread == o.unread && dateSeconds == o.dateSeconds && archived == o.archived
+                    && saved == o.saved && group == o.group && invited == o.invited && channel == o.channel
+                    && java.util.Objects.equals(name, o.name) && java.util.Objects.equals(message, o.message);
+        }
     }
 
     static Row map(ChatSummary c, Labels labels, long nowMs) {

@@ -6,6 +6,8 @@ import android.view.View;
 
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.INavigationLayout;
+import org.telegram.messenger.LiteMode;
+import org.telegram.messenger.SharedConfig;
 import org.telegram.ui.Components.CubicBezierInterpolator;
 import org.telegram.ui.DialogsActivity;
 import org.telegram.ui.MainTabsActivity;
@@ -167,9 +169,17 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         fadeThrough(network);
     }
 
+    /**
+     * Weak phones and power-saver mode: our own animations are skipped, as Telegram's screens do (reuse level 1:
+     * SharedConfig's device class and LiteMode's power-saver check).
+     */
+    static boolean lowEnd() {
+        return SharedConfig.getDevicePerformanceClass() == SharedConfig.PERFORMANCE_CLASS_LOW || LiteMode.isPowerSaverApplied();
+    }
+
     private void fadeThrough(int position) {
         viewPager.animate().cancel();
-        if (!ValueAnimator.areAnimatorsEnabled()) {
+        if (!ValueAnimator.areAnimatorsEnabled() || lowEnd()) {
             viewPager.setAlpha(1f);
             viewPager.setScaleX(1f);
             viewPager.setScaleY(1f);

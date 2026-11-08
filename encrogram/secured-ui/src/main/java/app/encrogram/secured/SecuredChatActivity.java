@@ -165,6 +165,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private SecuredMessageMapper mapper;
     private final ArrayList<SecuredMessage> messages = new ArrayList<>();   // oldest first
     private final ArrayList<Row> rows = new ArrayList<>();
+    private static final int OBJECT_CACHE_CAP = 600;
     private final HashMap<Long, MessageObject> objects = new HashMap<>();
     private final HashMap<Long, SecuredMessage> objectSources = new HashMap<>();
     private final LinkedHashSet<Long> selectedIds = new LinkedHashSet<>();
@@ -287,8 +288,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             if (cid != chatId || destroyed) return;
             final int idx = indexOf(messageId);
             if (idx < 0) return;
-            messages.set(idx, withStatus(messages.get(idx), status));
-            rebuildRows(true);
+            final SecuredMessage updated = withStatus(messages.get(idx), status);
+            messages.set(idx, updated);
+            // A tick changes one bubble: rebind that row only (no rebuild, no diff of every loaded row).
+            // ENCROGRAM perf (H2/P2)
+            if (!patchRowMessage(messageId, updated)) rebuildRows(true);
         }
 
         @Override
@@ -344,6 +348,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             final ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) invalidateTree(g.getChildAt(i));
         }
+    }
+
+    /** Low memory: forget the built bubbles; visible cells keep theirs, the rest are rebuilt when bound (H2). */
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        objects.clear();
+        objectSources.clear();
     }
 
     @Override
@@ -575,7 +587,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         layoutManager = new LinearLayoutManager(context);
         layoutManager.setStackFromEnd(true);
         listView.setLayoutManager(layoutManager);
-        listView.setItemAnimator(new ChatListItemAnimator(null, listView, chatResources));
+        // Weak phones skip the move animations, like Telegram's own lists do (H2).
+        listView.setItemAnimator(EncrogramChatsHost.lowEnd() ? null : new ChatListItemAnimator(null, listView, chatResources));
         listView.setLayoutAnimation(null);
         listView.setClipToPadding(false);
         listView.setPadding(0, dp(4), 0, dp(4));
@@ -2139,14 +2152,52 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     }
 
-    private static int dayStart(int sec) {
-        final Calendar c = Calendar.getInstance();
-        c.setTimeInMillis(sec * 1000L);
-        c.set(Calendar.HOUR_OF_DAY, 0);
-        c.set(Calendar.MINUTE, 0);
-        c.set(Calendar.SECOND, 0);
-        c.set(Calendar.MILLISECOND, 0);
-        return (int) (c.getTimeInMillis() / 1000L);
+    // One Calendar and the last day's [start, end) range, instead of a Calendar per message per rebuild. UI thread only.
+    private final Calendar dayCalendar = Calendar.getInstance();
+    private int dayRangeStart = Integer.MAX_VALUE;
+    private int dayRangeEnd = Integer.MIN_VALUE;
+    private java.util.TimeZone dayZone = java.util.TimeZone.getDefault();
+
+    private int dayStart(int sec) {
+        if (sec >= dayRangeStart && sec < dayRangeEnd) return dayRangeStart;
+        dayCalendar.setTimeInMillis(sec * 1000L);
+        dayCalendar.set(Calendar.HOUR_OF_DAY, 0);
+        dayCalendar.set(Calendar.MINUTE, 0);
+        dayCalendar.set(Calendar.SECOND, 0);
+        dayCalendar.set(Calendar.MILLISECOND, 0);
+        final int start = (int) (dayCalendar.getTimeInMillis() / 1000L);
+        dayCalendar.add(Calendar.DAY_OF_MONTH, 1);   // a day is 23 or 25 hours across a clock change
+        dayRangeStart = start;
+        dayRangeEnd = (int) (dayCalendar.getTimeInMillis() / 1000L);
+        return start;
+    }
+
+    /** The time zone or clock can change while the screen is open: forget the cached day. */
+    private void resetDayCache() {
+        final java.util.TimeZone now = java.util.TimeZone.getDefault();
+        if (!now.equals(dayZone)) {
+            dayZone = now;
+            dayCalendar.setTimeZone(now);
+            dayRangeStart = Integer.MAX_VALUE;
+            dayRangeEnd = Integer.MIN_VALUE;
+        }
+    }
+
+    /**
+     * A change to one message that moves no row: swaps its Row and rebinds just that cell. False when the message
+     * is not a listed row or the change has a row of its own that may appear or go (reactions), so the caller rebuilds.
+     */
+    private boolean patchRowMessage(long messageId, SecuredMessage updated) {
+        final int i = rowIndexOf(messageId);
+        if (i < 0 || adapter == null) return false;
+        final Row old = rows.get(i);
+        if (old.message == null || old.message.getEvent() != null) return false;
+        final Row r = new Row(old.kind, old.stableId, updated, old.dateSec);
+        r.pinnedTop = old.pinnedTop;
+        r.pinnedBottom = old.pinnedBottom;
+        rows.set(i, r);
+        adapter.notifyItemChanged(i);
+        return true;
     }
 
     private static long senderKey(SecuredMessage m) {
@@ -2159,6 +2210,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     }
 
     private void rebuildRows(boolean animated) {
+        resetDayCache();
+        if (objects.size() > OBJECT_CACHE_CAP) {   // keep bubbles only for loaded messages, never every one ever built
+            final HashSet<Long> live = new HashSet<>();
+            for (SecuredMessage m : messages) live.add(m.getMessageId());
+            objects.keySet().retainAll(live);
+            objectSources.keySet().retainAll(live);
+        }
         final ArrayList<Row> next = new ArrayList<>(messages.size() + 8);
         int lastDay = Integer.MIN_VALUE;
         for (SecuredMessage m : shown()) {

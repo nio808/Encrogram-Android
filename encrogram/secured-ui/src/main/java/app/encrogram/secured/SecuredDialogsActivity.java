@@ -47,6 +47,9 @@ import org.telegram.ui.Components.RecyclerListView;
 import org.telegram.ui.DialogsActivity;
 import org.telegram.ui.MainTabsActivity;
 
+import androidx.recyclerview.widget.DiffUtil;
+import org.telegram.ui.Components.DialogsItemAnimator;
+
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -116,6 +119,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         long id;
         ChatRowMapper.Row row;   // T_CHAT and T_ARCHIVE
         int textKind;            // T_TEXT
+        boolean inArchive;       // T_CHAT: bound with the archive's swipe action
+
+        boolean sameAs(Item o) {
+            return type == o.type && textKind == o.textKind && inArchive == o.inArchive
+                    && (row == null ? o.row == null : row.sameAs(o.row));
+        }
     }
 
     private final List<Item> items = new ArrayList<>();
@@ -256,9 +265,11 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             }
         }
 
+        // The engine posts onChatsChanged after every change that shows in the list (a new message, a tick on the
+        // row's last message, a delete of it, any reload), so it is the only one that reloads, once per burst (H2/P1).
         @Override
         public void onChatsChanged() {
-            refreshChats();
+            scheduleRefresh();
         }
 
         @Override
@@ -268,12 +279,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
         @Override
         public void onMessageReceived(SecuredMessage message) {
-            refreshChats();
+            // covered by the onChatsChanged the engine posts for the same event
         }
 
         @Override
         public void onMessageStatusChanged(long chatId, long messageId, MessageStatus status) {
-            refreshChats();
+            // a tick on a row's last message also posts onChatsChanged; other ticks change nothing in the list
         }
 
         @Override
@@ -379,6 +390,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        AndroidUtilities.cancelRunOnUIThread(refreshRunnable);
         if (flagSecure != null) flagSecure.detach();
         if (host == null) {
             SecuredUi.clearLinkListener(pendingLinkListener);
@@ -615,6 +627,9 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         listView = new RecyclerListView(context, SecuredResourcesProvider.get());
         listView.setLayoutManager(new LinearLayoutManager(context));
         listView.setClipToPadding(false);
+        listView.setHasFixedSize(true);
+        // Telegram's chat-list animator (rows slide when a chat moves up); none on weak phones (H2).
+        listView.setItemAnimator(EncrogramChatsHost.lowEnd() ? null : new DialogsItemAnimator(listView));
         listView.setVerticalScrollBarEnabled(false);
         searchRow = buildSearchRow(context);
         adapter = new ChatsAdapter(context);
@@ -813,7 +828,25 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         }
     }
 
+    private static final long REFRESH_COALESCE_MS = 60;
+    private boolean refreshScheduled;
+    private final Runnable refreshRunnable = () -> {
+        refreshScheduled = false;
+        refreshChats();
+    };
+
+    /** One reload for a burst of engine events: the first one arms a short timer, the rest ride on it. */
+    private void scheduleRefresh() {
+        if (refreshScheduled || destroyed) return;
+        refreshScheduled = true;
+        AndroidUtilities.runOnUIThread(refreshRunnable, REFRESH_COALESCE_MS);
+    }
+
     private void refreshChats() {
+        if (refreshScheduled) {   // this load is the newest snapshot: the timed one would only repeat it
+            refreshScheduled = false;
+            AndroidUtilities.cancelRunOnUIThread(refreshRunnable);
+        }
         if (destroyed || engine == null || adapter == null) return;
         if (emptyView == null || listView == null) return;
         final List<ChatSummary> fresh;
@@ -866,6 +899,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         it.type = T_CHAT;
         it.id = c.getChatId();
         it.row = ChatRowMapper.map(c, labels, System.currentTimeMillis());
+        it.inArchive = showingArchived;
         return it;
     }
 
@@ -941,8 +975,31 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
     private void rebuildAndNotify() {
         if (adapter == null) return;
+        final List<Item> old = new ArrayList<>(items);
         rebuildItems();
-        adapter.notifyDataSetChanged();
+        // Only rows that changed are rebound; a moved row slides (DialogsItemAnimator), as in Telegram's list.
+        final List<Item> next = items;
+        DiffUtil.calculateDiff(new DiffUtil.Callback() {
+            @Override
+            public int getOldListSize() {
+                return old.size();
+            }
+
+            @Override
+            public int getNewListSize() {
+                return next.size();
+            }
+
+            @Override
+            public boolean areItemsTheSame(int o, int n) {
+                return old.get(o).type == next.get(n).type && old.get(o).id == next.get(n).id;
+            }
+
+            @Override
+            public boolean areContentsTheSame(int o, int n) {
+                return old.get(o).sameAs(next.get(n));
+            }
+        }, true).dispatchUpdatesTo(adapter);
         updateActionMode();
     }
 

@@ -1,6 +1,7 @@
 package app.encrogram.android;
 
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.BillingController;
 import org.telegram.messenger.BuildVars;
 import org.telegram.ui.LaunchActivity;
 
@@ -65,6 +66,10 @@ public class EncrogramApplication extends ApplicationLoader {
         // These only work for upstream's official package names.
         BuildVars.SUPPORTS_PASSKEYS = false;
         BuildVars.IS_BILLING_UNAVAILABLE = true;
+        // No Play Billing connection at start (L11): Telegram's startConnection() binds the Play Store's billing service
+        // and its library logs every result to Google (firebaselogging.googleapis.com, ~40 s after launch). Our package
+        // has no Play products anyway; this makes useInvoiceBilling() true, so startConnection() skips the bind.
+        BillingController.billingClientEmpty = true;
         // Debug builds of Telegram show a "Test Backend" box on login and write request logs to disk; Encrogram wants neither.
         BuildVars.DEBUG_VERSION = false;
         BuildVars.LOGS_ENABLED = false;

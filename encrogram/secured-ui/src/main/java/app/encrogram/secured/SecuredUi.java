@@ -7,7 +7,9 @@ import android.os.Looper;
 
 import org.telegram.messenger.EncrogramHooks;
 import org.telegram.ui.ActionBar.BaseFragment;
-import org.telegram.ui.IntroActivity;
+import org.telegram.messenger.LocaleController;
+import org.telegram.tgnet.ConnectionsManager;
+import org.telegram.ui.LoginActivity;
 
 import app.encrogram.core.api.SecuredEngine;
 
@@ -176,11 +178,20 @@ public final class SecuredUi {
     }
 
     /**
-     * Telegram's own login flow (its intro, then "Start Messaging"), on top of {@code from} so Back returns.
-     * A fresh IntroActivity each time: an instance that was already shown and finished cannot be shown again.
+     * Telegram's own login (the phone-number screen), on top of {@code from} so Back returns. It skips Telegram's
+     * IntroActivity, whose first page draws Telegram's official logo (AGENTS.md rule 6). LoginActivity's intro
+     * transition is disabled upstream, so it opens fine on its own. A fresh instance each time.
      */
     static void openTelegramLogin(BaseFragment from) {
-        from.presentFragment(new IntroActivity());
+        from.presentFragment(new LoginActivity());
+        // What IntroActivity did before login: fetch DC settings and the language list. The wake-up hook
+        // (willPresentFragment) has already started Telegram's network by this point.
+        try {
+            final int account = from.getCurrentAccount();
+            ConnectionsManager.getInstance(account).updateDcSettings();
+            LocaleController.getInstance().loadRemoteLanguages(account);
+        } catch (Throwable ignored) {
+        }
     }
 
     // ---- debug self-check -------------------------------------------------------------------------------------

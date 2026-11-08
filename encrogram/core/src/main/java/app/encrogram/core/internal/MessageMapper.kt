@@ -101,7 +101,8 @@ internal object MessageMapper {
             muted = g.muted,
             archived = archived,
             kind = if (g.channel) ChatKind.CHANNEL else ChatKind.GROUP,
-            memberCount = g.memberCount,
+            // A deleted group has nobody in it; the core's count still holds the others' rows (CoreGroup.deleted).
+            memberCount = if (g.deleted) 0 else g.memberCount,
             myRole = g.myRole,
             canPost = !g.invited && CoreJson.canPost(g),
             lastMessageSender = last?.takeIf { !it.outgoing && !it.deleted }?.sender?.displayName,

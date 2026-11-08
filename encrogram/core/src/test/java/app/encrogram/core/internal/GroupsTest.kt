@@ -239,7 +239,8 @@ class GroupsTest {
         data class Case(val dir: String, val content: String, val from: String?, val expected: GroupEvent)
         val cases = listOf(
             Case("groupRcv", rcvEvent("""{"type":"memberConnected"}"""), carol, GroupEvent(GroupEvent.Kind.JOINED, "Carol")),
-            Case("groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":9,${profile("Dan")}}"""), carol, GroupEvent(GroupEvent.Kind.INVITED, "Dan")),
+            // The host announcing someone who has already joined (xGrpMemNew): "Dan joined", never "Dan was invited".
+            Case("groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":9,${profile("Dan")}}"""), carol, GroupEvent(GroupEvent.Kind.JOINED, "Dan")),
             Case("groupRcv", rcvEvent("""{"type":"memberAccepted","groupMemberId":9,${profile("Dan")}}"""), carol, GroupEvent(GroupEvent.Kind.JOINED, "Dan")),
             Case("groupRcv", rcvEvent("""{"type":"userAccepted"}"""), carol, GroupEvent(GroupEvent.Kind.JOINED)),
             Case("groupRcv", rcvEvent("""{"type":"memberLeft"}"""), carol, GroupEvent(GroupEvent.Kind.LEFT, "Carol")),
@@ -289,8 +290,11 @@ class GroupsTest {
         val earlier = parse(gItem(121, "groupRcv", joined, from = member(6, "Carol", category = "pre")))
         assertNull(earlier.event)
         assertFalse(earlier.shown)
-        // Someone joining after us (post) or someone we invited (invitee): "X joined" as before.
-        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Dan"), parse(gItem(122, "groupRcv", joined, from = member(7, "Dan", category = "post"))).event)
+        // Someone joining after us through another member (post): their memberAdded row was the join row, so none here.
+        val post = parse(gItem(122, "groupRcv", joined, from = member(7, "Dan", category = "post")))
+        assertNull(post.event)
+        assertFalse(post.shown)
+        // Someone we let in (invitee): "X joined" as before.
         assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Eve"), parse(gItem(123, "groupRcv", joined, from = member(8, "Eve", category = "invitee"))).event)
         // The host's other rows still name them.
         assertEquals(GroupEvent(GroupEvent.Kind.LEFT, "Alpha"),
@@ -781,15 +785,62 @@ class GroupsTest {
     }
 
     @Test
-    fun otherMembersCantTellALinkJoinFromAnInvitation() {
-        // Members other than the link owner get XGrpMemNew from the owner (memberAdded) and later the joiner's own
-        // connection (memberConnected, category post). Nothing in either says "link" (Types.hs:1043-1050), so a link
-        // join reads like an admin's invitation: "Bravo was invited", then "Bravo joined".
-        val alpha = member(2, "Alpha", role = "owner", category = "host")
-        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, "Bravo"),
-            parse(gItem(140, "groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":7,${profile("Bravo")}}"""), from = alpha)).event)
-        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"),
-            parse(gItem(141, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(7, "Bravo", category = "post"))).event)
+    fun otherMembersSeeOneJoinRow() {
+        // Members other than the one who let Bravo in get XGrpMemNew from them (memberAdded, after Bravo is already
+        // connected to them) and later Bravo's own connection (memberConnected, category post). Nothing in either says
+        // "link" (MemberInfo, Types.hs:1043-1050), so a link join and an admin's invitation read the same: one row,
+        // "Bravo joined" (never "Bravo was invited" then "Bravo joined").
+        val alpha = member(2, "Alpha", role = "owner")
+        val bravo = member(7, "Bravo", category = "post")
+        val items = listOf(
+            gItemAt("2026-11-08T10:00:00Z", 139, "groupRcv", msg("hi"), from = bob),
+            gItemAt("2026-11-08T10:00:01Z", 140, "groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":7,${profile("Bravo")}}"""), from = alpha),
+            gItemAt("2026-11-08T10:00:04Z", 141, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = bravo),
+            gItemAt("2026-11-08T10:00:05Z", 142, "groupRcv", rcvEvent("""{"type":"memberProfileUpdated","fromProfile":{},"toProfile":{}}"""), from = bravo),
+        )
+        // A page of the chat: one row about Bravo.
+        val page = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(myRole = "member", myStatus = "connected"), items))
+        val shown = InputRules.pageWindow(page, MessagePage(10), 10)
+        assertEquals(listOf(139L, 140L), shown.map { it.itemId })
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), shown[1].event)
+        assertEquals(1, shown.count { it.event != null })
+        // Live: the announcement is the one event the screens get; Bravo's connection coming up later is not shown.
+        val live = items.drop(1).map { CoreJson.parseAChatItem(JSONObject("""{"chatInfo":${groupChatInfo(groupInfo())},"chatItem":$it}"""))!! }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), null, null), live.map { it.event })
+        assertEquals(listOf(true, false, false), live.map { it.shown })
+        // Alpha once came in through our own link (we remember Alpha, id 2, as a link joiner): Alpha announcing Bravo
+        // is still a plain "Bravo joined", never "joined via invite link" (only a member's own connection row is marked).
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), null, null),
+            CoreJson.markLinkJoins(live) { _, m -> m == 2L || m == 7L }.map { it.event })
+        assertNull(live[0].connectedOf)
+        assertEquals(7L, live[1].connectedOf)
+        // The chat list previews the same single row.
+        val row = MessageMapper.groupSummary(CoreJson.parseGroupChats(body(groupChat(groupInfo(), listOf(items[1]))))[0], archived = false)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), row.lastEvent)
+        assertNull(CoreJson.newestShown(listOf(live[1], live[2])))
+    }
+
+    @Test
+    fun eachSideOfALinkJoinSeesItOnce() {
+        // Bravo joins "Team" by Alpha's link; Carol was already a member.
+        // Bravo (joiner): Alpha's connection is his own join, via the link; Carol (pre) adds no row.
+        val joiner = CoreJson.parseChatItemsOfChat(apiChat(joinedByLinkInfo(), listOf(
+            gItemAt("2026-11-08T10:00:03Z", 160, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(2, "Alpha", role = "owner", category = "host")),
+            gItemAt("2026-11-08T10:00:05Z", 161, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(6, "Carol", category = "pre")),
+        ))).filter { it.shown }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK)), joiner.map { it.event })
+        // Alpha (link owner): invitedViaGroupLink (hidden) then Bravo's connection, "Bravo joined the group via invite link".
+        val owner = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(), listOf(
+            gItemAt("2026-11-08T10:00:01Z", 170, "groupRcv", rcvEvent("""{"type":"invitedViaGroupLink"}"""), from = member(7, "Bravo", status = "accepted")),
+            gItemAt("2026-11-08T10:00:04Z", 171, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(7, "Bravo")),
+        ))).filter { it.shown }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo")), owner.map { it.event })
+        // Carol: Alpha's announcement, then Bravo connecting to her: "Bravo joined", once.
+        val other = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(myRole = "member", myStatus = "connected"), listOf(
+            gItemAt("2026-11-08T10:00:02Z", 180, "groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":9,${profile("Bravo")}}"""), from = member(2, "Alpha", role = "owner")),
+            gItemAt("2026-11-08T10:00:06Z", 181, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(9, "Bravo", category = "post")),
+        ))).filter { it.shown }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED, "Bravo")), other.map { it.event })
     }
 
     @Test
@@ -871,5 +922,141 @@ class GroupsTest {
         assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo"), CoreJson.newestShown(ownerPage)!!.event)
         // Nothing shown at all: no preview (the row keeps "No messages yet").
         assertNull(CoreJson.newestShown(page.filter { !it.shown }))
+    }
+
+    // ---- a deleted group has no members ----
+
+    @Test
+    fun aDeletedGroupShowsNoMembers() {
+        // xGrpDel (Subscriber.hs:3717-3727) sets only our membership to "deleted": the core's count drops by one for us
+        // (M20250919_group_summary triggers) and still counts the others' rows, so the header said "2 members".
+        val info = groupInfo(myRole = "member", myStatus = "deleted", members = 2)
+        val listed = CoreJson.parseGroupChats(body(groupChat(info, listOf(
+            gItem(90, "groupRcv", rcvEvent("""{"type":"groupDeleted"}"""), from = member(2, "Alpha", role = "owner")),
+        ))))[0]
+        assertTrue(listed.group.deleted)
+        assertEquals("the core's own count is still read as it is", 2, listed.group.memberCount)
+        val row = MessageMapper.groupSummary(listed, archived = false)
+        assertEquals(0, row.memberCount)
+        assertTrue(row.gone)
+        assertFalse(row.canPost)
+        assertEquals(GroupEvent(GroupEvent.Kind.GROUP_DELETED), row.lastEvent)
+        // A later item keeps it at 0.
+        assertEquals(0, MessageMapper.withNewItem(row, parse(gItem(91, "groupRcv", rcvEvent("""{"type":"groupDeleted"}"""), from = carol))).memberCount)
+        // Left, removed and live groups keep the core's count; only a deleted group is empty.
+        for (st in listOf("left", "removed", "rejected", "connected", "creator")) {
+            val g = CoreJson.parseGroupChats(body(groupChat(groupInfo(myRole = "member", myStatus = st, members = 2))))[0]
+            assertFalse(st, g.group.deleted)
+            assertEquals(st, 2, MessageMapper.groupSummary(g, archived = false).memberCount)
+        }
+    }
+
+    // ---- rejoins: one row per group ----
+
+    private fun memberWithId(id: Long, name: String, memberId: String, status: String = "connected", role: String = "member", category: String = "invitee") =
+        member(id, name, role = role, status = status, category = category).replace("\"memberId\":\"bWVtYmVy\"", "\"memberId\":\"$memberId\"")
+
+    /** A group row as the chat list reads it, optionally joined by [link] (viaGroupLinkUri) or prepared from it. */
+    private fun listedGroup(id: Long, name: String, status: String, link: String? = null, prepared: Boolean = false, members: Int = 3): CoreGroup {
+        val g = JSONObject(groupInfo(id = id, name = name, myRole = "member", myStatus = status, members = members))
+        if (link != null && prepared) {
+            g.put("preparedGroup", JSONObject().put("connLinkToConnect", JSONObject().put("connFullLink", link).put("connShortLink", "https://encrogram.nytmanager.com/g#short"))
+                .put("connLinkPreparedConnection", true).put("connLinkStartedConnection", true))
+        } else if (link != null) {
+            g.put("viaGroupLinkUri", link)
+        }
+        return CoreJson.parseGroupChats(body(groupChat(g.toString())))[0].group
+    }
+
+    @Test
+    fun theLinkWeJoinedByIsKeptOnlyAsAHash() {
+        val link = "simplex:/contact#/?v=2-7&smp=smp%3A%2F%2Ffp%40encrogram.nytmanager.com%2Fq1&data=%7B%22groupLinkId%22%3A%22abc%22%7D"
+        val g = listedGroup(3, "Team", "connected", link)
+        assertEquals("Team", g.profileName)
+        val key = g.linkKey!!
+        assertEquals(64, key.length)
+        assertFalse("the link itself is never kept", key.contains("smp") || key.contains("encrogram"))
+        // The same link under the other scheme (SimpleX matches both, Commands.hs:4602-4606), or from a prepared join.
+        assertEquals(key, listedGroup(4, "Team", "connected", link.replace("simplex:/contact#", "https://simplex.chat/contact#")).linkKey)
+        assertEquals(key, listedGroup(5, "Team", "connected", link, prepared = true).linkKey)
+        // Another link, no link, or a link without a # part.
+        assertNotEquals(key, listedGroup(6, "Team", "connected", link.replace("q1", "q2")).linkKey)
+        assertNull(listedGroup(7, "Team", "connected").linkKey)
+        assertNull(listedGroup(8, "Team", "connected", "simplex:/contact").linkKey)
+        // The profile name, not our local alias.
+        val aliased = JSONObject(groupInfo(name = "Team", alias = "My team"))
+        assertEquals("Team", CoreJson.parseGroup(aliased)!!.profileName)
+        assertEquals("My team", CoreJson.parseGroup(aliased)!!.displayName)
+    }
+
+    @Test
+    fun otherMembersIdsFromTheMemberList() {
+        val b = JSONObject("""{"group":{"groupInfo":${groupInfo(myStatus = "removed")},"members":[
+            ${memberWithId(2, "Alpha", "QUxQSEE=", role = "owner", category = "host")},
+            ${memberWithId(6, "Carol", "Q0FST0w=", status = "left")},
+            ${memberWithId(8, "Relay", "UkVMQVk=", role = "relay")},
+            ${memberWithId(9, "Ghost", "R0hPU1Q=", status = "unknown")}
+        ]}}""")
+        assertEquals(setOf("QUxQSEE=", "Q0FST0w="), CoreJson.otherMemberIds(b))
+        assertTrue(CoreJson.otherMemberIds(JSONObject("{}")).isEmpty())
+    }
+
+    @Test
+    fun aRejoinByTheSameLinkReplacesTheOldRow() {
+        val link = "simplex:/contact#/?v=2-7&smp=smp%3A%2F%2Ffp%40encrogram.nytmanager.com%2Fq1"
+        for (oldStatus in listOf("removed", "left", "rejected")) {
+            val old = listedGroup(3, "Tab Group", oldStatus, link)
+            val rejoined = listedGroup(9, "Tab Group", "connected", link, prepared = true)
+            // Same link: no member list needed.
+            val result = GroupRules.successors(listOf(rejoined, old)) { error("not needed: $it") }
+            assertEquals(oldStatus, mapOf(3L to 9L), result)
+        }
+        // Still connecting to the group counts too (the new row is what the user just joined).
+        assertEquals(mapOf(3L to 9L), GroupRules.successors(listOf(listedGroup(3, "T", "removed", link), listedGroup(9, "T", "accepted", link))) { error("member lists not needed") })
+    }
+
+    @Test
+    fun aRejoinAfterAnInvitationIsMatchedByItsMembers() {
+        // First invited by a contact (no link), removed, then joined again by link: the new row knows the host first.
+        val old = listedGroup(3, "Team", "removed")
+        val rejoined = listedGroup(9, "Team", "connected", "simplex:/contact#/?v=2-7&smp=x")
+        val ids = mapOf(3L to setOf("QUxQSEE=", "Q0FST0w="), 9L to setOf("QUxQSEE="))
+        val asked = ArrayList<Long>()
+        assertEquals(mapOf(3L to 9L), GroupRules.successors(listOf(old, rejoined)) { asked.add(it.groupId); ids[it.groupId] })
+        assertEquals(listOf(3L, 9L), asked)
+        // Another group with the same name and other people: kept.
+        assertTrue(GroupRules.successors(listOf(old, rejoined)) { if (it.groupId == 3L) setOf("QUxQSEE=") else setOf("WkFL") }.isEmpty())
+        // Member lists that couldn't be read: kept (fail open to two rows, never hide on a guess).
+        assertTrue(GroupRules.successors(listOf(old, rejoined)) { null }.isEmpty())
+        assertTrue(GroupRules.successors(listOf(old, rejoined)) { if (it.groupId == 3L) emptySet() else setOf("QUxQSEE=") }.isEmpty())
+        // A different name: member lists are never asked for.
+        assertTrue(GroupRules.successors(listOf(old, listedGroup(9, "Other", "connected"))) { error("not asked") }.isEmpty())
+    }
+
+    @Test
+    fun onlyANewerJoinedRowReplacesAnEndedOne() {
+        val link = "simplex:/contact#/?v=2-7&smp=x"
+        val ids: (CoreGroup) -> Set<String>? = { setOf("QUxQSEE=") }
+        // A pending invitation doesn't replace the old row (declining it must leave the old one).
+        assertTrue(GroupRules.successors(listOf(listedGroup(3, "T", "removed", link), listedGroup(9, "T", "invited", link)), ids).isEmpty())
+        // A deleted group can't be joined again, so it is never replaced.
+        assertTrue(GroupRules.successors(listOf(listedGroup(3, "T", "deleted", link), listedGroup(9, "T", "connected", link)), ids).isEmpty())
+        // Only a newer row (higher groupId) replaces; live rows are never replaced.
+        assertTrue(GroupRules.successors(listOf(listedGroup(9, "T", "removed", link), listedGroup(3, "T", "connected", link)), ids).isEmpty())
+        assertTrue(GroupRules.successors(listOf(listedGroup(3, "T", "connected", link), listedGroup(9, "T", "connected", link)), ids).isEmpty())
+        // No ended rows: nothing to do and nothing asked.
+        assertTrue(GroupRules.successors(listOf(listedGroup(3, "T", "connected"), listedGroup(9, "T", "creator"))) { error("member lists not needed") }.isEmpty())
+        // Removed twice, now back: both old rows go, the newest stays. Removed twice, not back: only the newest ended row stays.
+        val r1 = listedGroup(3, "T", "removed", link)
+        val r2 = listedGroup(5, "T", "left", link)
+        assertEquals(mapOf(3L to 5L, 5L to 9L), GroupRules.successors(listOf(r1, r2, listedGroup(9, "T", "connected", link)), ids))
+        assertEquals(mapOf(3L to 5L), GroupRules.successors(listOf(r1, r2), ids))
+        // The owner deleted it after the rejoin: the old removed row still gives way to the "deleted" one.
+        assertEquals(mapOf(3L to 9L), GroupRules.successors(listOf(r1, listedGroup(9, "T", "deleted", link)), ids))
+        // A newer group that only shares the name is passed over for the row that shares members.
+        val invitedOnce = listedGroup(3, "T", "removed")
+        assertEquals(mapOf(3L to 8L), GroupRules.successors(listOf(invitedOnce, listedGroup(7, "T", "connected"), listedGroup(8, "T", "connected"))) { g ->
+            if (g.groupId == 7L) setOf("WkFL") else setOf("QUxQSEE=")
+        })
     }
 }
