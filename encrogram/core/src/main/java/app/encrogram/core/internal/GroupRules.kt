@@ -45,7 +45,8 @@ internal object GroupRules {
 
     /**
      * Group links (APICreateGroupLink :3241-3243 `assertUserGroupRole gInfo GRAdmin`; we apply the same rule to
-     * reading and deleting the link): an admin or the owner who is a current, connected member.
+     * reading the link): an admin or the owner who is a current, connected member. Deleting needs neither (the core
+     * doesn't check, :3265-3268), so a demoted admin can remove their own link.
      */
     fun linkRefusal(g: CoreGroup): String? = statusRefusal(CoreJson.memberStatus(g.myStatus))
         ?: if (g.myRole < MemberRole.ADMIN) ErrorMapper.ONLY_ADMINS_LINK else null

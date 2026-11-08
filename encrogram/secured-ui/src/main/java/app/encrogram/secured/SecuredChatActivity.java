@@ -773,7 +773,9 @@ public class SecuredChatActivity extends BaseFragment {
             invitedTitle.setText(c.getString(channel ? R.string.secgroup_invited_bar_channel : R.string.secgroup_invited_bar));
         }
         if (cantPostText != null) {
-            cantPostText.setText(c.getString(channel ? R.string.secgroup_cant_post_channel : R.string.secgroup_cant_post_group));
+            // Not ready yet (members still connecting): say that, not "only admins can post".
+            cantPostText.setText(!chatReady() ? c.getString(R.string.secgroup_connecting_bar)
+                    : c.getString(channel ? R.string.secgroup_cant_post_channel : R.string.secgroup_cant_post_group));
         }
         if (joinButton != null) joinButton.setAlpha(joining ? 0.5f : 1f);
         composerView.setVisibility(!searching && canPost ? View.VISIBLE : View.GONE);
@@ -837,9 +839,7 @@ public class SecuredChatActivity extends BaseFragment {
             // Telegram's own Saved Messages avatar.
             avatarDrawable.setAvatarType(AvatarDrawable.AVATAR_TYPE_SAVED);
         } else {
-            final String shown = name == null ? "" : name.trim();
-            final int sp = shown.lastIndexOf(' ');
-            avatarDrawable.setInfo(chatId, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+            Kit.setAvatar(avatarDrawable, ChatRowMapper.colorId(chatId), name);
         }
         avatarContainer.getAvatarImageView().setImageDrawable(avatarDrawable);
 
@@ -1259,7 +1259,8 @@ public class SecuredChatActivity extends BaseFragment {
             final FrameLayout box = new FrameLayout(activity);
             final CheckBoxCell cell = new CheckBoxCell(activity, 1, chatResources);
             cell.setBackground(Theme.getSelectorDrawable(false));
-            cell.setText(LocaleController.formatString(org.telegram.messenger.R.string.DeleteMessagesOptionAlso, name), "", false, false);
+            cell.setText(groupChat ? tg(org.telegram.messenger.R.string.DeleteForAll)
+                    : LocaleController.formatString(org.telegram.messenger.R.string.DeleteMessagesOptionAlso, name), "", false, false);
             cell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);
             cell.setOnClickListener(v -> cell.setChecked(!cell.isChecked(), true));
             box.addView(cell, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 0, 0, 0, 0));
@@ -2527,12 +2528,42 @@ public class SecuredChatActivity extends BaseFragment {
         @Override
         protected void dispatchDraw(Canvas canvas) {
             super.dispatchDraw(canvas);
+            drawSenderAvatars(canvas);
             for (int i = 0; i < getChildCount(); i++) {
                 final View child = getChildAt(i);
                 if (child instanceof ChatMessageCell) {
                     final float offset = ((ChatMessageCell) child).getSlidingOffsetX();
                     if (offset < 0) drawReplyIcon(canvas, child, offset);
                 }
+            }
+        }
+
+        /**
+         * ChatMessageCell never draws its own avatar: ChatActivity's list draws it (ImageReceiver from
+         * getAvatarImage()), so we do the same for the last bubble of a run. The ImageReceiver holds only our local
+         * AvatarDrawable; the cell has no user or chat, so a tap on it reaches no delegate call.
+         */
+        private void drawSenderAvatars(Canvas canvas) {
+            if (!groupChat) return;
+            final int maxY = getMeasuredHeight() - getPaddingBottom();
+            for (int i = 0; i < getChildCount(); i++) {
+                final View child = getChildAt(i);
+                if (!(child instanceof ChatMessageCell)) continue;
+                final ChatMessageCell cell = (ChatMessageCell) child;
+                final org.telegram.messenger.ImageReceiver avatar = cell.getAvatarImage();
+                if (avatar == null || cell.drawPinnedBottom()) continue;
+                int bottom = (int) child.getY() + child.getPaddingTop() + cell.getLayoutHeight();
+                if (bottom > maxY) bottom = maxY;
+                final int top = (int) child.getY() + child.getPaddingTop();
+                if (bottom - dp(48) < top) bottom = top + dp(48);
+                final int cellBottom = (int) child.getY() + child.getMeasuredHeight();
+                if (bottom > cellBottom) bottom = cellBottom;
+                avatar.setVisible(true, false);
+                avatar.setImageY(bottom - dp(44));
+                canvas.save();
+                canvas.translate(cell.getSlidingOffsetX(), 0);
+                avatar.draw(canvas);
+                canvas.restore();
             }
         }
 

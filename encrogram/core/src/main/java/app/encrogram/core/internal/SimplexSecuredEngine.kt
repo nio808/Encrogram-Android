@@ -300,9 +300,11 @@ internal class SimplexSecuredEngine(
         // must be on our relay too, our own invite would connect us to ourselves (the core proceeds on ownLink), and
         // group links are joined with exactly the checked request. No plan, no connect: a short link we couldn't
         // resolve here would only fail the same way inside /connect.
+        // A `/g` link may only join a group: any other plan for it is refused (review #4).
+        val groupInput = LinkChecker.isShortGroupLink(normalized)
         val verdict = when (val plan = send(Commands.connectPlan(userId, normalized))) {
             is CoreReply.Result ->
-                if (plan.type == "connectionPlan") ConnectPlan.verdict(plan.body, config.allowedHosts, config.smpServers)
+                if (plan.type == "connectionPlan") ConnectPlan.verdict(plan.body, config.allowedHosts, config.smpServers, groupInput)
                 else ConnectPlan.Verdict.Refuse(unexpected(plan), "plan_reply")
             is CoreReply.Error -> ConnectPlan.Verdict.Refuse(ErrorMapper.fromCore(plan.error, Op.CONNECT), "plan_error")
             CoreReply.Invalid -> ConnectPlan.Verdict.Refuse(ErrorMapper.engine("invalid_reply"), "plan_reply")
@@ -484,6 +486,8 @@ internal class SimplexSecuredEngine(
                 SecuredLog.i(Ev.GROUP_ACTION, if (channel) "create_channel" else "create_group")
                 // The row first, so a caller reading chats() in the callback finds it.
                 refreshChats(notify = true)
+                // A group made after the last upload would be missing after a restore (G7).
+                requestUrgentBackup("group", CONTACT_BACKUP_DELAY_MS)
                 ok(callback, CoreJson.groupChatId(groupId))
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
@@ -572,12 +576,13 @@ internal class SimplexSecuredEngine(
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
         if (g.invited) return@post refuse(callback, "leave_invited", ErrorMapper.DECLINE_INSTEAD)
-        if (g.myStatus in GONE_STATUSES) return@post refuse(callback, "leave_gone", ErrorMapper.ALREADY_LEFT)
+        if (g.gone) return@post refuse(callback, "leave_gone", ErrorMapper.ALREADY_LEFT)
         when (val r = send(Commands.leaveGroup(g.groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "leftMemberUser") return@post err(callback, unexpected(r))
                 SecuredLog.i(Ev.GROUP_ACTION, "leave")
                 refreshChats(notify = true)
+                requestUrgentBackup("group", CONTACT_BACKUP_DELAY_MS)
                 ok(callback, Unit)
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
@@ -669,11 +674,14 @@ internal class SimplexSecuredEngine(
         ok(callback, SecuredInvite(compactInvite(l.shortLink ?: full!!)))
     }
 
-    /** `/_delete link #g` (admins and the owner). No link is not an error: the result is the same. */
+    /**
+     * `/_delete link #g`. No role or membership check, like the core (APIDeleteGroupLink, Commands.hs:3265-3268): the
+     * link is our own, so an admin who was made a member again can still delete the link they made (review #6).
+     * No link is not an error: the result is the same.
+     */
     override fun deleteGroupLink(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
-        GroupRules.linkRefusal(g)?.let { return@post refuse(callback, "link_role", it) }
         when (val r = send(Commands.deleteGroupLink(g.groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "groupLinkDeleted") return@post err(callback, unexpected(r))
@@ -1545,8 +1553,8 @@ internal class SimplexSecuredEngine(
      *     old phone's key, store it, close that controller too. (Every later backup carries this key inside its
      *     envelope, so the words open the copy that holds it, as they always do.);
      *  4. delete the `.bak`/`.exported` copies and the zip, open a new controller with the fresh key;
-     *  5. list the contacts and group member connections to repair, store the words, keys and server tag (backup stays
-     *     on, one upload owed at once),
+     *  5. list the contacts and groups to repair (groups as placeholders, expanded into member connections once
+     *     RUNNING), store the words, keys and server tag (backup stays on, one upload owed at once),
      *     and only then clear the restore marker ([RestoreRepair.commitRestore], finding 8): before that, a crash or a
      *     failed step is wiped at the next start, see [restoreMarker]; after it, nothing wipes the restore;
      *  6. lock the network until our servers are verified, and start like any other start ([configureAndRun]).
@@ -1595,22 +1603,12 @@ internal class SimplexSecuredEngine(
                 val contacts = chats.filter { !it.contact.isContactCard && !it.contact.removed }.map { RepairKey.contact(it.contact.contactId) }
                 // Every group member connection joins the same repair, keyed apart from contacts: `/_info #g <memberId>`,
                 // one `/_sync #g <memberId> force=on` (Commands.hs:5572), `/_switch #g <memberId>` after proof, and the
-                // groupMemberRatchetSync / groupMemberSwitch events (Controller.hs:926-928).
+                // groupMemberRatchetSync / groupMemberSwitch events (Controller.hs:926-928). The chat isn't started
+                // here, and the core refuses `/_members` until it is (8 Nov device test: chatNotStarted), so each
+                // group goes on the list as one placeholder, expanded into its members once RUNNING
+                // ([expandGroupPlaceholders]). Saved before the marker is cleared, like the contacts.
                 val groups = CoreJson.parseGroupChats(r.body)
-                val members = ArrayList<RepairKey>()
-                for (g in groups) {
-                    if (g.group.invited || g.group.myStatus in GONE_STATUSES) continue
-                    val mr = send(Commands.listMembers(g.group.groupId))
-                    if (mr !is CoreReply.Result || mr.type != "groupMembers") {
-                        // Same rule as the chat list: never leave member connections on old ratchets unnoticed.
-                        SecuredLog.e(Ev.RESTORE_FAILED, "members_" + replyTag(mr))
-                        backToEmptyProfile()
-                        return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.RESTORE_FAILED))
-                    }
-                    for (m in CoreJson.parseMembers(mr.body)) {
-                        if (!m.isMe && m.active) members.add(RepairKey.member(g.group.groupId, m.groupMemberId))
-                    }
-                }
+                val groupKeys = RestoreRepair.groupPlaceholders(groups.map { it.group })
                 // Our messages with a higher item id than every restored one were sent after the restore (receipt proof).
                 // Item ids are one counter across all chats, so groups and notes count too.
                 val since = (chats.mapNotNull { it.lastItem?.itemId } + groups.mapNotNull { it.lastItem?.itemId } +
@@ -1618,7 +1616,7 @@ internal class SimplexSecuredEngine(
                 // The restored databases carry the old phone's server list: lock the network until ours are verified.
                 if (!markFirstRunLockdown()) SecuredLog.w(Ev.CONFIG_STEP_FAILED, "lockdown_mark")
                 val failed = RestoreRepair.commitRestore(
-                    saveRepairList = { saveRepairList(contacts + members, since) },
+                    saveRepairList = { saveRepairList(contacts + groupKeys, since) },
                     storeKeys = { storeRestoredSecrets(payload, etag, secrets, entropy) },
                     clearMarker = { clearRestoreMarker() },
                 )
@@ -1629,7 +1627,7 @@ internal class SimplexSecuredEngine(
                     return err(callback, SecuredError(SecuredError.Kind.ENGINE, msg))
                 }
                 SecuredLog.i(Ev.RESTORE_DONE, "contacts", contacts.size)
-                SecuredLog.i(Ev.RESTORE_DONE, "members", members.size)
+                SecuredLog.i(Ev.RESTORE_DONE, "groups", groupKeys.size)
                 configureAndRun(user)
             } catch (f: StartFailure) {
                 failClosed(f)
@@ -1831,7 +1829,38 @@ internal class SimplexSecuredEngine(
 
     private fun checkAllPending() {
         if (state != EngineState.RUNNING) return
+        expandGroupPlaceholders()
         for (key in pendingMap().keys.toList()) checkPending(key)
+    }
+
+    /**
+     * Engine thread, RUNNING (the chat is started, so `/_members` works). Each group placeholder the restore listed
+     * ([RestoreRepair.groupPlaceholders]) becomes its member connections ([RestoreRepair.memberKeys]). The new list is
+     * written in one atomic save, and the placeholder is dropped only when that save succeeded, so a member key is
+     * never lost: a failed save or `/_members` keeps the placeholder for the next start. A group that is gone
+     * (groupNotFound) has nothing left to repair.
+     */
+    private fun expandGroupPlaceholders() {
+        val placeholders = pendingMap().keys.filter { it.isGroupPlaceholder }
+        for (key in placeholders) {
+            val r = send(Commands.listMembers(key.groupId))
+            val members = when {
+                r is CoreReply.Result && r.type == "groupMembers" -> RestoreRepair.memberKeys(key.groupId, CoreJson.parseMembers(r.body))
+                r is CoreReply.Error && r.error.detail in GONE_CONNECTION_ERRORS -> emptyList()
+                else -> {
+                    SecuredLog.w(Ev.RESTORE_REPAIR, "expand_" + replyTag(r))
+                    continue
+                }
+            }
+            val next = RestoreRepair.expand(pendingMap(), key, members)
+            if (!backupStore.setPending(next)) {
+                SecuredLog.w(Ev.BACKUP_IO_FAILED, "pending")
+                continue
+            }
+            pendingCache = next
+            if (next.isEmpty()) repairSinceCache = Long.MAX_VALUE
+            SecuredLog.i(Ev.RESTORE_REPAIR, "members", members.size)
+        }
     }
 
     /** `/_info @id` or `/_info #g <memberId>`. */
@@ -1851,7 +1880,8 @@ internal class SimplexSecuredEngine(
      */
     private fun checkPending(key: RepairKey) {
         if (state != EngineState.RUNNING || ctrl == 0L) return
-        if (pendingMap()[key] == null) return
+        // A group placeholder is no connection: [expandGroupPlaceholders] turns it into member keys first.
+        if (key.isGroupPlaceholder || pendingMap()[key] == null) return
         val (ready, stats) = when (val r = send(infoCommand(key))) {
             is CoreReply.Result -> connInfo(key, r) ?: return
             is CoreReply.Error -> {
@@ -1988,6 +2018,11 @@ internal class SimplexSecuredEngine(
 
     /** Events that matter for the backup and for repairing restored connections. Engine thread, RUNNING only. */
     private fun backupOnEvent(reply: CoreReply.Result) {
+        // New contacts, member connections and changes to our own memberships: the server copy must have them soon.
+        BackupStore.urgentReason(reply.type)?.let { reason ->
+            markChanged()
+            requestUrgentBackup(reason, CONTACT_BACKUP_DELAY_MS)
+        }
         when (reply.type) {
             "contactRatchetSync" -> {
                 val (contactId, status) = CoreJson.ratchetSyncEvent(reply.body) ?: return
@@ -2005,19 +2040,10 @@ internal class SimplexSecuredEngine(
                 val (groupId, memberId, progress) = CoreJson.memberSwitchEvent(reply.body) ?: return
                 onSwitchEvent(RepairKey.member(groupId, memberId), progress)
             }
-            "contactConnected" -> {
-                markChanged()
-                requestUrgentBackup("contact", CONTACT_BACKUP_DELAY_MS)
-            }
-            // New member connections: their keys must be in the server copy too, like a new contact's.
-            "connectedToGroupMember", "userJoinedGroup", "joinedGroupMember" -> {
-                markChanged()
-                requestUrgentBackup("member", CONTACT_BACKUP_DELAY_MS)
-                if (reply.type == "connectedToGroupMember") {
-                    val groupId = reply.body.optJSONObject("groupInfo")?.optLong("groupId", 0L) ?: 0L
-                    val memberId = reply.body.optJSONObject("member")?.optLong("groupMemberId", 0L) ?: 0L
-                    if (groupId > 0 && memberId > 0) checkPending(RepairKey.member(groupId, memberId))
-                }
+            "connectedToGroupMember" -> {
+                val groupId = reply.body.optJSONObject("groupInfo")?.optLong("groupId", 0L) ?: 0L
+                val memberId = reply.body.optJSONObject("member")?.optLong("groupMemberId", 0L) ?: 0L
+                if (groupId > 0 && memberId > 0) checkPending(RepairKey.member(groupId, memberId))
             }
             "contactSndReady" -> CoreJson.parseContact(reply.body.optJSONObject("contact"))?.contactId?.let { checkPending(RepairKey.contact(it)) }
             "newChatItems" -> {
@@ -2312,7 +2338,7 @@ internal class SimplexSecuredEngine(
      */
     private fun deleteGroupOnEngine(chatId: Long, forEveryone: Boolean, callback: SecuredCallback<Unit>) {
         val g = groupCache[chatId] ?: return err(callback, ErrorMapper.chatGone())
-        val stillMember = !g.invited && g.myStatus !in GONE_STATUSES
+        val stillMember = !g.invited && !g.gone
         val everyone = forEveryone && stillMember && g.myRole == MemberRole.OWNER
         if (stillMember && !everyone) {
             when (val r = send(Commands.leaveGroup(g.groupId))) {
@@ -2322,6 +2348,8 @@ internal class SimplexSecuredEngine(
             }
             SecuredLog.i(Ev.GROUP_ACTION, "leave")
         }
+        // We leave (or end the group for everyone): the server copy must not bring the membership back.
+        if (stillMember) requestUrgentBackup("group", CONTACT_BACKUP_DELAY_MS)
         val tag = when {
             everyone -> "delete_everyone"
             g.invited -> "decline"
@@ -2646,7 +2674,11 @@ internal class SimplexSecuredEngine(
         return tag to c
     }
 
-    private fun activeUser(): CoreUser? = when (val r = send(Commands.SHOW_ACTIVE_USER)) {
+    /**
+     * `/u`: the profile, or null when there is none yet (NEEDS_PROFILE). This probe is how a start finds out, so before
+     * the first profile its `noActiveUser` answer is expected and not logged as an error (G7 log noise).
+     */
+    private fun activeUser(): CoreUser? = when (val r = send(Commands.SHOW_ACTIVE_USER, expected = NO_USER_YET)) {
         is CoreReply.Result ->
             if (r.type == "activeUser") {
                 CoreJson.parseUser(r.body.optJSONObject("user")) ?: throw configFailure("active_user", r)
@@ -2654,7 +2686,7 @@ internal class SimplexSecuredEngine(
                 throw configFailure("active_user", r)
             }
         is CoreReply.Error ->
-            if (r.error.detail == "noActiveUser") null
+            if (r.error.detail in NO_USER_YET) null
             else throw StartFailure(ErrorMapper.fromCore(r.error, Op.START), r.error.tag)
         CoreReply.Invalid -> throw configFailure("active_user", r)
     }
@@ -3069,8 +3101,11 @@ internal class SimplexSecuredEngine(
     // Plumbing
     // =============================================================================================================
 
-    /** Runs one engine command on the engine thread. Logs only reply/error type tags. */
-    private fun send(cmd: String): CoreReply {
+    /**
+     * Runs one engine command on the engine thread. Logs only reply/error type tags; an error whose detail is in
+     * [expected] is an answer the caller asked for, not a failure, and isn't logged as CMD_ERROR.
+     */
+    private fun send(cmd: String, expected: Set<String> = emptySet()): CoreReply {
         val c = ctrl
         if (c == 0L) return CoreReply.Error(CoreError("error", "chatNotStarted", null))
         val raw = try {
@@ -3081,7 +3116,7 @@ internal class SimplexSecuredEngine(
         }
         val reply = CoreJson.parseReply(raw)
         when (reply) {
-            is CoreReply.Error -> SecuredLog.w(Ev.CMD_ERROR, reply.error.tag)
+            is CoreReply.Error -> if (reply.error.detail !in expected) SecuredLog.w(Ev.CMD_ERROR, reply.error.tag)
             CoreReply.Invalid -> SecuredLog.w(Ev.CMD_INVALID_REPLY)
             is CoreReply.Result -> Unit
         }
@@ -3207,6 +3242,9 @@ internal class SimplexSecuredEngine(
         const val AUTO_SYNC_GAP_MS = 10L * 60 * 1000
         /** A guard re-check runs this long after the guard ends (R6.6). */
         const val SYNC_RECHECK_SLACK_MS = 2_000L
+        /** `/u` before any profile exists (ChatErrorType CENoActiveUser). */
+        val NO_USER_YET = setOf("noActiveUser")
+
         /**
          * `/_info` errors that mean the connection is gone for good: contacts (errorStore contactNotFound, error
          * contactNotActive) and members (StoreError groupMemberNotFound / groupNotFound, Store/Shared.hs:98-101; error
@@ -3235,8 +3273,5 @@ internal class SimplexSecuredEngine(
             "memberBlockedForAll", "deletedMember", "deletedMemberUser", "leftMember", "groupDeleted", "groupUpdated",
             "groupMemberUpdated", "groupLinkConnecting",
         )
-
-        /** Our membership is over (Types.hs:1442-1447 memberRemoved): we can't leave, post or be repaired any more. */
-        val GONE_STATUSES = setOf("left", "removed", "rejected", "deleted")
     }
 }

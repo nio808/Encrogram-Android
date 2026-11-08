@@ -202,7 +202,7 @@ public final class SecuredMessageMapper {
             mo.customName = sender.getDisplayName();
             mo.overrideLinkColor = AvatarDrawable.getColorIndex(sender.getMemberId());
             final AvatarDrawable avatar = avatarResources != null ? new AvatarDrawable(avatarResources) : new AvatarDrawable();
-            avatar.setInfo(sender.getMemberId(), sender.getDisplayName(), null);
+            Kit.setAvatar(avatar, sender.getMemberId(), sender.getDisplayName());
             mo.customAvatarDrawable = avatar;
             // The text width was measured at construction, before the avatar existed: measure again with the avatar column.
             mo.generateLayout(null);

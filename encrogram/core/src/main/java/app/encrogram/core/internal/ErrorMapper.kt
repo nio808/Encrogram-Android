@@ -163,7 +163,9 @@ internal object ErrorMapper {
         "invitationLink.ownLink", "contactAddress.ownLink" -> ownLink()
         "groupLink.ownLink" -> SecuredError(Kind.INVALID_LINK, OWN_GROUP_LINK)
         "groupLink.known" -> SecuredError(Kind.INVALID_LINK, ALREADY_IN_GROUP)
-        "groupLink.connectingProhibit" -> SecuredError(Kind.INVALID_LINK, ALREADY_JOINING)
+        // A join already sent and not answered yet (Prohibit: the group row exists; ConfirmReconnect: only our
+        // request does). Never sent twice: the admin's core would add us twice (Subscriber.hs:1607, review #3).
+        "groupLink.connectingProhibit", "groupLink.connectingConfirmReconnect" -> SecuredError(Kind.INVALID_LINK, ALREADY_JOINING)
         "groupLink.noRelays", "groupLink.updateRequired" -> notAllowed(UNSUPPORTED_GROUP_LINK)
         else -> null
     }
@@ -171,39 +173,39 @@ internal object ErrorMapper {
     // ---- 12-word backup ------------------------------------------------------------------------------------------
 
     const val WRONG_PHRASE = "These aren't 12 valid recovery words. Check each word and their order."
-    const val NO_BACKUP = "No backup was found for these 12 words."
+    const val NO_BACKUP = "No Secured account was found for this recovery phrase."
     const val NEEDS_UNLOCK = "Unlock your phone to see the 12 words."
-    const val BACKUP_NETWORK = "Can't reach the backup server. Check your internet connection and try again."
-    const val BACKUP_BUSY = "The backup server is busy. Try again in a few minutes."
-    const val BACKUP_TOO_LARGE = "Your Secured data is too large to back up (over 20 MB)."
-    const val BACKUP_DAMAGED = "This backup is damaged and can't be restored."
-    const val BACKUP_ROLLBACK = "The server sent an older backup than one this phone has already seen, so it was refused. Try again later."
-    const val BACKUP_NEWER_APP = "This backup was made by a newer version of Encrogram. Update the app and try again."
-    const val BACKUP_NOT_CONFIGURED = "Backup isn't available in this version."
-    const val BACKUP_OFF = "Backup is off."
+    const val BACKUP_NETWORK = "Couldn't connect. Check your internet connection and try again."
+    const val BACKUP_BUSY = "Encrogram is busy right now. Try again in a few minutes."
+    const val BACKUP_TOO_LARGE = "Your Secured account has grown too large for its recovery phrase (over 20 MB)."
+    const val BACKUP_DAMAGED = "This account's saved data is damaged and can't be restored."
+    const val BACKUP_ROLLBACK = "Only an older state of this account was available, so it was refused. Try again later."
+    const val BACKUP_NEWER_APP = "This account was saved by a newer version of Encrogram. Update the app and try again."
+    const val BACKUP_NOT_CONFIGURED = "Recovery phrases aren't available in this version."
+    const val BACKUP_OFF = "No recovery phrase is saved on this phone."
     const val NO_SCREEN_LOCK = "Set a screen lock on this phone first: the 12 words are kept behind it."
-    const val KEYSTORE = "This phone's secure key storage isn't working, so backup can't be used."
-    const val PHRASE_INVALIDATED = "The 12 words can't be shown because the phone's screen lock changed. Turn backup off and on again to get new words."
+    const val KEYSTORE = "This phone's secure key storage isn't working, so a recovery phrase can't be used."
+    const val PHRASE_INVALIDATED = "Your recovery phrase can't be shown because the phone's screen lock changed. Remove it and save a new one."
     const val PROFILE_EXISTS = "A Secured profile already exists on this phone."
-    const val BACKUP_FAILED = "The backup couldn't be made. Try again."
-    const val RESTORE_FAILED = "The backup couldn't be restored. Try again."
-    const val OTHER_PHONE = "Another phone made a newer backup with these words. Automatic backups on this phone are paused."
-    const val BACKUP_RUNNING = "A backup is already under way. Try again in a moment."
-    const val BACKUP_SERVER_ODD = "The backup server didn't answer as expected. Encrogram will try again later."
+    const val BACKUP_FAILED = "Something went wrong. Try again."
+    const val RESTORE_FAILED = "Your account couldn't be restored. Try again."
+    const val OTHER_PHONE = "Your account was restored on another phone that uses this recovery phrase."
+    const val BACKUP_RUNNING = "Please wait a moment and try again."
+    const val BACKUP_SERVER_ODD = "Something went wrong. Encrogram will try again later."
     /** "Turn off" removed everything on this phone, but the server delete failed and is queued for later. */
     const val SERVER_COPY_NOT_DELETED =
-        "The copy on our server could not be deleted yet. Backup is off on this phone, and Encrogram will try to delete the copy again later."
+        "Removed from this phone. Encrogram will finish removing your account's saved data later."
     /** "Turn off" removed everything on this phone, but the key that names the server copy was unreadable. */
     const val SERVER_COPY_UNREACHABLE =
-        "The copy on our server could not be deleted, because this phone's secure key storage failed. Backup is off on this phone. " +
-            "Anyone with your 12 words can still restore that copy until the server removes it after 400 days unused."
+        "Removed from this phone, but this phone's secure key storage failed, so your old recovery phrase can still restore " +
+            "this account for up to 400 days. Keep it safe or destroy it."
     /** "Turn off" removed everything on this phone, but the server copy isn't provably this phone's, so it was kept (R6.3). */
     const val SERVER_COPY_KEPT =
-        "Backup is off on this phone. The copy on our server was kept: another phone with the same 12 words made it, " +
-            "or this phone can't confirm it made it. Anyone with your 12 words can still restore that copy."
+        "Removed from this phone. Your account stays saved for the other phone that uses this recovery phrase, " +
+            "so anyone with the phrase can still restore it."
     /** "Turn off" stopped: the server delete failed and couldn't be queued, so nothing was changed. */
     const val SERVER_COPY_KEEP_ON =
-        "The copy on our server could not be deleted. Check your internet connection and try again; backup is still on."
+        "Couldn't remove your recovery phrase. Check your internet connection and try again."
 
     fun wrongPhrase(): SecuredError = SecuredError(Kind.WRONG_PHRASE, WRONG_PHRASE)
 

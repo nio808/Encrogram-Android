@@ -383,6 +383,21 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
         fun autoPaused(m: Meta): Boolean = m.otherPhone || m.error == TOO_LARGE
 
         /**
+         * Engine events after which an automatic upload is owed soon ([Meta.urgent], coalesced by the engine): new
+         * connection keys or a changed group membership, which an older copy would restore wrongly. A new contact; a
+         * member connection on either side (`connectedToGroupMember`, `joinedGroupMember`); our own join
+         * (`userJoinedGroup`, for invitation and link joins alike once the connection to the member who let us in is
+         * up, Subscriber.hs:885-897); being removed (`deletedMemberUser`, :3636). Creating and leaving a group are our
+         * own commands: the engine asks for those uploads itself. Returns the reason word for the log, or null.
+         */
+        fun urgentReason(eventType: String): String? = when (eventType) {
+            "contactConnected" -> "contact"
+            "connectedToGroupMember", "joinedGroupMember" -> "member"
+            "userJoinedGroup", "deletedMemberUser" -> "group"
+            else -> null
+        }
+
+        /**
          * When the next automatic upload is due, or null when none is: now when one is owed ([Meta.urgent]), a day
          * after the last backup when something changed ([Meta.dirty]), never while [autoPaused]. After failures, not
          * before the backoff since the last attempt has passed.

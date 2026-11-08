@@ -14,6 +14,7 @@ import app.encrogram.core.api.GroupEvent
 import app.encrogram.core.api.SecuredEngine
 import app.encrogram.core.api.SecuredListener
 import app.encrogram.core.api.SecuredMessage
+import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.internal.SecuredLog
 
 /**
@@ -65,11 +66,7 @@ class SecuredService : Service() {
     }
 
     private fun onIncoming(message: SecuredMessage, e: SecuredEngine) {
-        if (message.outgoing) return
-        // Messages, in 1:1 chats and groups alike. Of the service rows only an invitation to a group notifies;
-        // "X joined" and the like don't. Same hidden text either way (NotificationText).
-        val event = message.event
-        if (event != null && event.kind != GroupEvent.Kind.INVITED) return
+        if (!notifies(message)) return
         val config = SecuredBackground.config ?: return
         if (SecuredBackground.isChatOnScreen(message.chatId)) return
         if (e.chats().firstOrNull { it.chatId == message.chatId }?.muted == true) return
@@ -98,5 +95,19 @@ class SecuredService : Service() {
         if (stopped) return
         stopped = true
         stopSelf()
+    }
+
+    internal companion object {
+        /**
+         * Incoming messages notify, in 1:1 chats and groups alike (same hidden text, NotificationText). Of the service
+         * rows only an invitation to you does: the INVITED row in the inviter's 1:1 chat (rcvGroupInvitation). In a
+         * group, INVITED means "X was invited" (memberAdded, invitedViaGroupLink) and, like "X joined", never notifies
+         * (review #5). Our own rows (sent invitations, "You left") are outgoing.
+         */
+        fun notifies(message: SecuredMessage): Boolean {
+            if (message.outgoing) return false
+            val event = message.event ?: return true
+            return event.kind == GroupEvent.Kind.INVITED && !isGroupChatId(message.chatId)
+        }
     }
 }

@@ -260,18 +260,83 @@ class GroupLinksTest {
     private val okDirect = groupPlan("ok", ""","groupSLinkInfo_":{"direct":true,"groupRelays":[]},
         "groupSLinkData_":{"groupProfile":{"displayName":"Team","fullName":""}},"ownerVerification":null""")
 
-    private fun verdict(body: JSONObject) = ConnectPlan.verdict(body, allowed, smp)
+    private fun verdict(body: JSONObject, groupInput: Boolean = false) = ConnectPlan.verdict(body, allowed, smp, groupInput)
 
-    private fun refusal(body: JSONObject): ConnectPlan.Verdict.Refuse =
-        verdict(body) as? ConnectPlan.Verdict.Refuse ?: throw AssertionError("not refused: ${verdict(body)}")
+    private fun refusal(body: JSONObject, groupInput: Boolean = false): ConnectPlan.Verdict.Refuse =
+        verdict(body, groupInput) as? ConnectPlan.Verdict.Refuse ?: throw AssertionError("not refused: ${verdict(body, groupInput)}")
 
     @Test
     fun aDirectGroupOnOurRelayIsJoinedWithTheCheckedLinks() {
         assertEquals(ConnectPlan.Verdict.JoinGroup(fullGroupLink(), coreGroupLink), verdict(plan(okDirect)))
+        assertEquals(ConnectPlan.Verdict.JoinGroup(fullGroupLink(), coreGroupLink), verdict(plan(okDirect), groupInput = true))
         // A full link pasted: no short link.
         assertEquals(ConnectPlan.Verdict.JoinGroup(fullGroupLink(), null), verdict(plan(groupPlan("ok"), short = null)))
-        // A stuck earlier request may be repeated (same request id, the admin's phone dedupes).
-        assertEquals(ConnectPlan.Verdict.JoinGroup(fullGroupLink(), coreGroupLink), verdict(plan(groupPlan("connectingConfirmReconnect"))))
+    }
+
+    @Test
+    fun aSecondTapWhileJoiningIsRefused() {
+        // Review #3: the admin's core doesn't de-duplicate a repeated request (Subscriber.hs:1607), so a join that is
+        // sent but not answered yet is never sent again.
+        for (input in listOf(false, true)) {
+            val r = refusal(plan(groupPlan("connectingConfirmReconnect")), input)
+            assertEquals(Kind.INVALID_LINK, r.error.kind)
+            assertEquals(ErrorMapper.ALREADY_JOINING, r.error.message)
+            assertEquals("plan", r.logTag)
+        }
+        assertEquals(ErrorMapper.ALREADY_JOINING, ErrorMapper.fromConnectionPlan("groupLink.connectingConfirmReconnect").message)
+    }
+
+    @Test
+    fun onlyKnownPlanKindsConnect() {
+        // Review #4. 1:1 plans go on to /connect, group plans to the group path, the core's error plan to /connect as
+        // before; anything else is refused.
+        fun p(json: String) = plan(json, full = fullGroupLink(), short = null)
+        assertEquals(ConnectPlan.Verdict.Connect, verdict(p("""{"type":"invitationLink","invitationLinkPlan":{"type":"ok"}}""")))
+        assertEquals(ConnectPlan.Verdict.Connect, verdict(p("""{"type":"invitationLink","invitationLinkPlan":{"type":"somethingNew"}}""")))
+        assertEquals(ConnectPlan.Verdict.Connect, verdict(p("""{"type":"contactAddress","contactAddressPlan":{"type":"ok"}}""")))
+        val error = p("""{"type":"error","chatError":{"type":"error","errorType":{"type":"invalidConnReq"}}}""")
+        assertEquals(ConnectPlan.Verdict.Connect, verdict(error))
+        for (unknown in listOf(
+            """{"type":"somethingNew","somethingNewPlan":{"type":"ok"}}""",
+            """{"type":"invitationLink"}""",
+            """{"type":"contactAddress","contactAddressPlan":null}""",
+        )) {
+            val r = refusal(p(unknown))
+            assertEquals(unknown, Kind.INVALID_LINK, r.error.kind)
+            assertEquals(unknown, "plan_unknown", r.logTag)
+        }
+        assertEquals("plan_unknown", refusal(JSONObject("""{"type":"connectionPlan","connLink":{"connFullLink":"${fullGroupLink()}"}}""")).logTag)
+    }
+
+    @Test
+    fun aGroupLinkOnlyEverJoinsAGroup() {
+        // A `/g` link whose plan says 1:1 (or error) is refused, never connected.
+        for (json in listOf(
+            """{"type":"invitationLink","invitationLinkPlan":{"type":"ok"}}""",
+            """{"type":"contactAddress","contactAddressPlan":{"type":"ok"}}""",
+            """{"type":"error","chatError":{"type":"error","errorType":{"type":"invalidConnReq"}}}""",
+        )) {
+            val r = refusal(plan(json), groupInput = true)
+            assertEquals(json, Kind.INVALID_LINK, r.error.kind)
+            assertEquals(json, "plan_not_group", r.logTag)
+        }
+        // Own links still get their own words.
+        assertEquals(Kind.OWN_LINK, refusal(plan("""{"type":"contactAddress","contactAddressPlan":{"type":"ownLink"}}"""), groupInput = true).error.kind)
+    }
+
+    @Test
+    fun shortGroupLinksAreKnownByShape() {
+        assertTrue(LinkChecker.isShortGroupLink(coreGroupLink))
+        assertTrue(LinkChecker.isShortGroupLink(compactGroupLink))
+        assertTrue(LinkChecker.isShortGroupLink("  HTTPS://$host/g#$linkKey "))
+        assertTrue(LinkChecker.isShortGroupLink("simplex:/g#$linkKey?h=$host&p=5223&c=$fp"))
+        for (other in listOf(
+            "https://$host/i#AbCdEfGhIjKlMnOpQrStUvWxYz012345/$linkKey", "https://$host/a#$linkKey", fullGroupLink(),
+            "https://$host/contact#/?v=2-7", "https://$host/c#$linkKey", "https://$host#/g", "https://$host", "", null,
+            "http://$host/g#$linkKey", "simplex:/a#$linkKey?h=$host",
+        )) {
+            assertEquals(other, false, LinkChecker.isShortGroupLink(other))
+        }
     }
 
     @Test

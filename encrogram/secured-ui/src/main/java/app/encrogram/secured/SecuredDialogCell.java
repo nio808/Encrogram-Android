@@ -37,6 +37,9 @@ final class SecuredDialogCell extends DialogCell {
     private ChatRowMapper.Tick tick = ChatRowMapper.Tick.NONE;
     private boolean lock = true;
     private boolean saved;
+    private AvatarDrawable chatAvatar;
+    private int avatarKey;
+    private String avatarName = "";
     private AvatarDrawable savedAvatar;
     private int unread;
     private final Paint badgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -59,6 +62,8 @@ final class SecuredDialogCell extends DialogCell {
         saved = row.saved;
         lock = lockBadge && !row.saved;
         unread = row.unread;
+        avatarKey = ChatRowMapper.colorId(row.chatId);
+        avatarName = row.name;
         setArchiveSwipe(inArchive);
         setDialog(ChatRowMapper.toCustomDialog(row));
     }
@@ -94,6 +99,11 @@ final class SecuredDialogCell extends DialogCell {
                 savedAvatar.setAvatarType(AvatarDrawable.AVATAR_TYPE_SAVED);
             }
             avatarImage.setImage(null, "50_50", savedAvatar, null, 0);
+        } else {
+            // DialogCell's own avatar reads a two-word title as "TE": use the same helper as the chat header.
+            if (chatAvatar == null) chatAvatar = new AvatarDrawable(SecuredResourcesProvider.get());
+            Kit.setAvatar(chatAvatar, avatarKey, avatarName);
+            avatarImage.setImage(null, "50_50", chatAvatar, null, 0);
         }
         return result;
     }

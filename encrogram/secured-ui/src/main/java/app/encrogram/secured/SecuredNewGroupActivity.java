@@ -447,8 +447,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
 
     private void updatePreview(String text) {
         final String shown = text.trim();
-        final int sp = shown.lastIndexOf(' ');
-        preview.setInfo(1, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+        Kit.setAvatar(preview, 1, shown);   // no chat id yet: the real colour follows the chat id once it exists
         if (previewView != null) previewView.invalidate();
     }
 

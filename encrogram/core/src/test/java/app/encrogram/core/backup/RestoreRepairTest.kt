@@ -1,7 +1,11 @@
 package app.encrogram.core.backup
 
+import app.encrogram.core.api.MemberRole
+import app.encrogram.core.api.MemberStatus
 import app.encrogram.core.backup.RestoreRepair.Action
 import app.encrogram.core.backup.RestoreRepair.ConnStats
+import app.encrogram.core.internal.CoreGroup
+import app.encrogram.core.internal.CoreMember
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -179,6 +183,69 @@ class RestoreRepairTest {
         // Never a number in logs.
         assertEquals("member", m.toString())
         assertEquals("contact", c.toString())
+    }
+
+    // ---- groups after a restore: a placeholder per group, expanded once the chat runs (G7) ----
+
+    @Test
+    fun groupPlaceholderKeys() {
+        val g = RepairKey.group(3)
+        assertTrue(g.isGroupPlaceholder)
+        assertFalse(g.isMember)
+        assertFalse(RepairKey.member(3, 12).isGroupPlaceholder)
+        assertFalse(RepairKey.contact(3).isGroupPlaceholder)
+        assertEquals("#3:*", g.encode())
+        assertEquals(g, RepairKey.decode("#3:*"))
+        assertEquals(g.hashCode(), RepairKey.decode("#3:*").hashCode())
+        // Never the same key as a member or a contact with the same numbers.
+        assertFalse(g == RepairKey.member(3, 12))
+        assertFalse(g == RepairKey.contact(3))
+        for (bad in listOf("#3:", "#0:*", "#-3:*", "#:*", "#3:**", "#3:*1", "*", "#3*")) assertNull(bad, RepairKey.decode(bad))
+        assertEquals("group", g.toString())
+    }
+
+    @Test
+    fun placeholdersOnlyForGroupsWeAreIn() {
+        fun g(id: Long, status: String) = CoreGroup(id, "G$id", MemberRole.MEMBER, status, 3)
+        val groups = listOf(
+            g(1, "creator"), g(2, "connected"), g(3, "complete"), g(4, "invited"), g(5, "left"), g(6, "removed"),
+            g(7, "rejected"), g(8, "deleted"), g(9, "accepted"),
+        )
+        // Invited only, left or removed: no member connections of ours. Still joining (accepted): listed.
+        assertEquals(listOf(1L, 2L, 3L, 9L).map { RepairKey.group(it) }, RestoreRepair.groupPlaceholders(groups))
+        assertTrue(RestoreRepair.groupPlaceholders(emptyList()).isEmpty())
+    }
+
+    @Test
+    fun aPlaceholderExpandsIntoItsWorkingMemberConnections() {
+        fun m(id: Long, status: MemberStatus, active: Boolean, isMe: Boolean = false) =
+            CoreMember(id, "n$id", MemberRole.MEMBER, status, isMe, null, active = active)
+        val members = listOf(
+            m(1, MemberStatus.CONNECTED, active = true, isMe = true),
+            m(5, MemberStatus.CONNECTED, active = true),
+            m(6, MemberStatus.CONNECTING, active = false),
+            m(7, MemberStatus.CONNECTED, active = true),
+            m(8, MemberStatus.LEFT, active = false),
+        )
+        val keys = RestoreRepair.memberKeys(3, members)
+        assertEquals(listOf(RepairKey.member(3, 5), RepairKey.member(3, 7)), keys)
+
+        val contact = RepairKey.contact(12)
+        val other = RepairKey.group(4)
+        val known = RepairKey.member(3, 7)
+        val map = linkedMapOf(contact to proven, RepairKey.group(3) to fresh, other to fresh, known to switched)
+        val out = RestoreRepair.expand(map, RepairKey.group(3), keys)
+        // The placeholder is gone; its members are listed fresh, one already listed keeps its state; the rest stays.
+        assertEquals(listOf(contact, other, known, RepairKey.member(3, 5)), out.keys.toList())
+        assertEquals(proven, out[contact])
+        assertEquals(switched, out[known])
+        assertEquals(fresh, out[RepairKey.member(3, 5)])
+        assertEquals(fresh, out[other])
+        // A group with nobody else connected: just the placeholder goes.
+        assertEquals(listOf(contact), RestoreRepair.expand(linkedMapOf(contact to fresh, RepairKey.group(3) to fresh), RepairKey.group(3), emptyList()).keys.toList())
+        // Keys of another group never land under this one.
+        assertEquals(setOf(contact), RestoreRepair.expand(linkedMapOf(contact to fresh, RepairKey.group(3) to fresh), RepairKey.group(3),
+            listOf(RepairKey.member(9, 5), RepairKey.contact(5))).keys)
     }
 
     @Test

@@ -192,7 +192,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         rows.add(new Row(T_ACTION, A_LEAVE));
         if (owner()) rows.add(new Row(T_ACTION, A_DELETE));
         rows.add(new Row(T_SHADOW, 0));
-        if (header != null) header.bind(displayName(), subtitle(header.getContext()));
+        if (header != null) header.bind(chatId, displayName(), subtitle(header.getContext()));
         if (adapter != null) adapter.notifyDataSetChanged();
     }
 
@@ -264,9 +264,12 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         final GroupMember m = members.get(index);
         final MemberRole theirs = m.getRole();
         // The core's rule (Commands.hs:2890): admin or owner, and at least the member's old and new role; owners only by owners.
-        if (m.isMe() || !admin() || theirs == MemberRole.OWNER) return;
+        // An owner may demote or remove a co-owner, never themselves; admins cannot touch owners.
+        if (m.isMe() || !admin() || (theirs == MemberRole.OWNER && myRole() != MemberRole.OWNER)) return;
         final Context c = row.getContext();
-        final boolean connected = m.getStatus() == MemberStatus.CONNECTED;
+        // Roles can change while the member is still invited or connecting (the core accepts it); not once they left.
+        final boolean connected = m.getStatus() == MemberStatus.CONNECTED
+                || m.getStatus() == MemberStatus.CONNECTING || m.getStatus() == MemberStatus.INVITED;
         final boolean channel = channel();
         final ItemOptions o = ItemOptions.makeOptions(this, row);
         if (connected) {
@@ -371,7 +374,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     @Override
     RecyclerListView.SelectionAdapter buildAdapter(Context context) {
         header = new ProfileHeader(context);
-        header.bind(displayName(), subtitle(context));
+        header.bind(chatId, displayName(), subtitle(context));
         adapter = new RecyclerListView.SelectionAdapter() {
             @Override
             public boolean isEnabled(RecyclerView.ViewHolder holder) {
@@ -495,10 +498,9 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
             addView(sub, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
         }
 
-        void bind(String name, CharSequence subtitle) {
+        void bind(long chatId, String name, CharSequence subtitle) {
             final String shown = name == null ? "" : name.trim();
-            final int sp = shown.lastIndexOf(' ');
-            avatar.setInfo(1, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+            Kit.setAvatar(avatar, ChatRowMapper.colorId(chatId), shown);
             title.setText(shown);
             sub.setText(subtitle);
             invalidate();

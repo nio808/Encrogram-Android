@@ -1,6 +1,10 @@
 package app.encrogram.core.background
 
 import android.content.Intent
+import app.encrogram.core.api.GROUP_CHAT_ID_BASE
+import app.encrogram.core.api.GroupEvent
+import app.encrogram.core.api.MessageStatus
+import app.encrogram.core.api.SecuredMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -51,6 +55,30 @@ class BackgroundTextTest {
         // Contacts keep the ids they had.
         assertEquals(259, NotificationText.notificationId(259L))
         assertEquals(Int.MAX_VALUE, NotificationText.notificationId(Int.MAX_VALUE.toLong()))
+    }
+
+    @Test
+    fun onlyMessagesAndInvitationsToYouNotify() {
+        // Review #5: "X was invited" in a group notified every member.
+        fun msg(chatId: Long, outgoing: Boolean = false, event: GroupEvent? = null) =
+            SecuredMessage(chatId, 1, outgoing, "", 0, MessageStatus.DELIVERED, event = event)
+        val group = GROUP_CHAT_ID_BASE + 3
+        // Incoming messages, 1:1 and group.
+        assertTrue(SecuredService.notifies(msg(5)))
+        assertTrue(SecuredService.notifies(msg(group)))
+        // "You were invited to <group>", in the inviter's 1:1 chat.
+        assertTrue(SecuredService.notifies(msg(5, event = GroupEvent(GroupEvent.Kind.INVITED, groupName = "Team"))))
+        // "X was invited" (memberAdded, invitedViaGroupLink) in a group: no.
+        assertFalse(SecuredService.notifies(msg(group, event = GroupEvent(GroupEvent.Kind.INVITED, "Dan"))))
+        // Other service rows, anywhere: no.
+        for (k in GroupEvent.Kind.values().filter { it != GroupEvent.Kind.INVITED }) {
+            assertFalse(k.name, SecuredService.notifies(msg(group, event = GroupEvent(k, "Dan"))))
+            assertFalse(k.name, SecuredService.notifies(msg(5, event = GroupEvent(k, "Dan"))))
+        }
+        // Our own: messages, "Bob was invited" in our chat with Bob, "You left".
+        assertFalse(SecuredService.notifies(msg(5, outgoing = true)))
+        assertFalse(SecuredService.notifies(msg(5, outgoing = true, event = GroupEvent(GroupEvent.Kind.INVITED, "Bob", groupName = "Team"))))
+        assertFalse(SecuredService.notifies(msg(group, outgoing = true, event = GroupEvent(GroupEvent.Kind.LEFT))))
     }
 
     @Test

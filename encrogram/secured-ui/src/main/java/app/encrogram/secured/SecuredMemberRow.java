@@ -74,8 +74,7 @@ final class SecuredMemberRow extends FrameLayout {
     void set(long id, String name, CharSequence sub, boolean checked, boolean showDivider) {
         // AvatarDrawable takes initials from first and last name: split at the last space, as the chat header does.
         final String shown = name == null ? "" : name.trim();
-        final int sp = shown.lastIndexOf(' ');
-        avatar.setInfo(id, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+        Kit.setAvatar(avatar, id, shown);
         nameView.setText(shown);
         subView.setText(sub);
         subView.setVisibility(TextUtils.isEmpty(sub) ? View.GONE : View.VISIBLE);

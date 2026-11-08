@@ -29,10 +29,25 @@ internal object ConnectPlan {
         data class Refuse(val error: SecuredError, val logTag: String) : Verdict()
     }
 
-    /** Group plans the engine joins (Controller.hs:1127-1134, tags `sumTypeJSON (dropPrefix "GLP")`, :1784). */
-    private val JOINABLE_GROUP_PLANS = setOf("groupLink.ok", "groupLink.connectingConfirmReconnect")
+    /**
+     * Group plans the engine joins (Controller.hs:1127-1134, tags `sumTypeJSON (dropPrefix "GLP")`, :1784). Only a
+     * fresh join: `connectingConfirmReconnect` (a join already sent, not answered yet) is refused, because the admin's
+     * core doesn't de-duplicate a second request and would add us twice (Subscriber.hs:1607, review #3).
+     */
+    private val JOINABLE_GROUP_PLANS = setOf("groupLink.ok")
 
-    fun verdict(body: JSONObject, allowedHosts: Set<String>, smpServers: List<String>): Verdict {
+    /** Plan kinds that may go on to `/connect`: 1:1 invites and addresses, and the core's own error plan (as before). */
+    private val CONNECT_PLAN_PREFIXES = listOf("invitationLink.", "contactAddress.")
+    private const val ERROR_PLAN_PREFIX = "error."
+    private const val GROUP_PLAN_PREFIX = "groupLink."
+
+    /**
+     * [groupInput]: the user's link is a short group link (`/g#`, [LinkChecker.isShortGroupLink]); then the plan must
+     * be a group plan, or nothing is connected. Only plan kinds this version knows go anywhere (review #4): 1:1 plans
+     * to `/connect`, group plans to the group path; everything else is refused. `error.*` plans go to `/connect` as
+     * before (the core's connectionPlanProceed is True for them, and `/connect` reports the error), except for `/g`.
+     */
+    fun verdict(body: JSONObject, allowedHosts: Set<String>, smpServers: List<String>, groupInput: Boolean = false): Verdict {
         val tag = CoreJson.connectionPlanTag(body)
         val links = body.optJSONObject("connLink")
         // 1. The request the core resolved, and the short link it will store, are on our relay (host, port, key).
@@ -43,7 +58,13 @@ internal object ConnectPlan {
         if (short != null) refusal(short.result, "resolved_short")?.let { return it }
         // 2. Own links, known and still-connecting groups, relay channels.
         ErrorMapper.planRefusal(tag)?.let { return Verdict.Refuse(it, "plan") }
-        if (!tag.startsWith("groupLink.")) return Verdict.Connect
+        // 3. Only known plan kinds, each on its own path; a `/g` link only as a group.
+        val groupPlan = tag.startsWith(GROUP_PLAN_PREFIX)
+        if (groupInput && !groupPlan) return Verdict.Refuse(ErrorMapper.invalidLink(), "plan_not_group")
+        if (!groupPlan) {
+            val known = CONNECT_PLAN_PREFIXES.any { tag.startsWith(it) } || tag.startsWith(ERROR_PLAN_PREFIX)
+            return if (known) Verdict.Connect else Verdict.Refuse(ErrorMapper.invalidLink(), "plan_unknown")
+        }
         if (tag !in JOINABLE_GROUP_PLANS) return Verdict.Refuse(ErrorMapper.fromConnectionPlan(tag), "plan")
         if (relayGroup(body)) return Verdict.Refuse(ErrorMapper.notAllowed(ErrorMapper.UNSUPPORTED_GROUP_LINK), "relay_group")
         val fullLink = full.normalized ?: return Verdict.Refuse(ErrorMapper.invalidLink(), "resolved")

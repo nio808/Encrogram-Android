@@ -263,6 +263,39 @@ class BackupStoreTest {
     }
 
     @Test
+    fun groupPlaceholdersSurviveRestartsUntilExpanded() {
+        // G7: at commit time a restore lists each group as `#<groupId>:*`; once RUNNING the engine swaps it for the
+        // members in one save.
+        val s = BackupStore(dir)
+        val c = RepairKey.contact(12)
+        val g = RepairKey.group(3)
+        assertTrue(s.startRepair(linkedMapOf(c to BackupStore.Pending(), g to BackupStore.Pending()), sinceItemId = 7))
+        assertEquals("since 7\n12 -\n#3:* -\n", File(dir, BackupStore.PENDING_FILE).readText())
+        val reloaded = BackupStore(dir).pending()
+        assertEquals(mapOf(c to BackupStore.Pending(), g to BackupStore.Pending()), reloaded)
+        assertTrue(reloaded.keys.last().isGroupPlaceholder)
+
+        val expanded = RestoreRepair.expand(reloaded, g, listOf(RepairKey.member(3, 5), RepairKey.member(3, 7)))
+        assertTrue(s.setPending(expanded))
+        assertEquals("since 7\n12 -\n#3:5 -\n#3:7 -\n", File(dir, BackupStore.PENDING_FILE).readText())
+        assertEquals(7L, BackupStore(dir).repairSince())
+    }
+
+    @Test
+    fun groupChangesOweAnEarlyUpload() {
+        // G7: a group made, joined or left after the last upload must not be missing after a restore.
+        assertEquals("contact", BackupStore.urgentReason("contactConnected"))
+        assertEquals("member", BackupStore.urgentReason("connectedToGroupMember"))
+        assertEquals("member", BackupStore.urgentReason("joinedGroupMember"))
+        assertEquals("group", BackupStore.urgentReason("userJoinedGroup"))
+        assertEquals("group", BackupStore.urgentReason("deletedMemberUser"))
+        for (t in listOf("newChatItems", "groupLinkConnecting", "joinedGroupMemberConnecting", "receivedGroupInvitation",
+            "leftMember", "deletedMember", "contactSwitch", "")) {
+            assertNull(t, BackupStore.urgentReason(t))
+        }
+    }
+
+    @Test
     fun pendingDeleteQueueIsCapped() {
         val s = BackupStore(dir, TestBox())
         val ids = (0 until BackupStore.MAX_PENDING_DELETES + 3).map { i -> "%064x".format(i + 1) }

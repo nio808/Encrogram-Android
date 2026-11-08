@@ -130,6 +130,13 @@ internal data class CoreGroup(
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
+
+    /** Our membership is over (Types.hs:1442-1447 memberRemoved): we can't leave, post or be repaired any more. */
+    val gone: Boolean get() = myStatus in GONE_STATUSES
+
+    companion object {
+        private val GONE_STATUSES = setOf("left", "removed", "rejected", "deleted")
+    }
 }
 
 internal data class CoreGroupChat(val group: CoreGroup, val lastItem: CoreItem?, val unreadCount: Int)
@@ -450,7 +457,8 @@ internal object CoreJson {
             else -> local || contentType?.startsWith("snd") == true
         }
         val group = isGroupChatId(chatId)
-        val sender = if (group && dir == "groupRcv") parseSender(item.optJSONObject("chatDir")?.optJSONObject("groupMember")) else null
+        val senderJson = if (group && dir == "groupRcv") item.optJSONObject("chatDir")?.optJSONObject("groupMember") else null
+        val sender = parseSender(senderJson)
         // Deleted by a moderator: a "moderated" placeholder (fullDelete on, Store/Messages.hs:2833-2850) or a marked
         // item (fullDelete off, itemDeleted {type: moderated}, Messages.hs:1291-1295). Shown as a service row only.
         val moderated = contentType == "rcvModerated" || contentType == "sndModerated" ||
@@ -459,7 +467,7 @@ internal object CoreJson {
         val legacyDeleted = contentType == "sndDeleted" || contentType == "rcvDeleted"
         val isMessage = !moderated && (contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted)
         val deleted = moderated || legacyDeleted || present(meta, "itemDeleted")
-        val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, peerName)
+        val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, senderJson?.str("memberCategory"), peerName)
         val msgContent = content?.optJSONObject("msgContent")
         val msgText = msgContent?.str("text").orEmpty()
         // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
@@ -503,10 +511,10 @@ internal object CoreJson {
      * chat banner, E2EE info of a member, profile updates, blocks, signature warnings) is null and the row is skipped.
      * A row about a member always names them; without a name it is skipped rather than worded as if it were about us.
      */
-    private fun serviceEvent(content: JSONObject?, contentType: String?, sender: CoreSender?, peerName: String?): GroupEvent? {
+    private fun serviceEvent(content: JSONObject?, contentType: String?, sender: CoreSender?, senderCategory: String?, peerName: String?): GroupEvent? {
         if (content == null) return null
         return when (contentType) {
-            "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender)
+            "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender, senderCategory)
             "sndGroupEvent" -> sndGroupEvent(content.optJSONObject("sndGroupEvent"))
             // In the inviting contact's 1:1 chat: "You were invited to <group>" (CIRcvGroupInvitation, CIContent.hs:152).
             "rcvGroupInvitation" -> GroupEvent(GroupEvent.Kind.INVITED, groupName = invitedGroupName(content))
@@ -518,13 +526,21 @@ internal object CoreJson {
         }
     }
 
-    private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?): GroupEvent? {
+    /** [senderCategory]: the sending member's memberCategory (GroupMemberCategory, Types.hs:1321-1326). */
+    private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?, senderCategory: String?): GroupEvent? {
         if (e == null) return null
         val about = profileName(e)
         return when (tagOf(e)) {
             "memberAdded" -> about?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
-            // The member the item is from finished connecting ("X joined").
-            "memberConnected" -> sender?.let { GroupEvent(GroupEvent.Kind.JOINED, it.displayName) }
+            // The member the item is from finished connecting ("X joined"), except when we are the one joining.
+            "memberConnected" -> when (senderCategory) {
+                // The member who let us in (by invitation or link): their connection coming up is our own join
+                // (Subscriber.hs:885-912 makes this item with userJoinedGroup), so "You joined", not "<host> joined".
+                "host" -> GroupEvent(GroupEvent.Kind.JOINED)
+                // Members who were there before us, connecting after our join (:1835-1845): they didn't just join.
+                "pre" -> null
+                else -> sender?.let { GroupEvent(GroupEvent.Kind.JOINED, it.displayName) }
+            }
             "memberAccepted" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
             "userAccepted" -> GroupEvent(GroupEvent.Kind.JOINED)
             "memberLeft" -> sender?.let { GroupEvent(GroupEvent.Kind.LEFT, it.displayName) }

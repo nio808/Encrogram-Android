@@ -55,6 +55,7 @@
     <string name="secgroup_invited_bar_channel">You’re invited to this channel</string>
     <string name="secgroup_join">Join</string>
     <string name="secgroup_decline">Decline</string>
+    <string name="secgroup_connecting_bar">Still connecting. You can write once the group is ready.</string>
     <string name="secgroup_cant_post_channel">Only admins can post in this channel.</string>
     <string name="secgroup_cant_post_group">You can’t send messages in this group.</string>
     <string name="secgroup_join_failed">Could not join: %1$s</string>
@@ -63,15 +64,15 @@
     <string name="secgroup_delete_title">Delete group</string>
     <string name="secgroup_delete_title_channel">Delete channel</string>
     <string name="secgroup_delete_everyone">Delete for everyone</string>
-    <string name="secgroup_delete_owner_text">As the owner you can delete this group for all members. Or remove it from this phone only; the group continues without you.</string>
-    <string name="secgroup_delete_owner_text_channel">As the owner you can delete this channel for all subscribers. Or remove it from this phone only; the channel continues without you.</string>
+    <string name="secgroup_delete_owner_text">As the owner you can delete this group for all members. Or delete it on this phone only: you leave first, so members see that you left, and the group continues without you.</string>
+    <string name="secgroup_delete_owner_text_channel">As the owner you can delete this channel for all subscribers. Or delete it on this phone only: you leave first, so subscribers see that you left, and the channel continues without you.</string>
     <string name="secgroup_delete_phone_only">Delete on this phone only</string>
     <string name="secgroup_leave_title">Leave group</string>
     <string name="secgroup_leave_title_channel">Leave channel</string>
     <string name="secgroup_leave_text">You leave the group and its messages are removed from this phone. Members see that you left.</string>
     <string name="secgroup_leave_text_channel">You leave the channel and its posts are removed from this phone. Others see that you left.</string>
     <string name="secgroup_leave_confirm">Leave and delete</string>
-    <string name="secgroup_delete_mixed_note">Groups in your selection are left, or removed from this phone only if you own them.</string>
+    <string name="secgroup_delete_mixed_note">Groups in your selection are left (members see that you left), including groups you own.</string>
 
     <!-- Chat list -->
     <string name="secgroup_row_invited">Invitation to join</string>
@@ -80,7 +81,7 @@
     <!-- Group facts for the info screen (G4). Keep these true to what the core does. -->
     <string name="secgroup_fact_sent_each">Each message is sent from your phone to every member.</string>
     <string name="secgroup_fact_ticks">✓✓ means every member received it (groups of 20 or fewer).</string>
-    <string name="secgroup_fact_admins_add">Only admins add people, from their own Secured contacts.</string>
+    <string name="secgroup_fact_admins_add">Admins add their own Secured contacts, or share the group’s invite link: anyone with the link can join.</string>
     <string name="secgroup_fact_history">New members see up to 100 earlier messages.</string>
     <string name="secgroup_fact_names_visible">Members see each other’s names.</string>
     <string name="secgroup_fact_channel_size">Good for up to about 50 subscribers. Posts are sent from your phone to each subscriber. Subscribers can see who else is in the channel and can react. No view counts.</string>

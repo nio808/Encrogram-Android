@@ -96,27 +96,23 @@ final class SecuredBackupSettingsActivity extends SecuredBackupScreen {
             return;
         }
         final TextView title = heading(c, c.getString(R.string.sec_bs_on));
-        final String status = s.getRunning() ? c.getString(R.string.sec_bs_running)
-                : s.getLastBackupMs() != null ? c.getString(R.string.sec_bs_last, when(c, s.getLastBackupMs()))
-                : c.getString(R.string.sec_bs_none_yet);
-        final TextView last = bodyText(c, status);
+        final TextView last = bodyText(c, c.getString(s.getOtherPhone() ? R.string.sec_bs_other_phone : R.string.sec_bs_on_text));
         final TextView error = errorView(c);
         final String shown = actionError != null ? actionError
-                : s.getLastError() != null ? c.getString(R.string.sec_bs_error, s.getLastError()) : null;
+                : s.getLastError() != null && !s.getOtherPhone() ? c.getString(R.string.sec_bs_error) : null;
         setError(error, shown);
         final boolean running = s.getRunning() || busy;
-        final int nowLabel = running ? R.string.sec_bs_now_busy : s.getOtherPhone() ? R.string.sec_bs_now_take_over : R.string.sec_bs_now;
-        final TextView now = Kit.button(c, c.getString(nowLabel), true);
+        final TextView now = Kit.button(c, c.getString(running ? R.string.sec_bs_now_busy : R.string.sec_bs_now_take_over), true);
         now.setEnabled(!running);
         now.setAlpha(running ? 0.6f : 1f);
         now.setOnClickListener(v -> backupNow(c));
+        now.setVisibility(s.getOtherPhone() ? View.VISIBLE : View.GONE);   // only after a restore elsewhere
         final TextView show = Kit.button(c, c.getString(R.string.sec_bs_show), false);
         show.setOnClickListener(v -> askScreenLock(c));
         final TextView off = Kit.button(c, c.getString(R.string.sec_bs_off_action), false);
         off.setTextColor(Kit.color(Theme.key_text_RedBold));
         off.setOnClickListener(v -> confirmTurnOff(c));
-        final TextView note = para(c, c.getString(R.string.sec_bs_note));
-        showStep(title, lp(last, 12), lp(error, 8), lp(now, 20), lp(show, 12), lp(off, 12), lp(note, 24));
+        showStep(title, lp(last, 12), lp(error, 8), lp(now, s.getOtherPhone() ? 20 : 0), lp(show, 12), lp(off, 12));
     }
 
     private static View lp(View v, int topDp) {
@@ -136,7 +132,7 @@ final class SecuredBackupSettingsActivity extends SecuredBackupScreen {
                 busy = false;
                 if (destroyed) return;
                 if (result instanceof SecuredResult.Err) {
-                    actionError = errorText(c, ((SecuredResult.Err) result).getError());
+                    actionError = c.getString(R.string.sec_bs_action_failed);
                 } else {
                     Toast.makeText(c, R.string.sec_bs_now_done, Toast.LENGTH_SHORT).show();
                 }
@@ -232,6 +228,7 @@ final class SecuredBackupSettingsActivity extends SecuredBackupScreen {
                 busy = false;
                 if (destroyed) return;
                 if (result instanceof SecuredResult.Err) {
+                    // The engine's text here can carry a security fact (an old phrase that still works), so show it.
                     actionError = errorText(c, ((SecuredResult.Err) result).getError());
                 } else {
                     SecuredBackupUi.showBannerAgain(c);

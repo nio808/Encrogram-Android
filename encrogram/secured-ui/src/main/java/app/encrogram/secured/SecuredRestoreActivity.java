@@ -250,7 +250,7 @@ final class SecuredRestoreActivity extends SecuredBackupScreen {
 
     private void showFound(Context c, BackupInfo info) {
         final TextView title = heading(c, c.getString(R.string.sec_rs_found_title));
-        final TextView text = bodyText(c, c.getString(R.string.sec_rs_found_text, when(c, info.getCreatedAtMs())));
+        final TextView text = bodyText(c, c.getString(R.string.sec_rs_found_text));
         final View warning = point(c, c.getString(R.string.sec_rs_found_warning));
         final TextView error = errorView(c);
         final TextView restore = Kit.button(c, c.getString(R.string.sec_rs_restore), true);
@@ -307,13 +307,13 @@ final class SecuredRestoreActivity extends SecuredBackupScreen {
         words = null;   // a finished restore: Back must not return to the words
         input = null;
         final TextView title = heading(c, c.getString(R.string.sec_rs_done_title));
-        final TextView back = bodyText(c, c.getString(R.string.sec_rs_done_back, when(c, info.getCreatedAtMs())));
-        final View resync = point(c, c.getString(R.string.sec_rs_done_resync));
-        final View verify = point(c, c.getString(R.string.sec_rs_done_verify));
-        final View oldPhone = point(c, c.getString(R.string.sec_rs_done_old_phone));
+        final TextView back = bodyText(c, c.getString(R.string.sec_rs_done_back));
+        final TextView resync = bodyText(c, c.getString(R.string.sec_rs_done_resync));
+        final TextView recent = para(c, c.getString(R.string.sec_rs_done_recent));
+        final TextView verify = para(c, c.getString(R.string.sec_rs_done_verify));
         final TextView next = Kit.button(c, c.getString(R.string.sec_rs_continue), true);
         next.setOnClickListener(v -> leave());
-        showStep(title, lp(back, 12), lp(resync, 20), lp(verify, 12), lp(oldPhone, 12), lp(next, 24));
+        showStep(title, lp(back, 12), lp(resync, 8), lp(recent, 16), lp(verify, 8), lp(next, 24));
     }
 
     private void leave() {

@@ -34,8 +34,9 @@ class GroupsTest {
         status: String = "connected",
         contactId: Long? = null,
         alias: String = "",
+        category: String = "invitee",
     ) = """
-        {"groupMemberId":$id,"groupId":3,"memberId":"bWVtYmVy","memberRole":"$role","memberCategory":"invitee",
+        {"groupMemberId":$id,"groupId":3,"memberId":"bWVtYmVy","memberRole":"$role","memberCategory":"$category",
          "memberStatus":"$status","memberSettings":{"showMessages":true},"blockedByAdmin":false,
          "invitedBy":{"type":"user"},"localDisplayName":"${name.lowercase()}",
          "memberProfile":{"profileId":${id + 20},"displayName":"$name","fullName":"","localAlias":"$alias"},
@@ -272,6 +273,43 @@ class GroupsTest {
             assertFalse(m.canDeleteForEveryone)
             assertNull(m.replyTo)
         }
+    }
+
+    @Test
+    fun theJoinerSeesTheirOwnJoinNotTheHosts() {
+        // G7: joining, our connection to the member who let us in comes up as their memberConnected item
+        // (Subscriber.hs:885-912, with userJoinedGroup). For us that is "You joined", not "<host> joined".
+        val joined = rcvEvent("""{"type":"memberConnected"}""")
+        val host = parse(gItem(120, "groupRcv", joined, from = member(2, "Alpha", role = "owner", category = "host")))
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED), host.event)
+        assertNull("worded as our own join, never naming the host", host.event!!.memberName)
+        assertTrue(host.shown)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED), MessageMapper.toMessage(host, MemberRole.MEMBER).event)
+        // Members who were there before us, connecting after our join, didn't just join: no row.
+        val earlier = parse(gItem(121, "groupRcv", joined, from = member(6, "Carol", category = "pre")))
+        assertNull(earlier.event)
+        assertFalse(earlier.shown)
+        // Someone joining after us (post) or someone we invited (invitee): "X joined" as before.
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Dan"), parse(gItem(122, "groupRcv", joined, from = member(7, "Dan", category = "post"))).event)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Eve"), parse(gItem(123, "groupRcv", joined, from = member(8, "Eve", category = "invitee"))).event)
+        // The host's other rows still name them.
+        assertEquals(GroupEvent(GroupEvent.Kind.LEFT, "Alpha"),
+            parse(gItem(124, "groupRcv", rcvEvent("""{"type":"memberLeft"}"""), from = member(2, "Alpha", category = "host"))).event)
+    }
+
+    @Test
+    fun restoredGroupsExpandFromTheMemberList() {
+        // G7: the member list read once RUNNING becomes the group's repair keys: other members whose connection works.
+        val b = JSONObject("""{"group":{"groupInfo":${groupInfo(myRole = "member", myStatus = "connected")},"members":[
+            $bob,
+            ${member(6, "Carol", status = "complete", category = "pre")},
+            ${member(7, "Dan", status = "announced")},
+            ${member(8, "Eve", status = "left")},
+            ${member(9, "Fay", status = "invited")}
+        ]}}""")
+        val keys = app.encrogram.core.backup.RestoreRepair.memberKeys(3, CoreJson.parseMembers(b))
+        assertEquals(listOf(5L, 6L), keys.map { it.memberId })
+        assertTrue(keys.all { it.isMember && it.groupId == 3L })
     }
 
     @Test

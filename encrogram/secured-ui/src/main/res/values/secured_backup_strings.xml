@@ -1,98 +1,94 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Strings of the 12-word backup screens (docs/recovery-phrase-plan.md). Plain, honest wording; no claims the engine can't keep. -->
+<!-- Strings of the recovery-phrase screens (docs/recovery-phrase-plan.md). Wallet-style wording: the user sees a recovery phrase, not a backup service. Plain, honest; no claims the engine can't keep. String names keep their old sec_bk_/sec_rs_/sec_bs_ prefixes. -->
 <resources>
     <!-- entry points -->
-    <string name="sec_bk_menu">Backup</string>
+    <string name="sec_bk_menu">Recovery phrase</string>
     <string name="sec_bk_menu_more">More options</string>
-    <string name="sec_bk_banner_title">Back up Secured</string>
-    <string name="sec_bk_banner_text">Without a backup, losing this phone means losing your Secured chats.</string>
+    <string name="sec_bk_banner_title">Save your recovery phrase</string>
+    <string name="sec_bk_banner_text">It\'s the only way to get your Secured account back on a new phone.</string>
     <string name="sec_bk_banner_dismiss">Dismiss</string>
-    <string name="sec_bk_restore_link">Restore with 12 words</string>
+    <string name="sec_bk_restore_link">Restore with recovery phrase</string>
 
     <!-- set up -->
-    <string name="sec_bk_title">Back up Secured</string>
-    <string name="sec_bk_intro">A backup lets you bring your Secured profile, contacts and text messages back on a new phone, using 12 words.</string>
-    <string name="sec_bk_point_lose">If you lose the 12 words, the backup is gone for good. Nobody, including us, can recover it.</string>
-    <string name="sec_bk_point_anyone">Anyone who has the 12 words can restore your Secured profile. Treat them like a house key.</string>
-    <string name="sec_bk_point_only">Use these words only in Encrogram. Never type them into a website or send them to anyone.</string>
-    <string name="sec_bk_point_what">The backup is encrypted on this phone before it is uploaded to our server. It holds your profile, contacts and text messages, not photos or files. Messages after the last backup are not in it.</string>
-    <string name="sec_bk_show_words">Show my 12 words</string>
+    <string name="sec_bk_title">Save your recovery phrase</string>
+    <string name="sec_bk_intro">Your recovery phrase is 12 words that protect your Secured account. It\'s the only way to get the account back on a new phone.</string>
+    <string name="sec_bk_point_lose">If you lose your recovery phrase, nobody, including us, can recover your account.</string>
+    <string name="sec_bk_point_anyone">Anyone who has your recovery phrase can open your Secured account. Never share it.</string>
+    <string name="sec_bk_point_only">Never type it into a website or send it to anyone. Use it only in Encrogram.</string>
+    <string name="sec_bk_show_words">Show recovery phrase</string>
     <string name="sec_bk_not_now">Not now</string>
     <string name="sec_bk_preparing">Preparing…</string>
 
-    <string name="sec_bk_words_title">Your 12 words</string>
-    <string name="sec_bk_words_text">Write them down on paper, in this order. This screen blocks screenshots on purpose; don\'t photograph it or save the words in a notes app.</string>
-    <string name="sec_bk_wrote_down">I wrote them down</string>
+    <string name="sec_bk_words_title">Your recovery phrase</string>
+    <string name="sec_bk_words_text">Write the 12 words down on paper, in this order. This screen blocks screenshots on purpose; don\'t photograph it or save the words in a notes app.</string>
+    <string name="sec_bk_wrote_down">I wrote it down</string>
     <string name="sec_bk_done">Done</string>
 
-    <string name="sec_bk_confirm_title">Check your words</string>
-    <string name="sec_bk_confirm_text">Type the words you wrote down for these three positions.</string>
+    <string name="sec_bk_confirm_title">Check your recovery phrase</string>
+    <string name="sec_bk_confirm_text">Type words %1$d, %2$d and %3$d.</string>
     <string name="sec_bk_confirm_hint">Word %1$d</string>
-    <string name="sec_bk_confirm_button">Confirm and back up</string>
-    <string name="sec_bk_confirm_busy">Backing up…</string>
+    <string name="sec_bk_confirm_button">Confirm</string>
+    <string name="sec_bk_confirm_busy">Checking…</string>
     <string name="sec_bk_confirm_mismatch">These don\'t match the words on the previous screen. Check what you wrote down, or go back to see the words again.</string>
     <string name="sec_bk_confirm_back">Show the words again</string>
 
-    <string name="sec_bk_done_title">Backed up</string>
-    <string name="sec_bk_done_when">Backup made on %1$s.</string>
-    <string name="sec_bk_done_text">Encrogram refreshes the backup after a new contact connects, and about once a day when something changed. You can check it, back up again or turn it off under Backup in the Secured menu.</string>
+    <string name="sec_bk_done_title">Recovery phrase saved</string>
+    <string name="sec_bk_done_text">It keeps your Secured account safe. You can show it again under Recovery phrase in the Secured menu.</string>
 
     <!-- restore -->
-    <string name="sec_rs_title">Restore with 12 words</string>
-    <string name="sec_rs_text">Type the 12 words of your backup, in order, separated by spaces. This restores your Secured profile, contacts and text messages as of the last backup.</string>
+    <string name="sec_rs_title">Restore with recovery phrase</string>
+    <string name="sec_rs_text">Type the 12 words of your recovery phrase, in order, separated by spaces.</string>
     <string name="sec_rs_hint">12 words</string>
     <string name="sec_rs_count">%1$d of 12 words</string>
     <string name="sec_rs_bad_word">\"%1$s\" is not in the word list. Check the spelling.</string>
-    <string name="sec_rs_find">Find my backup</string>
+    <string name="sec_rs_find">Continue</string>
     <string name="sec_rs_finding">Looking…</string>
-    <string name="sec_rs_found_title">Backup found</string>
-    <string name="sec_rs_found_text">Backup from %1$s. Restore it?</string>
-    <string name="sec_rs_found_warning">Restoring doesn\'t switch off your old phone. If it was lost or stolen, start a new Secured profile instead of restoring.</string>
+    <string name="sec_rs_found_title">We found your Secured account</string>
+    <string name="sec_rs_found_text">Restore it on this phone?</string>
+    <string name="sec_rs_found_warning">This doesn\'t sign out your old phone. If it was lost or stolen, start a new account instead.</string>
     <string name="sec_rs_restore">Restore</string>
     <string name="sec_rs_restoring">Restoring…</string>
     <string name="sec_rs_change_words">Change the words</string>
     <string name="sec_rs_starting">Secured is still starting. Try again in a moment.</string>
-    <string name="sec_rs_has_profile">This phone already has a Secured profile. A backup can only be restored on a phone with no Secured profile.</string>
+    <string name="sec_rs_has_profile">This phone already has a Secured account. A recovery phrase can only be used on a phone with no Secured account.</string>
     <string name="sec_rs_engine_failed">Secured can\'t start right now, so nothing can be restored.</string>
-    <string name="sec_rs_done_title">Profile restored</string>
-    <string name="sec_rs_done_back">Your profile, contacts and text messages are back as of %1$s. Anything sent after that is not in the backup.</string>
-    <string name="sec_rs_done_resync">Each chat now has to re-sync its encryption with your contact, which happens when they are online. Until then, messages in that chat can be delayed or lost.</string>
-    <string name="sec_rs_done_verify">Your contacts show as not verified again once they re-sync. Compare security codes again.</string>
-    <string name="sec_rs_done_old_phone">Restoring does not switch off the old phone. Both phones hold the same keys until each chat has moved to new addresses; until then messages go to whichever phone connected last. If the old phone was lost or stolen, start a new Secured profile instead.</string>
+    <string name="sec_rs_done_title">Welcome back</string>
+    <string name="sec_rs_done_back">Your Secured account is back on this phone.</string>
+    <string name="sec_rs_done_resync">Your chats reconnect as your contacts come online.</string>
+    <string name="sec_rs_done_recent">Very recent messages may not come back.</string>
+    <string name="sec_rs_done_verify">For now your contacts show as not verified. You can compare security codes with them again whenever you like.</string>
     <string name="sec_rs_continue">Continue</string>
 
     <!-- settings -->
-    <string name="sec_bs_title">Backup</string>
-    <string name="sec_bs_on">Backup is on</string>
-    <string name="sec_bs_off">Backup is off</string>
-    <string name="sec_bs_off_text">Without a backup, losing this phone means losing your Secured profile, contacts and messages.</string>
-    <string name="sec_bs_off_button">Back up with 12 words</string>
-    <string name="sec_bs_last">Last backup: %1$s</string>
-    <string name="sec_bs_none_yet">No backup has been uploaded yet.</string>
-    <string name="sec_bs_running">Backing up now…</string>
-    <string name="sec_bs_error">The last automatic backup failed: %1$s</string>
-    <string name="sec_bs_now">Back up now</string>
-    <string name="sec_bs_now_take_over">Back up from this phone</string>
-    <string name="sec_bs_now_busy">Backing up…</string>
-    <string name="sec_bs_now_done">Backup done</string>
-    <string name="sec_bs_show">Show 12 words</string>
-    <string name="sec_bs_off_action">Turn off and delete backup</string>
-    <string name="sec_bs_note">Encrogram refreshes the backup after a new contact connects, and about once a day when something changed. Messages after the last backup are not in it. Photos and files are not included yet.</string>
+    <string name="sec_bs_title">Recovery phrase</string>
+    <string name="sec_bs_on">Your recovery phrase is saved</string>
+    <string name="sec_bs_on_text">It protects your Secured account and brings it back on any phone.</string>
+    <string name="sec_bs_off">No recovery phrase</string>
+    <string name="sec_bs_off_text">Without a recovery phrase, losing this phone means losing your Secured account.</string>
+    <string name="sec_bs_off_button">Save your recovery phrase</string>
+    <string name="sec_bs_other_phone">Your account was restored on another phone.</string>
+    <string name="sec_bs_error">Your recovery phrase couldn\'t be kept up to date. Open Secured with a connection and check again later.</string>
+    <string name="sec_bs_action_failed">Something went wrong. Try again.</string>
+    <string name="sec_bs_now_take_over">Use this phone</string>
+    <string name="sec_bs_now_busy">Please wait…</string>
+    <string name="sec_bs_now_done">This phone is now your active phone</string>
+    <string name="sec_bs_show">Show recovery phrase</string>
+    <string name="sec_bs_off_action">Remove from this phone</string>
     <string name="sec_bs_unlock_title">Confirm it\'s you</string>
-    <string name="sec_bs_unlock_text">Use your screen lock to show the 12 words.</string>
+    <string name="sec_bs_unlock_text">Use your screen lock to show your recovery phrase.</string>
     <string name="sec_bs_need_lock_title">Screen lock needed</string>
-    <string name="sec_bs_need_lock_text">To show the 12 words, this phone needs a screen lock (PIN, pattern, password or fingerprint). Set one in Android settings, then try again.</string>
+    <string name="sec_bs_need_lock_text">To show your recovery phrase, this phone needs a screen lock (PIN, pattern, password or fingerprint). Set one in Android settings, then try again.</string>
     <string name="sec_bs_unlock_again">The unlock expired or wasn\'t accepted. Try again.</string>
     <string name="sec_bs_ok">OK</string>
-    <string name="sec_bs_confirm_off_title">Turn off backup?</string>
-    <string name="sec_bs_confirm_off_text">This deletes the backup from our server and the 12 words from this phone. Your chats on this phone stay as they are. If you turn backup on again later, you get new words.</string>
-    <string name="sec_bs_confirm_off_button">Turn off and delete</string>
+    <string name="sec_bs_confirm_off_title">Remove recovery phrase?</string>
+    <string name="sec_bs_confirm_off_text">Your recovery phrase stops working for this account. Your chats on this phone stay as they are. If you save a recovery phrase again later, you get new words.</string>
+    <string name="sec_bs_confirm_off_button">Remove</string>
     <string name="sec_bs_cancel">Cancel</string>
 
     <!-- errors -->
     <string name="sec_bk_err_wrong_phrase">These 12 words aren\'t valid. Check each word and the order; the last word works as a check, so one wrong word is usually caught.</string>
-    <string name="sec_bk_err_no_backup">No backup was found for these words. Check them, or the backup may never have been made or may have been deleted.</string>
+    <string name="sec_bk_err_no_backup">No Secured account was found for these words. Check them, or the recovery phrase may have been removed.</string>
     <string name="sec_bk_err_needs_unlock">Unlock your phone with its screen lock first. If this phone has no screen lock, set one in Android settings.</string>
-    <string name="sec_bk_err_network">Couldn\'t reach the backup server. Check your connection and try again.</string>
+    <string name="sec_bk_err_network">Couldn\'t connect. Check your connection and try again.</string>
     <string name="sec_bk_err_unknown">Something went wrong. Try again.</string>
 </resources>

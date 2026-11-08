@@ -16,7 +16,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
-import app.encrogram.core.api.BackupState;
 import app.encrogram.core.api.SecuredError;
 import app.encrogram.core.api.SecuredResult;
 
@@ -106,13 +105,12 @@ final class SecuredBackupActivity extends SecuredBackupScreen {
         final View p1 = point(c, c.getString(R.string.sec_bk_point_lose));
         final View p2 = point(c, c.getString(R.string.sec_bk_point_anyone));
         final View p3 = point(c, c.getString(R.string.sec_bk_point_only));
-        final View p4 = point(c, c.getString(R.string.sec_bk_point_what));
         introError = errorView(c);
         introButton = Kit.button(c, c.getString(R.string.sec_bk_show_words), true);
         introButton.setOnClickListener(v -> loadNewPhrase(c));
         final TextView later = Kit.button(c, c.getString(R.string.sec_bk_not_now), false);
         later.setOnClickListener(v -> finishFragment());
-        showStep(title, wrap(intro, 12), wrap(p1, 20), wrap(p2, 12), wrap(p3, 12), wrap(p4, 12), introError,
+        showStep(title, wrap(intro, 12), wrap(p1, 20), wrap(p2, 12), wrap(p3, 12), introError,
                 wrap(introButton, 24), wrap(later, 10));
     }
 
@@ -176,7 +174,7 @@ final class SecuredBackupActivity extends SecuredBackupScreen {
 
     private void renderConfirm(Context c) {
         final TextView title = heading(c, c.getString(R.string.sec_bk_confirm_title));
-        final TextView text = para(c, c.getString(R.string.sec_bk_confirm_text));
+        final TextView text = para(c, c.getString(R.string.sec_bk_confirm_text, positions[0] + 1, positions[1] + 1, positions[2] + 1));
         final EditText[] inputs = new EditText[3];
         final View[] views = new View[3];
         for (int i = 0; i < 3; i++) {
@@ -239,24 +237,15 @@ final class SecuredBackupActivity extends SecuredBackupScreen {
 
     private void renderDone(Context c) {
         words = null;   // not needed any more
-        long at = System.currentTimeMillis();
-        try {
-            final BackupState s = engine != null ? engine.backupState() : null;
-            if (s != null && s.getLastBackupMs() != null) at = s.getLastBackupMs();
-        } catch (Throwable ignored) {
-        }
         final android.widget.LinearLayout center = new android.widget.LinearLayout(c);
         center.setOrientation(android.widget.LinearLayout.VERTICAL);
         center.setGravity(Gravity.CENTER_HORIZONTAL);
         center.addView(new Kit.LockBadge(c), LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
         final TextView title = heading(c, c.getString(R.string.sec_bk_done_title));
         center.addView(title, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 0, 16, 0, 0));
-        final TextView date = bodyText(c, c.getString(R.string.sec_bk_done_when, when(c, at)));
-        date.setGravity(Gravity.CENTER);
-        center.addView(date, wide(8));
         final TextView text = para(c, c.getString(R.string.sec_bk_done_text));
         text.setGravity(Gravity.CENTER);
-        center.addView(text, wide(12));
+        center.addView(text, wide(8));
         final TextView done = Kit.button(c, c.getString(R.string.sec_bk_done), true);
         done.setOnClickListener(v -> finishFragment());
         center.addView(done, wide(28));

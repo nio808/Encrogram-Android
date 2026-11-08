@@ -55,6 +55,7 @@ final class SecuredGroupLinkSheet {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
+        Kit.secure(sheet);
         fragment.showDialog(sheet);
 
         try {

@@ -65,6 +65,7 @@ final class SecuredSheets {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
+        Kit.secure(sheet);
         fragment.showDialog(sheet);
 
         try {
@@ -188,6 +189,7 @@ final class SecuredSheets {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, true, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
+        Kit.secure(sheet);
 
         connect.setOnClickListener(v -> {
             final String link = input.getText().toString().trim();

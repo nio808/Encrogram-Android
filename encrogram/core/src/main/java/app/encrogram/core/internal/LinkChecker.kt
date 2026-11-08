@@ -94,6 +94,28 @@ internal object LinkChecker {
         return Analysis(LinkCheck.Approved, normalized)
     }
 
+    /**
+     * A short group link (`https://<host>/g#..`, `simplex:/g#..`), by its shape only. [ConnectPlan] then accepts
+     * nothing but a group plan for it.
+     */
+    fun isShortGroupLink(link: String?): Boolean {
+        val s = link?.trim() ?: return false
+        val lower = s.lowercase(Locale.ROOT)
+        val tail = when {
+            lower.startsWith("https://") -> {
+                val rest = s.substring("https://".length)
+                val authorityEnd = rest.indexOfFirst { it == '/' || it == '?' || it == '#' }
+                if (authorityEnd <= 0) return false
+                rest.substring(authorityEnd)
+            }
+            lower.startsWith("simplex:") -> s.substring("simplex:".length)
+            else -> return false
+        }
+        val hash = tail.indexOf('#')
+        if (!tail.startsWith("/") || hash < 0) return false
+        return kindOf(tail.substring(1, hash).removeSuffix("/")) == Kind.SHORT_GROUP
+    }
+
     /** Fingerprints compare as unpadded base64url. */
     private fun fpKey(fp: String): String = fp.trimEnd('=').replace('+', '-').replace('/', '_')
 

@@ -1,5 +1,8 @@
 package app.encrogram.core.backup
 
+import app.encrogram.core.internal.CoreGroup
+import app.encrogram.core.internal.CoreMember
+
 /**
  * What to do for one connection after a restore (docs/recovery-phrase-plan.md limits 3 and 4; research/v2-plan-review.md
  * §5.3): a contact, or a group member's connection ([RepairKey]); groups get exactly the same treatment, with the
@@ -115,6 +118,31 @@ internal object RestoreRepair {
         else -> null
     }
 
+    /**
+     * The groups to repair, as one placeholder each ([RepairKey.group]), written with the repair list at commit time.
+     * Their members can't be listed then: the restored chat isn't started yet and the core refuses `/_members`
+     * (`chatNotStarted`, 8 Nov device test). Groups we were only invited to, or have left or been removed from, have
+     * no member connections of ours to repair.
+     */
+    fun groupPlaceholders(groups: List<CoreGroup>): List<RepairKey> =
+        groups.filter { !it.invited && !it.gone }.map { RepairKey.group(it.groupId) }
+
+    /** One group's member connections to repair, from `/_members`: every other member whose connection works. */
+    fun memberKeys(groupId: Long, members: List<CoreMember>): List<RepairKey> =
+        members.filter { !it.isMe && it.active }.map { RepairKey.member(groupId, it.groupMemberId) }
+
+    /**
+     * [map] with [placeholder] replaced by its group's [members] (fresh entries; a member already listed keeps its
+     * state), order kept. The caller writes the result in one atomic save, so the placeholder goes only together with
+     * its member keys.
+     */
+    fun expand(map: Map<RepairKey, BackupStore.Pending>, placeholder: RepairKey, members: List<RepairKey>): LinkedHashMap<RepairKey, BackupStore.Pending> {
+        val out = LinkedHashMap<RepairKey, BackupStore.Pending>()
+        for ((k, v) in map) if (k != placeholder) out[k] = v
+        for (m in members) if (m.isMember && m.groupId == placeholder.groupId) out.putIfAbsent(m, BackupStore.Pending())
+        return out
+    }
+
     private val SYNC_STATES = setOf("allowed", "required")
 }
 
@@ -122,24 +150,44 @@ internal object RestoreRepair {
  * A connection on the restore repair list ([BackupStore.pending]): a contact, or one member of a group. Member keys are
  * apart from contact ids (the core's groupMemberId and contactId are separate counters). Stored as `<contactId>` or
  * `#<groupId>:<groupMemberId>`, so lists written by earlier builds (contact ids only) still read.
+ *
+ * A third form, `#<groupId>:*` ([group]), stands for all of one group's member connections until the engine can list
+ * them ([RestoreRepair.groupPlaceholders], [RestoreRepair.expand]). It is never a connection itself: no `/_info`,
+ * `/_sync` or `/_switch` is ever sent for it.
  */
 internal class RepairKey private constructor(val contactId: Long, val groupId: Long, val memberId: Long) {
 
-    val isMember: Boolean get() = groupId > 0
+    val isMember: Boolean get() = groupId > 0 && memberId > 0
 
-    fun encode(): String = if (isMember) "#$groupId:$memberId" else contactId.toString()
+    /** A whole group, still to be expanded into its members. */
+    val isGroupPlaceholder: Boolean get() = groupId > 0 && memberId == 0L
+
+    fun encode(): String = when {
+        isMember -> "#$groupId:$memberId"
+        isGroupPlaceholder -> "#$groupId:$GROUP_WILDCARD"
+        else -> contactId.toString()
+    }
 
     override fun equals(other: Any?): Boolean =
         other is RepairKey && other.contactId == contactId && other.groupId == groupId && other.memberId == memberId
 
     override fun hashCode(): Int = (contactId * 31 + groupId).hashCode() * 31 + memberId.hashCode()
 
-    override fun toString(): String = if (isMember) "member" else "contact"
+    override fun toString(): String = when {
+        isMember -> "member"
+        isGroupPlaceholder -> "group"
+        else -> "contact"
+    }
 
     companion object {
+        private const val GROUP_WILDCARD = "*"
+
         fun contact(contactId: Long): RepairKey = RepairKey(contactId, 0, 0)
 
         fun member(groupId: Long, groupMemberId: Long): RepairKey = RepairKey(0, groupId, groupMemberId)
+
+        /** Every member connection of group [groupId], until [RestoreRepair.expand] lists them. */
+        fun group(groupId: Long): RepairKey = RepairKey(0, groupId, 0)
 
         /** [encode]'s form back; null for anything else (a damaged line is skipped). */
         fun decode(s: String): RepairKey? {
@@ -147,7 +195,9 @@ internal class RepairKey private constructor(val contactId: Long, val groupId: L
                 val colon = s.indexOf(':')
                 if (colon < 0) return null
                 val g = s.substring(1, colon).toLongOrNull()?.takeIf { it > 0 } ?: return null
-                val m = s.substring(colon + 1).toLongOrNull()?.takeIf { it > 0 } ?: return null
+                val rest = s.substring(colon + 1)
+                if (rest == GROUP_WILDCARD) return group(g)
+                val m = rest.toLongOrNull()?.takeIf { it > 0 } ?: return null
                 return member(g, m)
             }
             return s.toLongOrNull()?.takeIf { it > 0 }?.let { contact(it) }
