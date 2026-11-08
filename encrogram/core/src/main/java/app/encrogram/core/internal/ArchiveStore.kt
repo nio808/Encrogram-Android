@@ -41,10 +41,13 @@ internal class ArchiveStore(private val file: File) {
     }
 
     /** Drops ids of chats the engine no longer has (ids can be reused by new contacts). */
-    fun retainOnly(known: Set<Long>): Boolean {
+    fun retainOnly(known: Set<Long>): Boolean = retainIf { it in known }
+
+    /** Keeps only the ids [keep] accepts. The same store also holds the engine's link-join keys (one file each). */
+    fun retainIf(keep: (Long) -> Boolean): Boolean {
         val current = loaded()
-        if (known.containsAll(current)) return true
-        return save(current.filterTo(LinkedHashSet()) { it in known })
+        if (current.all(keep)) return true
+        return save(current.filterTo(LinkedHashSet(), keep))
     }
 
     private fun save(next: LinkedHashSet<Long>): Boolean {

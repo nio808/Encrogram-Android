@@ -11,6 +11,7 @@ import app.encrogram.core.api.SecuredError
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -249,7 +250,6 @@ class GroupsTest {
             Case("groupRcv", rcvEvent("""{"type":"userDeleted"}"""), carol, GroupEvent(GroupEvent.Kind.YOU_REMOVED)),
             Case("groupRcv", rcvEvent("""{"type":"groupDeleted"}"""), carol, GroupEvent(GroupEvent.Kind.GROUP_DELETED)),
             Case("groupRcv", rcvEvent("""{"type":"groupUpdated","groupProfile":{"displayName":"New","fullName":""}}"""), carol, GroupEvent(GroupEvent.Kind.GROUP_UPDATED)),
-            Case("groupRcv", rcvEvent("""{"type":"invitedViaGroupLink"}"""), carol, GroupEvent(GroupEvent.Kind.INVITED, "Carol")),
             Case("groupSnd", sndEvent("""{"type":"memberRole","groupMemberId":9,${profile("Dan")},"role":"moderator"}"""), null,
                 GroupEvent(GroupEvent.Kind.ROLE_CHANGED, "Dan", MemberRole.MODERATOR)),
             Case("groupSnd", sndEvent("""{"type":"userRole","role":"admin"}"""), null, GroupEvent(GroupEvent.Kind.ROLE_CHANGED, null, MemberRole.ADMIN)),
@@ -688,5 +688,188 @@ class GroupsTest {
         assertEquals(ErrorMapper.INVITATION_GONE, err("groupInvitationNotFound", "errorStore").message)
         assertEquals("No one could be added. Try again.", ErrorMapper.addFailed(2, 2).message)
         assertEquals("1 of 3 people couldn't be added. Try again for them.", ErrorMapper.addFailed(1, 3).message)
+    }
+
+    // ---- link joins: one row, "X joined the group via invite link" ----
+
+    /** [gItem] at an explicit item time (the core orders a chat by item time, then id). */
+    private fun gItemAt(ts: String, id: Long, dir: String, content: String, from: String? = null) =
+        gItem(id, dir, content, from = from).replace(Regex("\"itemTs\":\"[^\"]+\""), "\"itemTs\":\"$ts\"")
+
+    /** GroupInfo of a group we joined through its link (Types.hs:477-503: viaGroupLinkUri, preparedGroup). */
+    private fun joinedByLinkInfo(prepared: Boolean = false): String {
+        val g = JSONObject(groupInfo(myRole = "member", myStatus = "connected"))
+        if (prepared) {
+            g.put("preparedGroup", JSONObject("""{"connLinkToConnect":{"connFullLink":"simplex:/contact#/?v=2-7&smp=x",
+                "connShortLink":"https://encrogram.nytmanager.com/g#x"},"connLinkPreparedConnection":true,"connLinkStartedConnection":true}"""))
+        } else {
+            g.put("viaGroupLinkUri", "simplex:/contact#/?v=2-7&smp=x")
+        }
+        return g.toString()
+    }
+
+    private fun apiChat(info: String, items: List<String>) =
+        JSONObject("""{"chat":{"chatInfo":${groupChatInfo(info)},"chatItems":[${items.joinToString(",")}],"chatStats":{"unreadCount":0}}}""")
+
+    @Test
+    fun theLinkOwnerSeesOneRowForALinkJoin() {
+        // Bravo as the link owner's core writes him: invitee, no contact (createJoiningMember, Store/Groups.hs:2068-2128).
+        val bravoAccepted = member(7, "Bravo", status = "accepted")
+        val bravo = member(7, "Bravo")
+        // Accepting the request (Subscriber.hs:1626-1629): never shown, only marks the member.
+        val accepted = parse(gItemAt("2026-11-08T10:00:01Z", 130, "groupRcv", rcvEvent("""{"type":"invitedViaGroupLink"}"""), from = bravoAccepted))
+        assertNull(accepted.event)
+        assertFalse(accepted.shown)
+        assertEquals(7L, accepted.linkJoinOf)
+        // His connection coming up (:950): on its own, a plain join row; the member record never decides it.
+        val joined = parse(gItemAt("2026-11-08T10:00:04Z", 131, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = bravo))
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), joined.event)
+        assertTrue(joined.shown)
+        assertNull(joined.linkJoinOf)
+        // Live, the engine has seen his invitedViaGroupLink row seconds earlier (remembered per group and member):
+        val seen = setOf(chat3 to 7L)
+        val live = CoreJson.markLinkJoins(CoreJson.parseChatItems(JSONObject("""{"chatItems":[{"chatInfo":${groupChatInfo(groupInfo())},"chatItem":${
+            gItem(131, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = bravo)}}]}"""))) { c, m -> (c to m) in seen }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo")), live.map { it.event })
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo"), MessageMapper.toMessage(live[0], MemberRole.OWNER).event)
+        // The same member id in another group, our own join and other rows are never marked.
+        val others = CoreJson.markLinkJoins(listOf(
+            CoreJson.parseChatItem(chat3 + 1, JSONObject(gItem(133, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = bravo)))!!,
+            parse(gItem(134, "groupRcv", rcvEvent("""{"type":"memberLeft"}"""), from = bravo)),
+            parse(gItem(135, "groupRcv", msg("hello"), from = bravo)),
+        )) { c, m -> (c to m) in seen }
+        assertEquals(listOf(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"), GroupEvent(GroupEvent.Kind.LEFT, "Bravo"), null), others.map { it.event })
+
+        // Reopened later: the page's invitedViaGroupLink row marks him, whether or not a contact is linked to him now
+        // (a contact merge links one, Subscriber.hs:3083-3086). An admin-invited member whose contact we deleted since
+        // (that clears memberContactId, Store/Direct.hs:491) has no such row and stays "joined".
+        for (bravoNow in listOf(bravo, member(7, "Bravo", contactId = 12))) {
+            val page = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(), listOf(
+                gItemAt("2026-11-08T10:00:00Z", 129, "groupRcv", msg("hi"), from = bob),
+                gItemAt("2026-11-08T10:00:01Z", 130, "groupRcv", rcvEvent("""{"type":"invitedViaGroupLink"}"""), from = bravoNow),
+                gItemAt("2026-11-08T10:00:04Z", 131, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = bravoNow),
+                gItemAt("2026-11-08T10:00:05Z", 132, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(8, "Dan")),
+            )))
+            val shown = InputRules.pageWindow(page, MessagePage(10), 10)
+            assertEquals(listOf(129L, 131L, 132L), shown.map { it.itemId })
+            assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo"), shown[1].event)
+            assertEquals("no link row for Dan", GroupEvent(GroupEvent.Kind.JOINED, "Dan"), shown[2].event)
+        }
+
+        // The stored key: group and member in one Long; nothing outside groups or for ids that don't fit.
+        val key = CoreJson.linkJoinKey(chat3, 7)!!
+        assertEquals(3L, CoreJson.linkJoinGroupId(key))
+        assertEquals(7L, key and 0xFFFFFFFFL)
+        assertNotEquals(key, CoreJson.linkJoinKey(chat3 + 1, 7))
+        assertNull(CoreJson.linkJoinKey(5, 7))
+        assertNull(CoreJson.linkJoinKey(chat3, 0))
+        assertNull(CoreJson.linkJoinKey(chat3, 1L shl 31))
+        assertNull(CoreJson.linkJoinKey(GROUP_CHAT_ID_BASE + (1L shl 31), 7))
+    }
+
+    @Test
+    fun goneWhenNoLongerAMember() {
+        fun row(status: String) =
+            MessageMapper.groupSummary(CoreJson.parseGroupChats(body(groupChat(groupInfo(myRole = "member", myStatus = status))))[0], archived = false)
+        for (s in listOf("left", "removed", "rejected", "deleted")) assertTrue(s, row(s).gone)
+        for (s in listOf("connected", "complete", "invited", "accepted", "creator")) assertFalse(s, row(s).gone)
+        // A new item keeps it.
+        assertTrue(MessageMapper.withNewItem(row("removed"), parse(gItem(70, "groupRcv", rcvEvent("""{"type":"userDeleted"}"""), from = carol))).gone)
+        // 1:1 chats never are.
+        assertFalse(MessageMapper.summaryOf(CoreJson.parseChats(body("""{"chatInfo":{"type":"direct","contact":${Samples.contact(8, "Dan", "ready")}},
+            "chatItems":[],"chatStats":{"unreadCount":0}}"""))[0], archived = false).gone)
+    }
+
+    @Test
+    fun otherMembersCantTellALinkJoinFromAnInvitation() {
+        // Members other than the link owner get XGrpMemNew from the owner (memberAdded) and later the joiner's own
+        // connection (memberConnected, category post). Nothing in either says "link" (Types.hs:1043-1050), so a link
+        // join reads like an admin's invitation: "Bravo was invited", then "Bravo joined".
+        val alpha = member(2, "Alpha", role = "owner", category = "host")
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, "Bravo"),
+            parse(gItem(140, "groupRcv", rcvEvent("""{"type":"memberAdded","groupMemberId":7,${profile("Bravo")}}"""), from = alpha)).event)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Bravo"),
+            parse(gItem(141, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(7, "Bravo", category = "post"))).event)
+    }
+
+    @Test
+    fun theJoinerSeesYouJoinedViaInviteLink() {
+        val connected = rcvEvent("""{"type":"memberConnected"}""")
+        // The host as a link joiner's core writes them: no contact behind them.
+        val host = member(2, "Alpha", role = "owner", category = "host")
+        for (prepared in listOf(false, true)) {
+            val info = joinedByLinkInfo(prepared)
+            assertTrue(CoreJson.joinedByLink(JSONObject(info)))
+            // A page of the chat.
+            val page = CoreJson.parseChatItemsOfChat(apiChat(info, listOf(gItem(150, "groupRcv", connected, from = host))))
+            assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK), page.single().event)
+            assertNull("our own join never names the host", page.single().event!!.memberName)
+            // The live event.
+            val live = CoreJson.parseAChatItem(JSONObject("""{"chatInfo":${groupChatInfo(info)},"chatItem":${gItem(150, "groupRcv", connected, from = host)}}"""))!!
+            assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK), live.event)
+            // The chat list's newest item.
+            val row = CoreJson.parseGroupChats(body(groupChat(info, listOf(gItem(150, "groupRcv", connected, from = host)))))[0]
+            assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK), MessageMapper.groupSummary(row, archived = false).lastEvent)
+        }
+        // Invited by a contact: the GroupInfo has no link, so plain "You joined", even when the host's contact is gone.
+        assertFalse(CoreJson.joinedByLink(JSONObject(groupInfo(myRole = "member", myStatus = "connected"))))
+        val invited = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(myRole = "member", myStatus = "connected"),
+            listOf(gItem(151, "groupRcv", connected, from = host))))
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED), invited.single().event)
+        assertFalse(CoreJson.joinedByLink(null))
+    }
+
+    // ---- the chat list's preview after a join ----
+
+    @Test
+    fun aJustJoinedGroupPreviewsItsNewestServiceRow() {
+        val info = joinedByLinkInfo()
+        val host = member(2, "Alpha", role = "owner", category = "host")
+        // What the joiner's core holds right after a link join (Subscriber.hs:885-912, 1835-1845): history the host
+        // sent (old item times, new ids), E2EE info, feature rows, "You joined", then a row for each member who was
+        // already there connecting to us, and the host's profile update (XGrpLinkMem).
+        val items = listOf(
+            gItemAt("2026-11-08T09:00:00Z", 210, "groupRcv", msg("earlier post"), from = host),
+            gItemAt("2026-11-08T10:00:01Z", 200, "groupRcv", """{"type":"rcvGroupE2EEInfo","e2eeInfo":{"pqEnabled":false}}""", from = host),
+            gItemAt("2026-11-08T10:00:02Z", 201, "groupRcv", """{"type":"rcvGroupFeature","groupFeature":"history","preference":{"enable":"on"}}""", from = host),
+            gItemAt("2026-11-08T10:00:03Z", 202, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = host),
+            gItemAt("2026-11-08T10:00:05Z", 211, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(6, "Carol", category = "pre")),
+            gItemAt("2026-11-08T10:00:06Z", 212, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(8, "Dan", category = "pre")),
+            gItemAt("2026-11-08T10:00:07Z", 213, "groupRcv", rcvEvent("""{"type":"memberProfileUpdated","fromProfile":{},"toProfile":{}}"""), from = host),
+        )
+        // The bug: apiChats lists only the newest item (by item time, Store/Messages.hs:895-913), a skipped one, so the
+        // row had neither text nor lastEvent ("No messages yet").
+        val listed = CoreJson.parseGroupChats(body(groupChat(info, listOf(items.last()))))[0]
+        assertFalse(listed.lastItem!!.shown)
+        assertNull(MessageMapper.groupSummary(listed, archived = false).lastEvent)
+        assertNull(MessageMapper.groupSummary(listed, archived = false).lastMessageText)
+
+        // The look-back page: the newest shown item is "You joined via invite link", newer than the history message
+        // even though that has a higher id.
+        val page = CoreJson.parseChatItemsOfChat(apiChat(info, items))
+        val newest = CoreJson.newestShown(page)!!
+        assertEquals(202L, newest.itemId)
+        val row = MessageMapper.groupSummary(listed.copy(lastItem = newest), archived = false)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK), row.lastEvent)
+        assertNull(row.lastMessageText)
+        assertNull(row.lastMessageSender)
+        assertFalse(row.lastMessageOutgoing)
+
+        // A message newer than every service row is the preview instead, with its sender.
+        val later = page + parse(gItemAt("2026-11-08T10:00:09Z", 214, "groupRcv", msg("welcome!"), from = member(6, "Carol", category = "pre")))
+        val msgRow = MessageMapper.groupSummary(listed.copy(lastItem = CoreJson.newestShown(later)), archived = false)
+        assertEquals("welcome!", msgRow.lastMessageText)
+        assertEquals("Carol", msgRow.lastMessageSender)
+        assertNull(msgRow.lastEvent)
+
+        // On the link owner's side: "Bravo joined via invite link" beats the later skipped rows.
+        val ownerPage = CoreJson.parseChatItemsOfChat(apiChat(groupInfo(), listOf(
+            gItemAt("2026-11-08T10:00:01Z", 300, "groupRcv", rcvEvent("""{"type":"invitedViaGroupLink"}"""), from = member(7, "Bravo", status = "accepted")),
+            gItemAt("2026-11-08T10:00:04Z", 301, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = member(7, "Bravo")),
+            gItemAt("2026-11-08T10:00:08Z", 302, "groupRcv", rcvEvent("""{"type":"memberProfileUpdated","fromProfile":{},"toProfile":{}}"""), from = member(7, "Bravo")),
+        )))
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED_BY_LINK, "Bravo"), CoreJson.newestShown(ownerPage)!!.event)
+        // Nothing shown at all: no preview (the row keeps "No messages yet").
+        assertNull(CoreJson.newestShown(page.filter { !it.shown }))
     }
 }

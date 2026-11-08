@@ -18,7 +18,7 @@ import org.telegram.ui.Components.LayoutHelper;
  * Start screen when no Telegram account is activated: two doors. Reads no Telegram data and makes no Telegram
  * calls; its only state is one flag in Secured's own preferences.
  */
-final class SecuredWelcomeActivity extends BaseFragment {
+final class SecuredWelcomeActivity extends BaseFragment implements SecuredScreen {
 
     @Override
     public Theme.ResourcesProvider getResourceProvider() {

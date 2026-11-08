@@ -50,6 +50,21 @@ internal object Commands {
      */
     const val NETWORK_CONFIG = "/network socks=off smp-proxy=unknown smp-proxy-fallback=no"
 
+    /**
+     * APISetNetworkInfo (Commands.hs:1851, :5549) -> `cmdOk`: the phone's network, sent on every change as the official
+     * Android app does (NetworkObserver.kt). Works before `/_start`. Example: `/_network info {"networkType":"wifi","online":true}`.
+     * `online` is [NetInfo.coreOnline]: false only when the phone has no network at all.
+     */
+    fun networkInfo(info: NetInfo): String =
+        "/_network info " + asciiJson(JSONObject().put("networkType", info.type).put("online", info.coreOnline).toString())
+
+    /**
+     * ReconnectAllServers (Commands.hs:1852, :5554) -> `cmdOk`; needs a user. Closes every relay connection (waiting
+     * for one being opened) and resubscribes at once, as after a network error (Agent.hs:679-683, Client.hs:1010-1034,
+     * :783-795). The official app's "Reconnect all servers".
+     */
+    const val RECONNECT_ALL = "/reconnect"
+
     /** APIGetServerOperators -> `serverOperatorConditions`. */
     const val GET_OPERATORS = "/_operators"
 

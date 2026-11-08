@@ -15,6 +15,8 @@ import android.graphics.drawable.Drawable;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.DialogCell;
@@ -34,6 +36,8 @@ import org.telegram.ui.Components.AvatarDrawable;
  */
 final class SecuredDialogCell extends DialogCell {
 
+    private ChatRowMapper.Row row;
+    private boolean archiveRow;
     private ChatRowMapper.Tick tick = ChatRowMapper.Tick.NONE;
     private boolean lock = true;
     private boolean saved;
@@ -58,6 +62,8 @@ final class SecuredDialogCell extends DialogCell {
 
     /** Binds a chat row. {@code lockBadge} is false for the "Archived chats" row. */
     void bind(ChatRowMapper.Row row, boolean inArchive, boolean lockBadge) {
+        this.row = row;
+        archiveRow = !lockBadge;
         tick = row.tick;
         saved = row.saved;
         lock = lockBadge && !row.saved;
@@ -66,6 +72,7 @@ final class SecuredDialogCell extends DialogCell {
         avatarName = row.name;
         setArchiveSwipe(inArchive);
         setDialog(ChatRowMapper.toCustomDialog(row));
+        setContentDescription(describe());   // node info too, not only on events (TalkBack reads both)
     }
 
     /** The swipe reveal shows Archive (or Unarchive inside the archive), never the Telegram swipe setting. */
@@ -106,6 +113,48 @@ final class SecuredDialogCell extends DialogCell {
             avatarImage.setImage(null, "50_50", chatAvatar, null, 0);
         }
         return result;
+    }
+
+    /**
+     * DialogCell builds its TalkBack text from Telegram user and chat objects, which a CustomDialog does not have, so
+     * it would read only the unread count. Same order and Telegram strings, from the row: kind and name, muted,
+     * unread, sent or received time, then the preview ("Name: text" for groups; "You" only through the sent string).
+     */
+    @Override
+    public void onPopulateAccessibilityEvent(android.view.accessibility.AccessibilityEvent event) {
+        super.onPopulateAccessibilityEvent(event);
+        final CharSequence d = describe();
+        if (d == null) return;
+        event.setContentDescription(d);
+        setContentDescription(d);
+    }
+
+    private CharSequence describe() {
+        final ChatRowMapper.Row r = row;
+        if (r == null) return null;
+        final StringBuilder sb = new StringBuilder();
+        if (archiveRow) {
+            sb.append(r.name).append(". ");
+        } else {
+            if (r.saved) {
+                sb.append(LocaleController.getString(R.string.SavedMessages));
+            } else {
+                if (r.group) {
+                    sb.append(LocaleController.getString(r.channel ? R.string.AccDescrChannel : R.string.AccDescrGroup)).append(". ");
+                }
+                sb.append(r.name);
+            }
+            sb.append(". ");
+            if (r.muted) sb.append(LocaleController.getString(R.string.AccDescrNotificationsMuted)).append(". ");
+            if (r.unread > 0) sb.append(LocaleController.formatPluralString("NewMessages", r.unread)).append(". ");
+            if (r.message != null && !r.message.isEmpty()) {
+                final String date = LocaleController.formatDateAudio(r.dateSeconds, true);
+                sb.append(LocaleController.formatString(r.outgoing ? "AccDescrSentDate" : "AccDescrReceivedDate",
+                        r.outgoing ? R.string.AccDescrSentDate : R.string.AccDescrReceivedDate, date)).append(". ");
+                sb.append(r.message);
+            }
+        }
+        return sb;
     }
 
     @Override

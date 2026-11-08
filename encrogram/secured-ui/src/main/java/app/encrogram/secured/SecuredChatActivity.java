@@ -125,7 +125,7 @@ import app.encrogram.core.api.SecuredResult;
  * SendMessagesHelper, FileLoader, ImageLoader, NotificationsController, FileLog, MediaDataController or
  * Browser.openUrl calls are made from here.
  */
-public class SecuredChatActivity extends BaseFragment {
+public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private static final int VIEW_MESSAGE = 0;
     private static final int VIEW_DATE = 1;
@@ -197,6 +197,7 @@ public class SecuredChatActivity extends BaseFragment {
     private View composerView;
     private FrameLayout invitedBar;
     private FrameLayout cantPostBar;
+    private FrameLayout deleteBar;
     private TextView invitedTitle;
     private TextView cantPostText;
     private TextView joinButton;
@@ -260,6 +261,11 @@ public class SecuredChatActivity extends BaseFragment {
 
         @Override
         public void onChatsChanged() {
+            updateHeader();
+        }
+
+        @Override
+        public void onConnectionChanged(boolean online) {
             updateHeader();
         }
 
@@ -428,6 +434,8 @@ public class SecuredChatActivity extends BaseFragment {
             cantPostBar = buildCantPostBar(context);
             column.addView(invitedBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
             column.addView(cantPostBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            deleteBar = buildDeleteBar(context);
+            column.addView(deleteBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         }
 
         // shortcut: attachments and media cells (step 5) plug in next to the composer field.
@@ -739,6 +747,24 @@ public class SecuredChatActivity extends BaseFragment {
         return bar;
     }
 
+    /** Telegram's "DELETE CHAT" bottom button for a chat you were removed from or left (its own DeleteChat string). */
+    private FrameLayout buildDeleteBar(Context context) {
+        final FrameLayout bar = buildBar(context);
+        final TextView t = Kit.text(context, tg(org.telegram.messenger.R.string.DeleteChatUser).toUpperCase(), 15,
+                Kit.color(Theme.key_chat_fieldOverlayText), true);
+        t.setGravity(Gravity.CENTER);
+        t.setOnClickListener(v -> confirmDeleteChat());
+        bar.addView(t, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.CENTER));
+        return bar;
+    }
+
+    /** True when you were removed, left, or the group is gone: you can only delete the chat (channel observers are not this). */
+    private boolean isRemovedOrLeft() {
+        final ChatSummary s = summary();
+        if (!groupChat || s == null || s.getInvited() || !s.getGone()) return false;
+        return true;
+    }
+
     private FrameLayout buildInvitedBar(Context context) {
         final FrameLayout bar = buildBar(context);
         final LinearLayout col = new LinearLayout(context);
@@ -780,7 +806,9 @@ public class SecuredChatActivity extends BaseFragment {
         if (joinButton != null) joinButton.setAlpha(joining ? 0.5f : 1f);
         composerView.setVisibility(!searching && canPost ? View.VISIBLE : View.GONE);
         if (invitedBar != null) invitedBar.setVisibility(!searching && invited ? View.VISIBLE : View.GONE);
-        if (cantPostBar != null) cantPostBar.setVisibility(!searching && !canPost && !invited ? View.VISIBLE : View.GONE);
+        final boolean removed = isRemovedOrLeft();
+        if (cantPostBar != null) cantPostBar.setVisibility(!searching && !canPost && !invited && !removed ? View.VISIBLE : View.GONE);
+        if (deleteBar != null) deleteBar.setVisibility(!searching && removed ? View.VISIBLE : View.GONE);
         if (!canPost && replyStrip != null) cancelStrip();
     }
 
@@ -853,6 +881,8 @@ public class SecuredChatActivity extends BaseFragment {
             sub = c.getString(R.string.sec_engine_failed_title);
         } else if (state != EngineState.RUNNING) {
             sub = c.getString(R.string.secchat_connecting);
+        } else if (!engine.isOnline()) {
+            sub = tg(org.telegram.messenger.R.string.WaitingForNetwork);   // Telegram's own header string
         } else if (groupChat) {
             sub = groupSubtitle(c, s);
         } else if (s != null && !s.getReady()) {
@@ -1738,7 +1768,8 @@ public class SecuredChatActivity extends BaseFragment {
     private void confirmDeleteChat() {
         final Activity activity = getParentActivity();
         if (activity == null) return;
-        if (groupChat) {
+        final boolean removed = groupChat && isRemovedOrLeft();   // already out of the group: nothing to leave
+        if (groupChat && !removed) {
             SecuredGroupDialogs.confirmDelete(this, chatResources, name, isOwnerOrChannel(true), isOwnerOrChannel(false),
                     everyone -> chatAction(new ChatAction.Delete(everyone), this::finishFragment));
             return;
@@ -1747,11 +1778,13 @@ public class SecuredChatActivity extends BaseFragment {
         b.setTitle(activity.getString(R.string.sec_list_delete_title));
         b.setMessage(activity.getString(R.string.sec_list_delete_text));
         final CheckBoxCell also = new CheckBoxCell(activity, CheckBoxCell.TYPE_CHECK_BOX_DEFAULT, chatResources);
-        also.setText(activity.getString(R.string.sec_list_delete_also), "", false, false);
-        also.setOnClickListener(v -> also.setChecked(!also.isChecked(), true));
-        final FrameLayout holder = new FrameLayout(activity);
-        holder.addView(also, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 8, 0, 8, 0));
-        b.setView(holder);
+        if (!removed) {
+            also.setText(activity.getString(R.string.sec_list_delete_also), "", false, false);
+            also.setOnClickListener(v -> also.setChecked(!also.isChecked(), true));
+            final FrameLayout holder = new FrameLayout(activity);
+            holder.addView(also, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 8, 0, 8, 0));
+            b.setView(holder);
+        }
         b.setNegativeButton(activity.getString(R.string.sec_list_cancel), null);
         b.setPositiveButton(activity.getString(R.string.sec_list_delete_confirm), (d, w) ->
                 chatAction(new ChatAction.Delete(also.isChecked()), this::finishFragment));
@@ -2292,6 +2325,7 @@ public class SecuredChatActivity extends BaseFragment {
     public void onResume() {
         super.onResume();
         isPaused = false;
+        SecuredUi.nudgeLink();   // a link that waited (passcode, transition) shows now that this screen is resumed
         // Secured screens stay out of Recents thumbnails and screenshots (SPEC: protect screen, on by default).
         if (flagSecure == null && getParentActivity() != null) {
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);

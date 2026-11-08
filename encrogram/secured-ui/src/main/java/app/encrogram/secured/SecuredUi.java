@@ -91,6 +91,18 @@ public final class SecuredUi {
         }
     }
 
+    /** Re-offers a waiting link to the listener; called when a Secured screen resumes (after the passcode). */
+    static void nudgeLink() {
+        final LinkListener l = linkListener;
+        if (l != null && hasPendingLink()) {
+            new Handler(Looper.getMainLooper()).post(l::onSecuredLink);
+        }
+    }
+
+    private static synchronized boolean hasPendingLink() {
+        return pendingLink != null;
+    }
+
     static synchronized String takePendingLink() {
         final String l = pendingLink;
         pendingLink = null;

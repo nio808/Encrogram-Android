@@ -146,9 +146,10 @@ final class SecuredSheets {
 
     // ---- connect ---------------------------------------------------------------------------------------------
 
-    static void showConnect(BaseFragment fragment, SecuredEngine engine, String prefill) {
+    /** Returns true only when the sheet actually showed (showDialog returns null during a screen transition). */
+    static boolean showConnect(BaseFragment fragment, SecuredEngine engine, String prefill) {
         final Context context = fragment.getParentActivity();
-        if (context == null || engine == null) return;
+        if (context == null || engine == null) return false;
 
         final LinearLayout box = column(context);
         box.addView(title(context, R.string.sec_connect_title));
@@ -252,10 +253,11 @@ final class SecuredSheets {
                 showError(error, context.getString(R.string.sec_connect_failed, t.getClass().getSimpleName()));
             }
         });
-        fragment.showDialog(sheet);
+        if (fragment.showDialog(sheet) == null) return false;
         if (prefill == null) {
             input.requestFocus();
         }
+        return true;
     }
 
     private static void showError(TextView view, String message) {

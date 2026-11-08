@@ -112,6 +112,19 @@ class ChatListTest {
     }
 
     @Test
+    fun linkJoinsArePrunedWithTheirGroups() {
+        // The engine keeps link-join keys in its own ArchiveStore file and drops those of groups that are gone.
+        val file = File(tmp.root, "link_joins")
+        val store = ArchiveStore(file)
+        val inGroup3 = CoreJson.linkJoinKey(app.encrogram.core.api.GROUP_CHAT_ID_BASE + 3, 7)!!
+        val inGroup4 = CoreJson.linkJoinKey(app.encrogram.core.api.GROUP_CHAT_ID_BASE + 4, 7)!!
+        assertTrue(store.set(inGroup3, true))
+        assertTrue(store.set(inGroup4, true))
+        assertTrue(store.retainIf { CoreJson.linkJoinGroupId(it) in setOf(3L) })
+        assertEquals(setOf(inGroup3), ArchiveStore(file).all())
+    }
+
+    @Test
     fun archiveFlagReachesTheRow() {
         val chat = chats().first { it.contact.contactId == 5L }
         assertTrue(MessageMapper.summaryOf(chat, archived = true).archived)

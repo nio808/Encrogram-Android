@@ -224,7 +224,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         if (chatId != null && chatId != SecuredUi.NO_CHAT) {
             openChat(chatId);
         }
-        if (!resumed) {
+        if (!canShowLinkNow()) {
             return;
         }
         final String link = SecuredUi.takePendingLink();
@@ -349,6 +349,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         applyInsets();
         updateMode();
         refreshBackupBanner();
+        showPendingLinkIfReady();
         if (mode == Mode.PROFILE) {
             AndroidUtilities.requestAdjustResize(getParentActivity(), classGuid);
         }
@@ -1268,12 +1269,39 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     }
 
     void showPendingLinkIfReady() {
-        if (pendingLink == null || !resumed || engine == null || safeState() != EngineState.RUNNING) {
+        if (pendingLink == null || engine == null || safeState() != EngineState.RUNNING) {
             return;
         }
-        final String link = pendingLink;
-        pendingLink = null;
-        SecuredSheets.showConnect(this, engine, link);
+        final BaseFragment over = linkTarget();
+        if (over != null && SecuredSheets.showConnect(over, engine, pendingLink)) {
+            pendingLink = null;
+            linkRetries = 0;
+        } else if (over != null && linkRetries++ < 5) {
+            // The screen was mid-transition: keep the link and try again shortly. It is never dropped.
+            AndroidUtilities.runOnUIThread(this::showPendingLinkIfReady, 400);
+        }
+    }
+
+    private int linkRetries;
+
+    /**
+     * Where the connect sheet shows: this page when it is on top, else the Secured screen on top (a chat, group info)
+     * so a tapped link opens at once, as Telegram's t.me links do. Never over a Telegram screen: then it waits.
+     */
+    private BaseFragment linkTarget() {
+        // Only a screen that is resumed: Telegram holds back onResume while its passcode is up (LaunchActivity
+        // onPasscodeResume), so a locked app never gets the sheet. A Secured screen's onResume nudges the link.
+        if (resumed && !isPaused()) {
+            return this;
+        }
+        final INavigationLayout layout = host != null ? host.getParentLayout() : getParentLayout();
+        final BaseFragment top = layout != null ? layout.getLastFragment() : null;
+        return top instanceof SecuredScreen && !top.isPaused() ? top : null;
+    }
+
+    /** True when a tapped link can show now: the page is on top or a Secured screen is. */
+    boolean canShowLinkNow() {
+        return linkTarget() != null;
     }
 
     // ---- adapter ---------------------------------------------------------------------------------------------

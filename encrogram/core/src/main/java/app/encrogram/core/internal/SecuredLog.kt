@@ -29,6 +29,8 @@ internal object SecuredLog {
         ITEM_ACTION, CHAT_ACTION, GROUP_ACTION, ACTION_REFUSED, ARCHIVE_IO_FAILED,
         PROFILE_UPDATED, PROFILE_PREFS_MERGED, PROFILE_PREFS_FAILED,
         TASK_CRASHED, STOPPED,
+        // Phone network changes: the tag is the network type (wifi, cellular, ...) or "offline", never an address.
+        NETWORK,
         BG_START_REFUSED, BG_SERVICE_STARTED, BG_NOTIFY_FAILED,
         // 12-word backup. Tags are fixed words; the count is at most an HTTP status or a number of items.
         // Never the words, the backup id or key, the URL, the database key or the archive.

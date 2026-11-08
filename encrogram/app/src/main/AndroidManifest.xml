@@ -11,14 +11,17 @@
             Secured invite / address links (https://encrogram.nytmanager.com/i#... and /a#...).
             A tiny activity of our own, not a LaunchActivity hook. The activity is exported, so explicit intents
             can bypass this filter; the code re-checks https, our host, no user info, default port, exact path
-            /i or /a and a length limit, and drops anything else. A valid link goes to the Secured connect
+            /i, /a or /g and a length limit, and drops anything else. A valid link goes to the Secured connect
             flow in memory only (which still runs the engine's checkLink) and the normal app opens.
+            Own empty task affinity: otherwise the task keeps this link as its root intent and a second tap
+            on the same link only brings the app forward, without the connect sheet.
         -->
         <activity
             android:name="app.encrogram.android.SecuredLinkActivity"
             android:exported="true"
             android:excludeFromRecents="true"
             android:noHistory="true"
+            android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />

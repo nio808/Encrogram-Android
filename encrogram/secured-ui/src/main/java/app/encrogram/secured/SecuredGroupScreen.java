@@ -26,7 +26,7 @@ import app.encrogram.core.api.SecuredResult;
  * while visible, and one engine listener that asks the subclass to refresh (coalesced, on the UI thread).
  * Same shape as {@link SecuredBackupScreen}. Reads no Telegram data; every engine call goes through the engine only.
  */
-abstract class SecuredGroupScreen extends BaseFragment {
+abstract class SecuredGroupScreen extends BaseFragment implements SecuredScreen {
 
     protected SecuredEngine engine;
     protected boolean destroyed;
@@ -138,6 +138,7 @@ abstract class SecuredGroupScreen extends BaseFragment {
     @Override
     public void onResume() {
         super.onResume();
+        SecuredUi.nudgeLink();   // a link that waited (passcode, transition) shows now that this screen is resumed
         if (flagSecure == null && getParentActivity() != null) {
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
         }

@@ -107,6 +107,7 @@ internal object MessageMapper {
             lastMessageSender = last?.takeIf { !it.outgoing && !it.deleted }?.sender?.displayName,
             invited = g.invited,
             lastEvent = if (g.invited) null else lastEventOf(chat.lastItem),
+            gone = g.gone,
         )
     }
 

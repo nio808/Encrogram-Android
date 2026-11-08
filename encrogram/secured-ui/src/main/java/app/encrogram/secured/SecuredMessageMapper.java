@@ -200,7 +200,7 @@ public final class SecuredMessageMapper {
             // Group bubble (research/group-ui-reuse.md section 1): Telegram's own name, colour and avatar fields,
             // fed from the member key. The sentinel stays the only peer id; no Telegram user object exists.
             mo.customName = sender.getDisplayName();
-            mo.overrideLinkColor = AvatarDrawable.getColorIndex(sender.getMemberId());
+            mo.overrideLinkColor = AvatarDrawable.getColorIndex(Kit.colorKey(sender.getDisplayName()));
             final AvatarDrawable avatar = avatarResources != null ? new AvatarDrawable(avatarResources) : new AvatarDrawable();
             Kit.setAvatar(avatar, sender.getMemberId(), sender.getDisplayName());
             mo.customAvatarDrawable = avatar;
@@ -332,6 +332,8 @@ public final class SecuredMessageMapper {
                 return named ? context.getString(R.string.secgroup_event_invited, who) : context.getString(R.string.secgroup_event_invited_you);
             case JOINED:
                 return named ? context.getString(R.string.secgroup_event_joined, who) : context.getString(R.string.secgroup_event_joined_you);
+            case JOINED_BY_LINK:
+                return named ? context.getString(R.string.secgroup_event_joined_via_link, who) : context.getString(R.string.secgroup_event_joined_via_link_you);
             case LEFT:
                 return named ? context.getString(R.string.secgroup_event_left, who) : context.getString(R.string.secgroup_event_left_you);
             case REMOVED:
@@ -488,7 +490,7 @@ public final class SecuredMessageMapper {
                     new MessageSender(7L, "Alice", MemberRole.ADMIN), null);
             final MessageObject g = group.map(gm);
             checkShape(failures, "group msg", g, false, true);
-            check(failures, "Alice".equals(g.customName) && g.overrideLinkColor == AvatarDrawable.getColorIndex(7L)
+            check(failures, "Alice".equals(g.customName) && g.overrideLinkColor == AvatarDrawable.getColorIndex(Kit.colorKey("Alice"))
                     && g.customAvatarDrawable != null && g.needDrawAvatar(), "group bubble: name, colour, avatar");
             check(failures, g.messageOwner.from_id.user_id == SENTINEL_ID, "group bubble: sentinel sender");
         } catch (Throwable t) {

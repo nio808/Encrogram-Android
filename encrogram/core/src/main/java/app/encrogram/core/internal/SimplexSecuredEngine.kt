@@ -109,6 +109,26 @@ internal class SimplexSecuredEngine(
     private val groupCache = HashMap<Long, CoreGroup>()
     private var receiver: Receiver? = null
 
+    // ---- the phone's network ([NetworkWatch]): engine thread, except [online] ----
+    /** Reports network changes to the core, so it reconnects as soon as the network is back (like the official app). */
+    private val network = NetworkWatch(appContext, main) { info -> post { applyNetwork(info) } }
+    /** The watch is registered: from opening the store until [stopOnEngine]. */
+    private var watchingNetwork = false
+    /** The last network the watch reported; sent again to each newly opened store. */
+    private var netInfo: NetInfo? = null
+    /** Bumped for each network change, so only the last one of a burst reconnects ([applyNetwork]). */
+    private var reconnectGen = 0L
+    @Volatile private var online = true
+
+    /** [lastShown] results: chat id -> (that chat's newest item id when looked up, the item found or null). */
+    private val previewCache = HashMap<Long, Pair<Long, CoreItem?>>()
+    /** A list reload ran less than [REFRESH_WINDOW_MS] ago; [refreshOwed]: events asked for another one meanwhile. */
+    private var refreshWindowOpen = false
+    private var refreshOwed = false
+
+    /** Members who came in through one of our group links (their invitedViaGroupLink row), as [CoreJson.linkJoinKey]s. */
+    private val linkJoins: ArchiveStore by lazy { ArchiveStore(File(dataDir, LINK_JOINS_FILE)) }
+
     private val dataDir: File get() = File(appContext.noBackupFilesDir, DATA_DIR)
 
     /** Local-only archive flags, in the same no-backup folder as the databases. */
@@ -214,6 +234,8 @@ internal class SimplexSecuredEngine(
 
     override fun chats(): List<ChatSummary> = chatSnapshot
 
+    override fun isOnline(): Boolean = online
+
     override fun messages(chatId: Long, limit: Int, callback: SecuredCallback<List<SecuredMessage>>) =
         messages(chatId, MessagePage(limit), callback)
 
@@ -233,7 +255,7 @@ internal class SimplexSecuredEngine(
         when (val r = send(cmd)) {
             is CoreReply.Result ->
                 if (r.type == "apiChat") {
-                    val items = InputRules.pageWindow(CoreJson.parseChatItemsOfChat(r.body), page, want)
+                    val items = InputRules.pageWindow(withLinkJoins(CoreJson.parseChatItemsOfChat(r.body)), page, want)
                     val role = roleIn(chatId)
                     ok(callback, items.map { MessageMapper.toMessage(it, role) })
                 } else {
@@ -2660,6 +2682,9 @@ internal class SimplexSecuredEngine(
             SecuredLog.crash(Ev.DB_OPEN_FAILED, t)
             throw StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured storage couldn't be opened (setup)."), "db_setup")
         }
+        // A new store (first open, restore): item ids from an earlier one mean nothing here.
+        previewCache.clear()
+        watchNetwork()
     }
 
     /** `/set file paths` with our remote-hosts folder; the backup points [files] and [assets] elsewhere for a moment. */
@@ -2833,6 +2858,7 @@ internal class SimplexSecuredEngine(
     }
 
     private fun stopOnEngine() {
+        stopWatchingNetwork()
         if (ctrl == 0L) {
             if (state != EngineState.NOT_STARTED) setState(EngineState.NOT_STARTED)
             return
@@ -2850,6 +2876,9 @@ internal class SimplexSecuredEngine(
         lastItemIds.clear()
         timedChats.clear()
         groupCache.clear()
+        previewCache.clear()
+        refreshWindowOpen = false
+        refreshOwed = false
         noteFolderId = null
         publishChats()
         setState(EngineState.NOT_STARTED)
@@ -2937,7 +2966,7 @@ internal class SimplexSecuredEngine(
             is CoreReply.Error -> SecuredLog.w(Ev.EVENT_ERROR, reply.error.tag)
             is CoreReply.Result -> when (reply.type) {
                 "newChatItems" -> {
-                    val items = CoreJson.parseChatItems(reply.body)
+                    val items = withLinkJoins(CoreJson.parseChatItems(reply.body))
                     applyNewItems(items)
                     // Incoming messages, and service rows in either direction ("You left" comes from our own command
                     // as an event). Notes are always ours (outgoing) and never notify; the chat id check keeps it so.
@@ -2962,7 +2991,7 @@ internal class SimplexSecuredEngine(
                 }
                 in CHAT_LIST_EVENTS -> {
                     SecuredLog.i(Ev.EVENT, reply.type)
-                    refreshChats(notify = true)
+                    refreshSoon()
                 }
                 "chatErrors" -> SecuredLog.w(Ev.EVENT_ERROR, "chatErrors", reply.body.optJSONArray("chatErrors")?.length())
                 "messageError" -> SecuredLog.w(Ev.EVENT_ERROR, "messageError")
@@ -2973,8 +3002,141 @@ internal class SimplexSecuredEngine(
     }
 
     // =============================================================================================================
+    // The phone's network
+    // =============================================================================================================
+
+    /** Starts watching the network (once) and tells a newly opened store what it is now. */
+    private fun watchNetwork() {
+        if (!watchingNetwork) {
+            watchingNetwork = true
+            network.start()
+        }
+        sendNetworkInfo()
+    }
+
+    private fun stopWatchingNetwork() {
+        if (watchingNetwork) {
+            watchingNetwork = false
+            network.stop()
+        }
+        netInfo = null
+        setOnline(true)
+    }
+
+    /**
+     * A real change from the watch (offline already held back a few seconds): tell the core, then the screens. When the
+     * phone moves to another network, or a network comes back, relay connections opened on the old one can go silent
+     * without an error (seen on device: opened over mobile data a second before Wi-Fi took over), and the agent keeps
+     * such a connection until 3 pings time out and 15 minutes pass without a reply (simplexmq Client.hs:660-674, pings
+     * every 10 minutes). Meanwhile every send and the subscriptions sit on it. So once the network settles, reconnect.
+     */
+    private fun applyNetwork(info: NetInfo) {
+        if (!watchingNetwork) return
+        val previous = netInfo
+        netInfo = info
+        sendNetworkInfo()
+        setOnline(info.usable)
+        if (previous != null && info.coreOnline && (!previous.coreOnline || previous.handle != info.handle)) {
+            val gen = ++reconnectGen
+            main.postDelayed({ post { if (gen == reconnectGen) reconnectAll() } }, RECONNECT_SETTLE_MS)
+        }
+    }
+
+    private fun sendNetworkInfo() {
+        val info = netInfo ?: return
+        if (ctrl == 0L) return
+        if (!info.coreOnline && !TELL_CORE_OFFLINE) return
+        val r = send(Commands.networkInfo(info))
+        if (r is CoreReply.Result && r.type == "cmdOk") SecuredLog.i(Ev.NETWORK, if (info.coreOnline) info.type else "offline")
+    }
+
+    /** `/reconnect` on the network the phone settled on; only with a running chat and a network. */
+    private fun reconnectAll() {
+        if (state != EngineState.RUNNING || ctrl == 0L || netInfo?.coreOnline != true) return
+        val r = send(Commands.RECONNECT_ALL)
+        if (r is CoreReply.Result && r.type == "cmdOk") SecuredLog.i(Ev.NETWORK, "reconnect")
+    }
+
+    private fun setOnline(value: Boolean) {
+        if (online == value) return
+        online = value
+        main.post { for (l in listeners) l.onConnectionChanged(value) }
+    }
+
+    // =============================================================================================================
     // Chat list cache
     // =============================================================================================================
+
+    /**
+     * The newest item a row can preview: a message or a service row we show. `apiChats` gives each chat's newest item
+     * only (by item time, Store/Messages.hs:895-913), and that is often one we skip: after a link join, the members
+     * who were there before connecting to us, a feature or profile change. Then look back through the chat, a few
+     * pages at most; [newest] when nothing there is shown. Cached per chat while its newest item stays the same
+     * ([previewCache]; [applyNewItems] moves the key along for each new item we skip, so a burst of skipped rows
+     * costs one look-back, not one per reload).
+     */
+    private fun lastShown(chatId: Long, chat: ChatRef, newest: CoreItem?): CoreItem? {
+        if (newest == null || newest.shown) {
+            previewCache.remove(chatId)
+            return newest
+        }
+        previewCache[chatId]?.let { (seen, found) -> if (seen == newest.itemId) return found ?: newest }
+        var before: Long? = null
+        for (attempt in 1..LOOKBACK_PAGES) {
+            val r = send(Commands.getChat(chat, LOOKBACK_COUNT, beforeId = before))
+            // Not cached: the next reload tries again.
+            if (r !is CoreReply.Result || r.type != "apiChat") return newest
+            val page = withLinkJoins(CoreJson.parseChatItemsOfChat(r.body))
+            CoreJson.newestShown(page)?.let {
+                previewCache[chatId] = newest.itemId to it
+                return it
+            }
+            val raw = r.body.optJSONObject("chat")?.optJSONArray("chatItems")?.length() ?: 0
+            before = page.minWithOrNull(CoreJson.ITEM_ORDER)?.itemId
+            if (raw < LOOKBACK_COUNT || before == null) break
+        }
+        previewCache[chatId] = newest.itemId to null
+        return newest
+    }
+
+    /**
+     * A list reload for an event: at once, then at most one more per [REFRESH_WINDOW_MS] however many events come in
+     * meanwhile (joining a big group brings one event per member connecting to us).
+     */
+    private fun refreshSoon() {
+        if (refreshWindowOpen) {
+            refreshOwed = true
+            return
+        }
+        refreshWindowOpen = true
+        refreshChats(notify = true)
+        main.postDelayed({ post { refreshWindowEnded() } }, REFRESH_WINDOW_MS)
+    }
+
+    private fun refreshWindowEnded() {
+        if (!refreshOwed || state != EngineState.RUNNING) {
+            refreshWindowOpen = false
+            refreshOwed = false
+            return
+        }
+        refreshOwed = false
+        refreshChats(notify = true)
+        main.postDelayed({ post { refreshWindowEnded() } }, REFRESH_WINDOW_MS)
+    }
+
+    /**
+     * Remembers who came in through our group links (from their invitedViaGroupLink rows, live or on a page) and words
+     * their join rows "joined via invite link". Stored, because the two rows are seconds apart and pages split them.
+     */
+    private fun withLinkJoins(items: List<CoreItem>): List<CoreItem> {
+        for (i in items) {
+            val key = CoreJson.linkJoinKey(i.chatId, i.linkJoinOf ?: continue) ?: continue
+            if (!linkJoins.set(key, true)) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "link_joins")
+        }
+        return CoreJson.markLinkJoins(items) { chatId, memberId ->
+            CoreJson.linkJoinKey(chatId, memberId)?.let { linkJoins.isArchived(it) } == true
+        }
+    }
 
     private fun refreshChats(notify: Boolean) {
         val r = send(Commands.getChats(userId))
@@ -2984,21 +3146,28 @@ internal class SimplexSecuredEngine(
         // Group chat ids are kept too: pruning only by contact ids would un-archive every group.
         val known = chats.mapTo(HashSet()) { it.contact.contactId }.apply { groups.mapTo(this) { it.group.chatId } }
         if (!archive.retainOnly(known)) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "prune")
+        val groupIds = groups.mapTo(HashSet()) { it.group.groupId }
+        if (!linkJoins.retainIf { CoreJson.linkJoinGroupId(it) in groupIds }) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "link_joins_prune")
+        previewCache.keys.retainAll(known)
         chatCache.clear()
         lastItemIds.clear()
         timedChats.clear()
         groupCache.clear()
-        for (chat in chats) {
-            val c = chat.contact
+        for (listed in chats) {
+            val c = listed.contact
             if (c.isContactCard || c.removed) continue
+            val chat = listed.copy(lastItem = lastShown(c.contactId, ChatRef.contact(c.contactId), listed.lastItem))
             chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId))
             // Messages and the service rows we show (lastEvent): edits and deletions of either reload the row.
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
         }
-        for (chat in groups) {
-            val id = chat.group.chatId
-            groupCache[id] = chat.group
+        for (listed in groups) {
+            val id = listed.group.chatId
+            groupCache[id] = listed.group
+            // Invited: nothing is previewed before joining, so no look-back.
+            val newest = listed.lastItem?.let { withLinkJoins(listOf(it)).single() }
+            val chat = listed.copy(lastItem = if (listed.group.invited) newest else lastShown(id, ChatRef.group(listed.group.groupId), newest))
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
         }
@@ -3031,7 +3200,12 @@ internal class SimplexSecuredEngine(
                 unknownChat = true
                 continue
             }
-            if (!item.shown) continue
+            if (!item.shown) {
+                // The row keeps its preview, and a cached look-back stays right with this item as the chat's newest.
+                previewCache[item.chatId]?.let { previewCache[item.chatId] = item.itemId to it.second }
+                continue
+            }
+            previewCache.remove(item.chatId)
             chatCache[item.chatId] = MessageMapper.withNewItem(row, item)
             lastItemIds[item.chatId] = item.itemId
             changed = true
@@ -3049,6 +3223,7 @@ internal class SimplexSecuredEngine(
         var changed = false
         for (item in items) {
             if (!item.outgoing || lastItemIds[item.chatId] != item.itemId) continue
+            previewCache.remove(item.chatId)
             val row = chatCache[item.chatId] ?: continue
             if (row.lastMessageStatus == item.status) continue
             chatCache[item.chatId] = row.copy(lastMessageStatus = item.status)
@@ -3064,7 +3239,10 @@ internal class SimplexSecuredEngine(
     private fun applyItemUpdated(item: CoreItem) {
         if (!item.shown) return
         emitChanged(listOf(item))
-        if (lastItemIds[item.chatId] == item.itemId) refreshChats(notify = true)
+        if (lastItemIds[item.chatId] == item.itemId) {
+            previewCache.remove(item.chatId)
+            refreshChats(notify = true)
+        }
     }
 
     /** Fully deleted -> onMessagesRemoved; only marked deleted -> onMessageChanged (deleted=true, text ""). */
@@ -3083,11 +3261,15 @@ internal class SimplexSecuredEngine(
             main.post { for ((chatId, ids) in gone) for (l in listeners) l.onMessagesRemoved(chatId, ids) }
         }
         emitChanged(marked)
-        if (deletions.any { lastItemIds[it.chatId] == it.itemId }) refreshChats(notify = true)
+        val lastGone = deletions.filter { lastItemIds[it.chatId] == it.itemId }
+        if (lastGone.isNotEmpty()) {
+            for (d in lastGone) previewCache.remove(d.chatId)
+            refreshChats(notify = true)
+        }
     }
 
     private fun emitChanged(items: List<CoreItem>) {
-        val messages = items.filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
+        val messages = withLinkJoins(items).filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
         if (messages.isEmpty()) return
         markChanged()
         main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
@@ -3207,6 +3389,22 @@ internal class SimplexSecuredEngine(
         const val LOCKDOWN_MARKER = "first_run_lockdown"
         const val MIGRATION_CONFIRM = "yesUp"
         const val RECV_WAIT_MICROS = 2_000_000
+        /** [lastShown]: items per page and pages at most (a link join into a big group adds a row per earlier member). */
+        const val LOOKBACK_COUNT = 50
+        const val LOOKBACK_PAGES = 3
+        /** [refreshSoon]: at most one event-driven list reload per this long. */
+        const val REFRESH_WINDOW_MS = 500L
+        /** Members who joined through our group links ([withLinkJoins]), next to the databases. */
+        const val LINK_JOINS_FILE = "link_joins"
+        /** [applyNetwork]: reconnect once the default network has stayed the same this long. */
+        const val RECONNECT_SETTLE_MS = 2_000L
+        /**
+         * Tell the core "offline" when the phone has no network at all (held back 3 s), so it retries at the moment the
+         * network is back (RetryInterval.hs:78-85, Client.hs:961-965). False: never tell it; its own back-off runs as
+         * before (about 15 s after a short outage, up to 2 min after a long one). The reconnect after a network switch
+         * runs either way.
+         */
+        const val TELL_CORE_OFFLINE = true
         /** Commands.hs mkValidName keeps at most 50 characters (code points) of a display name. */
         const val MAX_NAME_CHARS = 50
         /** Local-only archive flags ([ArchiveStore]), next to the databases. */

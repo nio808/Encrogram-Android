@@ -153,6 +153,11 @@ interface SecuredEngine {
 
     /** Leaves the group; the chat stays until deleted. */
     fun leaveGroup(chatId: Long, callback: SecuredCallback<Unit>) = notYet(callback)
+
+    // ---- network ----------------------------------------------------------------------------------------------
+
+    /** False while the phone has no usable network; screens then say "Waiting for network…" like Telegram's. */
+    fun isOnline(): Boolean = true
 }
 
 /** Groups start here so their chat ids never collide with contacts (small positive) or Saved Messages (-1). */
@@ -188,7 +193,8 @@ data class GroupEvent @JvmOverloads constructor(
     val role: MemberRole? = null,
     val groupName: String? = null,
 ) {
-    enum class Kind { CREATED, INVITED, JOINED, LEFT, REMOVED, YOU_REMOVED, ROLE_CHANGED, GROUP_DELETED, GROUP_UPDATED, DELETED_BY_ADMIN }
+    /** [JOINED_BY_LINK]: [memberName] joined through the group's invite link (Telegram: "X joined the group via invite link"). */
+    enum class Kind { CREATED, INVITED, JOINED, LEFT, REMOVED, YOU_REMOVED, ROLE_CHANGED, GROUP_DELETED, GROUP_UPDATED, DELETED_BY_ADMIN, JOINED_BY_LINK }
 }
 
 private fun <T> notYet(callback: SecuredCallback<T>) =
@@ -227,6 +233,8 @@ interface SecuredListener {
     fun onError(error: SecuredError) {}
     /** [SecuredEngine.backupState] changed. */
     fun onBackupStateChanged() {}
+    /** [SecuredEngine.isOnline] changed. */
+    fun onConnectionChanged(online: Boolean) {}
 }
 
 fun interface SecuredCallback<T> {
@@ -276,6 +284,8 @@ data class ChatSummary @JvmOverloads constructor(
     val invited: Boolean = false,
     /** Set when the newest item is a service row ("Ann joined"): the UI words it as the preview; [lastMessageText] is then null. */
     val lastEvent: GroupEvent? = null,
+    /** Groups: you are no longer a member (removed, left, or the group was deleted). The chat stays until deleted. */
+    val gone: Boolean = false,
 )
 
 data class SecuredMessage @JvmOverloads constructor(

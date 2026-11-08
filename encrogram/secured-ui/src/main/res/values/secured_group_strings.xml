@@ -92,6 +92,9 @@
     <string name="secgroup_name_hint_group">Group name</string>
     <string name="secgroup_name_hint_channel">Channel name</string>
     <string name="secgroup_create">Create</string>
+    <string name="secgroup_add">Add</string>
+    <string name="secgroup_event_joined_via_link">%1$s joined the group via invite link</string>
+    <string name="secgroup_event_joined_via_link_you">You joined the group via invite link</string>
     <string name="secgroup_create_channel_confirm">Create channel</string>
     <string name="secgroup_pick_header_group">Add members</string>
     <string name="secgroup_pick_header_channel">Add subscribers</string>

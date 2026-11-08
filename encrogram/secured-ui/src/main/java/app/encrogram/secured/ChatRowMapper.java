@@ -80,6 +80,7 @@ final class ChatRowMapper {
         /** Group or channel: avatar from the name, no verified badge, "Name: message" preview. */
         boolean group;
         boolean invited;
+        boolean channel;
     }
 
     static Row map(ChatSummary c, Labels labels, long nowMs) {
@@ -87,6 +88,7 @@ final class ChatRowMapper {
         r.chatId = c.getChatId();
         r.saved = r.chatId == SAVED_MESSAGES_CHAT_ID;
         r.group = c.getKind() != ChatKind.DIRECT || app.encrogram.core.api.SecuredEngineKt.isGroupChatId(r.chatId);
+        r.channel = c.getKind() == ChatKind.CHANNEL;
         r.invited = r.group && c.getInvited();
         r.name = r.saved ? labels.savedMessages : c.getDisplayName() != null ? c.getDisplayName() : "";
         r.pinned = c.getPinned();
@@ -228,6 +230,14 @@ final class ChatRowMapper {
         r = map(g, labels, now);
         check(bad, "service-row preview is worded", "JOINED:Bo".equals(r.message) && !r.outgoing);
         labels.events = null;
+        final app.encrogram.core.api.GroupEvent viaLink = new app.encrogram.core.api.GroupEvent(app.encrogram.core.api.GroupEvent.Kind.JOINED_BY_LINK, null);
+        g = new ChatSummary(gBase + 3, "Team", null, 1000, 0, false, true, false, null, false, false, false, null,
+                ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, true, null, false, viaLink);
+        labels.events = (e, k) -> e.getKind() + ":" + e.getMemberName();
+        r = map(g, labels, now);
+        check(bad, "link join preview is worded", "JOINED_BY_LINK:null".equals(r.message));
+        labels.events = null;
+        check(bad, "avatar colour key is the name, not an id", Kit.colorKey(" Ann ") == Kit.colorKey("Ann") && Kit.colorKey("Ann") != Kit.colorKey("Bob"));
         g = new ChatSummary(gBase + 2, "Club", "secret", 1000, 1, false, true, false, null, false, false, false, null,
                 ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, false, "Ann", true);
         r = map(g, labels, now);

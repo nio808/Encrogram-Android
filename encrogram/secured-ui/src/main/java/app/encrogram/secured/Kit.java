@@ -37,13 +37,22 @@ final class Kit {
     }
 
     /**
+     * Avatar and name colour input: a stable hash of the trimmed display name (String.hashCode is specified, so it is the
+     * same on every phone), never a local chat or member id. Telegram's AvatarDrawable colour set picks from it.
+     */
+    static long colorKey(String name) {
+        return name == null ? 0 : name.trim().hashCode();
+    }
+
+    /**
      * The one place that sets a Secured avatar's colour and initials. {@code colorKey} is {@link ChatRowMapper#colorId}
      * of the chat id (or a member id), so a chat has the same colour in the list, the header and its info screen.
      * AvatarDrawable takes initials from first and last name, and its single-string path mis-reads a two-word title
      * ("Team Test" gives "TE"), so split at the last space ("TT").
      */
-    static void setAvatar(AvatarDrawable d, long colorKey, String name) {
+    static void setAvatar(AvatarDrawable d, long ignoredLocalId, String name) {
         final String shown = name == null ? "" : name.trim();
+        final long colorKey = colorKey(shown);
         final int sp = shown.lastIndexOf(' ');
         d.setInfo(colorKey, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
     }

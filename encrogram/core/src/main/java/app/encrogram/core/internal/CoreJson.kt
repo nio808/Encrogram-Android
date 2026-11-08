@@ -100,6 +100,11 @@ internal data class CoreItem(
     val sender: CoreSender? = null,
     /** A service row we show ("X joined", "deleted by admin"); null for messages and for service items we skip. */
     val event: GroupEvent? = null,
+    /**
+     * An `invitedViaGroupLink` row (never shown): the groupMemberId of who came in through our group link. It marks
+     * their later join row as a link join ([CoreJson.parseChatItemsOfChat]).
+     */
+    val linkJoinOf: Long? = null,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -438,11 +443,22 @@ internal object CoreJson {
         if (aChatItem == null) return null
         val info = aChatItem.optJSONObject("chatInfo")
         val chatId = chatIdOf(info) ?: return null
-        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info))
+        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info), joinedByLink(groupInfoOf(info)))
     }
 
-    /** [peerName]: the contact's name in a direct chat, used only for our own sent invitation row. */
-    fun parseChatItem(chatId: Long, item: JSONObject?, peerName: String? = null): CoreItem? {
+    /**
+     * We joined this group through its link: the GroupInfo keeps the link we used (viaGroupLinkUri, Types.hs:500, set by
+     * Store/Shared.hs:909-937) or the group was prepared from it (preparedGroup, Types.hs:551-557). An invitation from a
+     * contact sets neither. Only presence is read: the link itself is never kept.
+     */
+    fun joinedByLink(groupInfo: JSONObject?): Boolean =
+        groupInfo != null && (present(groupInfo, "viaGroupLinkUri") || present(groupInfo, "preparedGroup"))
+
+    /**
+     * [peerName]: the contact's name in a direct chat, used only for our own sent invitation row. [joinedByLink]: we
+     * joined this group by its link ([joinedByLink]), so our own join row reads "You joined via invite link".
+     */
+    fun parseChatItem(chatId: Long, item: JSONObject?, peerName: String? = null, joinedByLink: Boolean = false): CoreItem? {
         if (item == null) return null
         val meta = item.optJSONObject("meta") ?: return null
         if (!meta.has("itemId")) return null
@@ -467,7 +483,8 @@ internal object CoreJson {
         val legacyDeleted = contentType == "sndDeleted" || contentType == "rcvDeleted"
         val isMessage = !moderated && (contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted)
         val deleted = moderated || legacyDeleted || present(meta, "itemDeleted")
-        val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, senderJson?.str("memberCategory"), peerName)
+        val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, senderJson, joinedByLink, peerName)
+        val linkJoinOf = if (contentType == "rcvGroupEvent" && tagOf(content?.opt("rcvGroupEvent")) == "invitedViaGroupLink") sender?.memberId else null
         val msgContent = content?.optJSONObject("msgContent")
         val msgText = msgContent?.str("text").orEmpty()
         // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
@@ -500,8 +517,15 @@ internal object CoreJson {
             local = local,
             sender = sender,
             event = event,
+            linkJoinOf = linkJoinOf,
         )
     }
+
+    /** The core's order of a chat's items (Store/Messages.hs: item_ts, then chat_item_id). */
+    val ITEM_ORDER: Comparator<CoreItem> = compareBy<CoreItem>({ it.timeMs }, { it.itemId })
+
+    /** The newest item a chat-list row can preview: a message or a service row we show; null when there is none. */
+    fun newestShown(items: List<CoreItem>): CoreItem? = items.filter { it.shown }.maxWithOrNull(ITEM_ORDER)
 
     // ---- groups ----------------------------------------------------------------------------------------------------
 
@@ -511,10 +535,17 @@ internal object CoreJson {
      * chat banner, E2EE info of a member, profile updates, blocks, signature warnings) is null and the row is skipped.
      * A row about a member always names them; without a name it is skipped rather than worded as if it were about us.
      */
-    private fun serviceEvent(content: JSONObject?, contentType: String?, sender: CoreSender?, senderCategory: String?, peerName: String?): GroupEvent? {
+    private fun serviceEvent(
+        content: JSONObject?,
+        contentType: String?,
+        sender: CoreSender?,
+        senderJson: JSONObject?,
+        joinedByLink: Boolean,
+        peerName: String?,
+    ): GroupEvent? {
         if (content == null) return null
         return when (contentType) {
-            "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender, senderCategory)
+            "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender, senderJson, joinedByLink)
             "sndGroupEvent" -> sndGroupEvent(content.optJSONObject("sndGroupEvent"))
             // In the inviting contact's 1:1 chat: "You were invited to <group>" (CIRcvGroupInvitation, CIContent.hs:152).
             "rcvGroupInvitation" -> GroupEvent(GroupEvent.Kind.INVITED, groupName = invitedGroupName(content))
@@ -526,19 +557,32 @@ internal object CoreJson {
         }
     }
 
-    /** [senderCategory]: the sending member's memberCategory (GroupMemberCategory, Types.hs:1321-1326). */
-    private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?, senderCategory: String?): GroupEvent? {
+    /**
+     * [senderJson]: the sending GroupMember (its memberCategory is GroupMemberCategory, Types.hs:1321-1326).
+     * [joinedByLink]: we joined this group through its link.
+     *
+     * A link join is one row, "X joined the group via invite link": on the link owner's side the core makes two items
+     * for it, `invitedViaGroupLink` when it accepts the request (Subscriber.hs:1626-1629) and `memberConnected` when
+     * the joiner's connection comes up (:950); only the second is shown, marked from the first ([markLinkJoins]).
+     * Members other than the link owner get the
+     * same `memberAdded` + `memberConnected` pair for a link join as for an admin's invitation (XGrpMemNew carries no
+     * marker, Subscriber.hs:3185-3189, Types.hs:1043-1050), so for them it stays "invited" then "joined".
+     */
+    private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?, senderJson: JSONObject?, joinedByLink: Boolean): GroupEvent? {
         if (e == null) return null
         val about = profileName(e)
         return when (tagOf(e)) {
             "memberAdded" -> about?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
             // The member the item is from finished connecting ("X joined"), except when we are the one joining.
-            "memberConnected" -> when (senderCategory) {
+            "memberConnected" -> when (senderJson?.str("memberCategory")) {
                 // The member who let us in (by invitation or link): their connection coming up is our own join
                 // (Subscriber.hs:885-912 makes this item with userJoinedGroup), so "You joined", not "<host> joined".
-                "host" -> GroupEvent(GroupEvent.Kind.JOINED)
+                "host" -> GroupEvent(if (joinedByLink) GroupEvent.Kind.JOINED_BY_LINK else GroupEvent.Kind.JOINED)
                 // Members who were there before us, connecting after our join (:1835-1845): they didn't just join.
                 "pre" -> null
+                // Anyone else, including someone we let in. Whether that was through our link is not in the member
+                // (memberContactId changes with contact deletes and merges), only in their invitedViaGroupLink row:
+                // [markLinkJoins] turns this into JOINED_BY_LINK from those rows.
                 else -> sender?.let { GroupEvent(GroupEvent.Kind.JOINED, it.displayName) }
             }
             "memberAccepted" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
@@ -550,8 +594,9 @@ internal object CoreJson {
             "userDeleted" -> GroupEvent(GroupEvent.Kind.YOU_REMOVED)
             "groupDeleted" -> GroupEvent(GroupEvent.Kind.GROUP_DELETED)
             "groupUpdated" -> GroupEvent(GroupEvent.Kind.GROUP_UPDATED)
-            // Made on our side when we invite someone through a link (Events.hs:28-31), attributed to them.
-            "invitedViaGroupLink" -> sender?.let { GroupEvent(GroupEvent.Kind.INVITED, it.displayName) }
+            // Made on our side when we accept a join through our link (Events.hs:28-31): not shown, their memberConnected
+            // row is the one "joined via invite link" row ([CoreItem.linkJoinOf] marks it).
+            "invitedViaGroupLink" -> null
             else -> null
         }
     }
@@ -747,11 +792,12 @@ internal object CoreJson {
             val chat = arr.optJSONObject(i) ?: continue
             val info = groupInfoOf(chat.optJSONObject("chatInfo")) ?: continue
             val group = parseGroup(info) ?: continue
+            val viaLink = joinedByLink(info)
             val items = chat.optJSONArray("chatItems")
             var last: CoreItem? = null
             if (items != null) {
                 for (j in 0 until items.length()) {
-                    val it = parseChatItem(group.chatId, items.optJSONObject(j)) ?: continue
+                    val it = parseChatItem(group.chatId, items.optJSONObject(j), joinedByLink = viaLink) ?: continue
                     if (last == null || it.itemId > last.itemId) last = it
                 }
             }
@@ -897,18 +943,52 @@ internal object CoreJson {
         return null
     }
 
-    /** `apiChat` body -> items of that direct chat, group or note folder (chat id -1), oldest first. */
+    /**
+     * `apiChat` body -> items of that direct chat, group or note folder (chat id -1), oldest first. A join row whose
+     * member has an `invitedViaGroupLink` row on the same page is a link join ([markLinkJoins]); the engine also
+     * remembers those rows across pages.
+     */
     fun parseChatItemsOfChat(body: JSONObject): List<CoreItem> {
         val chat = body.optJSONObject("chat") ?: return emptyList()
         val info = chat.optJSONObject("chatInfo")
         val chatId = chatIdOf(info) ?: return emptyList()
         val peer = peerNameOf(info)
+        val viaLink = joinedByLink(groupInfoOf(info))
         val items = chat.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(items.length())
-        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j), peer)?.let { out.add(it) }
+        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j), peer, viaLink)?.let { out.add(it) }
         out.sortBy { it.itemId }
-        return out
+        val linkJoiners = out.mapNotNullTo(HashSet()) { it.linkJoinOf }
+        return if (linkJoiners.isEmpty()) out else markLinkJoins(out) { _, memberId -> memberId in linkJoiners }
     }
+
+    /**
+     * Someone else's join row ("X joined") becomes "X joined via invite link" when [viaLink] says that member of that
+     * chat came in through our group link (an invitedViaGroupLink row was seen for them). Only the link owner has such
+     * rows (Subscriber.hs:1626-1629), and a member id is never reused within a group, so nothing else can match.
+     */
+    fun markLinkJoins(items: List<CoreItem>, viaLink: (chatId: Long, memberId: Long) -> Boolean): List<CoreItem> = items.map { i ->
+        val e = i.event
+        val member = i.sender?.memberId
+        if (e != null && member != null && e.kind == GroupEvent.Kind.JOINED && e.memberName != null && viaLink(i.chatId, member)) {
+            i.copy(event = e.copy(kind = GroupEvent.Kind.JOINED_BY_LINK))
+        } else {
+            i
+        }
+    }
+
+    /**
+     * One stored key for (group, member): groupId in the high 32 bits, groupMemberId in the low ones; null outside
+     * groups or for ids that don't fit (then the row just reads "joined").
+     */
+    fun linkJoinKey(chatId: Long, memberId: Long): Long? {
+        val groupId = groupIdFromChatId(chatId) ?: return null
+        if (groupId > Int.MAX_VALUE || memberId <= 0 || memberId > Int.MAX_VALUE) return null
+        return (groupId shl 32) or memberId
+    }
+
+    /** The groupId of a [linkJoinKey]. */
+    fun linkJoinGroupId(key: Long): Long = key ushr 32
 
     /** `contactCode` body {contact, connectionCode}: the code to compare in person (digits in groups of five). */
     fun contactCode(body: JSONObject): String? = body.str("connectionCode")?.ifEmpty { null }

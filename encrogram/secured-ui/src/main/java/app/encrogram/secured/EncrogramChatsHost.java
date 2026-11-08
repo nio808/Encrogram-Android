@@ -222,7 +222,8 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
     // ---- deep links ------------------------------------------------------------------------------------------
 
     private void onLinkAvailable() {
-        if (!resumed || viewPager == null) {
+        // Over a Secured screen (a chat) the sheet shows at once; over a Telegram screen the link waits for onResume.
+        if (viewPager == null || !((resumed && !isPaused()) || securedPage.canShowLinkNow())) {
             return;
         }
         final String link = SecuredUi.takePendingLink();
@@ -230,7 +231,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
             return;
         }
         securedPage.setPendingLink(link);
-        if (selected == POSITION_SECURED) {
+        if (selected == POSITION_SECURED || !resumed) {
             securedPage.showPendingLinkIfReady();
         } else {
             selectNetwork(POSITION_SECURED);   // the page shows the connect sheet when it resumes

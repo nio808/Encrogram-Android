@@ -108,7 +108,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
         final View v = super.createView(context);
         final ActionBarMenu menu = actionBar.createMenu();
         menu.addItem(MENU_DONE, org.telegram.messenger.R.drawable.ic_ab_done, SecuredResourcesProvider.get())
-                .setContentDescription(context.getString(R.string.secgroup_create));
+                .setContentDescription(context.getString(adding() ? R.string.secgroup_add : R.string.secgroup_create));
         listView.setOnItemClickListener((view, position) -> {
             if (position < 0 || position >= rows.size() || !(view instanceof SecuredMemberRow)) return;
             final int[] r = rows.get(position);
@@ -447,7 +447,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
 
     private void updatePreview(String text) {
         final String shown = text.trim();
-        Kit.setAvatar(preview, 1, shown);   // no chat id yet: the real colour follows the chat id once it exists
+        Kit.setAvatar(preview, 1, shown);   // colour comes from the name hash, so it matches the created group everywhere
         if (previewView != null) previewView.invalidate();
     }
 

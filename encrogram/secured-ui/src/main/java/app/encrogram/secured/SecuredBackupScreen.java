@@ -36,7 +36,7 @@ import app.encrogram.core.api.SecuredError;
  * Reads no Telegram data and makes no Telegram calls; all data goes through the engine. The words only ever live in
  * fields of the subclasses and are never logged.
  */
-abstract class SecuredBackupScreen extends BaseFragment {
+abstract class SecuredBackupScreen extends BaseFragment implements SecuredScreen {
 
     protected SecuredEngine engine;
     protected boolean destroyed;
@@ -102,6 +102,7 @@ abstract class SecuredBackupScreen extends BaseFragment {
     @Override
     public void onResume() {
         super.onResume();
+        SecuredUi.nudgeLink();   // a link that waited (passcode, transition) shows now that this screen is resumed
         // Same protection as the other Secured screens: out of Recents thumbnails and screenshots.
         if (flagSecure == null && getParentActivity() != null) {
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);

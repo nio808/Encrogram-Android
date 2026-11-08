@@ -158,6 +158,26 @@ Every action result also arrives through the listener; callbacks only say whethe
   messages; the engine then reports them with `onMessageChanged` (`expiresAtMs` set).
 - **Security code:** `securityCode` returns the core's code (digit groups). `verifyContact(code)` accepts digits and
   spaces only; `null` clears verification. Both reload the list so `verified` follows the core.
+- **Network (8 November 2026):** `NetworkWatch` follows the default network (ConnectivityManager callback) from
+  opening the store until `stop()` and sends each real change as `/_network info {"networkType":"wifi","online":true}`,
+  as the official app does. The core hears `online:false` only when the phone has no network at all for 3 s (never
+  from Android's "validated" check, which can be blocked on a working network), so it retries at once when the
+  network is back. On every switch to another network, or a network coming back, the engine sends `/reconnect` once
+  the network has been stable for 2 s: a relay connection opened on the old network can go silent without an error,
+  and the agent would keep it (and every send and subscription on it) for 15+ minutes. `isOnline()` (screens only) is
+  false without internet or behind a captive portal. No ConnectivityManager, no permission or no callback: online.
+  `TELL_CORE_OFFLINE = false` turns the offline report off (the reconnect stays).
+- **Link joins:** one row, `JOINED_BY_LINK`. The link owner's `invitedViaGroupLink` item is hidden and remembered
+  (group and member id in `noBackupFilesDir/encrogram-secured/link_joins`, pruned with the groups); that member's
+  `memberConnected` row becomes the one row. The member record never decides it (contact deletes and merges change
+  it). The joiner's own row is `JOINED_BY_LINK` with no name when the GroupInfo has `viaGroupLinkUri`/`preparedGroup`.
+  Other members can't tell a link join from an invitation (no marker in `x.grp.mem.new`): they keep "invited" then
+  "joined".
+- **Row preview:** `/_get chats` gives one newest item per chat; when that is a row we skip (members connecting
+  after our join, feature or profile changes), the list reload looks back up to 3 × 50 items for the newest message
+  or shown service row (`lastMessageText` or `lastEvent`). Cached per chat while its newest item stays the same (new
+  skipped rows move the key along), and event-driven reloads run at most once per 500 ms.
+- **Gone:** `ChatSummary.gone` is true when our membership is over (left, removed, rejected, deleted).
 
 ### Events handled
 
