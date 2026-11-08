@@ -59,6 +59,7 @@ import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.MessageStatus;
 import app.encrogram.core.api.SecuredEngine;
+import app.encrogram.core.api.SecuredEngineKt;
 import app.encrogram.core.api.SecuredError;
 import app.encrogram.core.api.SecuredListener;
 import app.encrogram.core.api.SecuredMessage;
@@ -197,10 +198,15 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         return host == null;
     }
 
+    /** Opens Saved Messages (the user's own notes), from the connect sheet when someone pastes their own invite. */
+    void openSavedMessages() {
+        if (!destroyed) openChat(SecuredEngineKt.SAVED_MESSAGES_CHAT_ID);
+    }
+
     private void openChat(long chatId) {
         final SecuredChatActivity chat = new SecuredChatActivity(chatId);
         if (host != null) {
-            presentFragment(new INavigationLayout.NavigationParams(chat).forceRightLayout());
+            presentFragment(new INavigationLayout.NavigationParams(chat.inRightPane()).forceRightLayout());
         } else {
             presentFragment(chat);
         }
@@ -388,7 +394,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                 if (id >= ID_PIN && id <= ID_READ) onSelectionAction(id);
             }
         });
-        labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet));
+        labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet),
+                org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages));
         final ChatsSwitcherView switcher = new ChatsSwitcherView(context, owner);
         actionBar.addView(switcher, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 48, Gravity.LEFT | Gravity.BOTTOM, 22, 0, 0, 4));
 
@@ -717,7 +724,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         chats.clear();
         chats.addAll(fresh);
         rebuildAndNotify();
-        emptyView.setVisibility(chats.isEmpty() ? View.VISIBLE : View.GONE);
+        // Saved Messages is always listed once a profile exists: the invite/connect hint shows while it is the only chat.
+        boolean onlyNotes = true;
+        for (ChatSummary c : chats) {
+            if (c.getChatId() != SecuredEngineKt.SAVED_MESSAGES_CHAT_ID) onlyNotes = false;
+        }
+        emptyView.setVisibility(onlyNotes ? View.VISIBLE : View.GONE);
         listView.setVisibility(chats.isEmpty() ? View.GONE : View.VISIBLE);
         int unread = 0;
         for (ChatSummary c : chats) {
@@ -741,7 +753,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     }
 
     private boolean matches(ChatSummary c, String q) {
-        final String name = c.getDisplayName();
+        final String name = c.getChatId() == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID && labels != null ? labels.savedMessages : c.getDisplayName();
         final String text = c.getLastMessageText();
         return (name != null && name.toLowerCase(Locale.ROOT).contains(q))
                 || (text != null && text.toLowerCase(Locale.ROOT).contains(q));
@@ -759,7 +771,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         items.clear();
         final Item search = new Item();
         search.type = T_SEARCH;
-        search.id = -1;
+        search.id = Long.MIN_VALUE; // never a chat id (Saved Messages is -1), so stable ids can't collide
         items.add(search);
 
         final String q = query.trim().toLowerCase(Locale.ROOT);
@@ -844,7 +856,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         switch (it.type) {
             case T_CHAT:
                 if (!selected.isEmpty()) {
-                    toggleSelected(it.id, view);
+                    // Saved Messages is never selectable: "Delete chats" must not reach the notes.
+                    if (it.id != SecuredEngineKt.SAVED_MESSAGES_CHAT_ID) toggleSelected(it.id, view);
                 } else {
                     openChat(it.id);
                 }
@@ -863,7 +876,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private boolean onRowLongClick(View view, int position) {
         if (position < 0 || position >= items.size()) return false;
         final Item it = items.get(position);
-        if (it.type != T_CHAT) return false;
+        // Saved Messages has no pin, mute, archive or delete in the list (its history is cleared inside the chat).
+        if (it.type != T_CHAT || it.id == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID) return false;
         view.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
         toggleSelected(it.id, view);
         return true;
@@ -1076,6 +1090,10 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         @Override
         public int getMovementFlags(RecyclerView recyclerView, RecyclerView.ViewHolder viewHolder) {
             if (!selected.isEmpty() || viewHolder.getItemViewType() != T_CHAT || !(viewHolder.itemView instanceof DialogCell)) {
+                return 0;
+            }
+            final int pos = viewHolder.getAdapterPosition();
+            if (pos >= 0 && pos < items.size() && items.get(pos).id == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID) {
                 return 0;
             }
             ((DialogCell) viewHolder.itemView).setSliding(true);

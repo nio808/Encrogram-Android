@@ -147,6 +147,8 @@ public class SecuredChatActivity extends BaseFragment {
     private static final long SEARCH_DEBOUNCE_MS = 300;
 
     private final long chatId;
+    /** Saved Messages: the user's own notes (text only, on this phone). No ticks, replies, reactions or verification. */
+    private final boolean notes;
     private FlagSecureReason flagSecure;
     private final SecuredChatResources chatResources = new SecuredChatResources();
     private SecuredEngine engine;
@@ -217,9 +219,19 @@ public class SecuredChatActivity extends BaseFragment {
 
     private final Runnable hideFloatingDate = () -> showFloatingDate(false);
 
+    private boolean occupyStatusBar = !AndroidUtilities.isTablet();
+
+    /** Called when this chat opens in the tablet's right-hand pane (forceRightLayout). */
+    SecuredChatActivity inRightPane() {
+        occupyStatusBar = true;
+        return this;
+    }
+
     public SecuredChatActivity(long chatId) {
         super();
         this.chatId = chatId;
+        this.notes = chatId == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID;
+        chatResources.setHideTicks(notes);
     }
 
     // ---- engine events ---------------------------------------------------------------------------------------
@@ -331,7 +343,7 @@ public class SecuredChatActivity extends BaseFragment {
         hasOwnBackground = true;
         sharedResources = new ChatMessageSharedResources(context);
         final ChatSummary summary = summary();
-        name = summary != null ? summary.getDisplayName() : "";
+        name = notes ? tg(org.telegram.messenger.R.string.SavedMessages) : summary != null ? summary.getDisplayName() : "";
         selfNameShown = selfName();
         mapper = new SecuredMessageMapper(context, currentAccount);
         mapper.setNames(name, selfNameShown);
@@ -398,8 +410,9 @@ public class SecuredChatActivity extends BaseFragment {
     private void buildHeader(Context context) {
         actionBar.setBackButtonImage(org.telegram.messenger.R.drawable.ic_ab_back);
         actionBar.setAllowOverlayTitle(false);
-        // Tablets: the chat opens in the right-hand pane (forceRightLayout), under no status bar.
-        actionBar.setOccupyStatusBar(!AndroidUtilities.isTablet());
+        // Like ChatActivity: under the status bar on phones and in the tablet's right-hand pane (edge-to-edge there);
+        // not in the tablet's centred floating window (logged out), which has no status bar above it.
+        actionBar.setOccupyStatusBar(occupyStatusBar);
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
             public void onItemClick(int id) {
@@ -432,15 +445,19 @@ public class SecuredChatActivity extends BaseFragment {
 
         // Telegram's header with a null fragment: no profile opening, no stories, no Telegram connection observers.
         avatarContainer = new ChatAvatarContainer(context, null, false, chatResources);
-        avatarContainer.setOccupyStatusBar(!AndroidUtilities.isTablet());
+        avatarContainer.setOccupyStatusBar(occupyStatusBar);
         avatarContainer.setEnabled(false);
         // Right margin leaves room for the two header buttons (search, menu: 2 x 48dp), so taps on them reach them.
         actionBar.addView(avatarContainer, 0, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.TOP | Gravity.LEFT, 56, 0, 100, 0));
         avatarDrawable = new AvatarDrawable(chatResources);
-        avatarContainer.setTitleIcons(new LockMarkDrawable(), null);
-        // Tapping the header opens the security code sheet.
-        avatarContainer.setEnabled(true);
-        avatarContainer.setOnClickListener(v -> openVerify());
+        if (!notes) {
+            avatarContainer.setTitleIcons(new LockMarkDrawable(), null);
+            // Tapping the header opens the security code sheet (a note folder has no contact to verify).
+            avatarContainer.setEnabled(true);
+            avatarContainer.setOnClickListener(v -> openVerify());
+        } else {
+            avatarContainer.setEnabled(false);
+        }
 
         final ActionBarMenu menu = actionBar.createMenu();
         searchItem = menu.addItem(0, org.telegram.messenger.R.drawable.outline_header_search, chatResources)
@@ -469,13 +486,17 @@ public class SecuredChatActivity extends BaseFragment {
         searchItem.setContentDescription(tg(org.telegram.messenger.R.string.Search));
         final ActionBarMenuItem more = menu.addItem(0, org.telegram.messenger.R.drawable.ic_ab_other, chatResources);
         more.setContentDescription(tg(org.telegram.messenger.R.string.AccDescrMoreOptions));
-        muteSubItem = more.addSubItem(MENU_MUTE, org.telegram.messenger.R.drawable.msg_mute, context.getString(R.string.sec_list_mute), chatResources);
-        more.addSubItem(MENU_DISAPPEAR, org.telegram.messenger.R.drawable.msg_autodelete, context.getString(R.string.secchat_disappear), chatResources);
-        more.addSubItem(MENU_VERIFY, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.secchat_verify_menu), chatResources);
+        if (!notes) {
+            muteSubItem = more.addSubItem(MENU_MUTE, org.telegram.messenger.R.drawable.msg_mute, context.getString(R.string.sec_list_mute), chatResources);
+            more.addSubItem(MENU_DISAPPEAR, org.telegram.messenger.R.drawable.msg_autodelete, context.getString(R.string.secchat_disappear), chatResources);
+            more.addSubItem(MENU_VERIFY, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.secchat_verify_menu), chatResources);
+        }
         more.addSubItem(MENU_CLEAR, org.telegram.messenger.R.drawable.msg_clear, context.getString(R.string.secchat_clear_title), chatResources);
-        final ActionBarMenuSubItem deleteChat = more.addSubItem(MENU_DELETE_CHAT, org.telegram.messenger.R.drawable.msg_delete, context.getString(R.string.sec_list_delete_title), chatResources);
-        final int red = chatResources.getColor(Theme.key_text_RedBold);
-        deleteChat.setColors(red, red);
+        if (!notes) {
+            final ActionBarMenuSubItem deleteChat = more.addSubItem(MENU_DELETE_CHAT, org.telegram.messenger.R.drawable.msg_delete, context.getString(R.string.sec_list_delete_title), chatResources);
+            final int red = chatResources.getColor(Theme.key_text_RedBold);
+            deleteChat.setColors(red, red);
+        }
 
         final ActionBarMenu actionMode = actionBar.createActionMode();
         selectedCountView = new NumberTextView(actionMode.getContext());
@@ -505,12 +526,20 @@ public class SecuredChatActivity extends BaseFragment {
         listView.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         adapter = new MessagesAdapter(context);
         listView.setAdapter(adapter);
-        listView.setOnItemClickListener((view, position) -> {
-            final SecuredMessage m = view instanceof ChatMessageCell ? messageAt(position) : null;
-            if (m != null && searching) {
-                openMatch(m);
-            } else if (m != null && !selectedIds.isEmpty()) {
-                toggleSelection(m);
+        listView.setOnItemClickListener(new RecyclerListView.OnItemClickListenerExtended() {
+            @Override
+            public void onItemClick(View view, int position, float x, float y) {
+                if (view instanceof SecuredReactionsView) {
+                    // A tap on a reaction chip (not while selecting or searching): toggles our own reaction.
+                    if (selectedIds.isEmpty() && !searching) ((SecuredReactionsView) view).onTap(x, y);
+                    return;
+                }
+                final SecuredMessage m = view instanceof ChatMessageCell ? messageAt(position) : null;
+                if (m != null && searching) {
+                    openMatch(m);
+                } else if (m != null && !selectedIds.isEmpty()) {
+                    toggleSelection(m);
+                }
             }
         });
         listView.setOnItemLongClickListener((view, position) -> {
@@ -548,7 +577,7 @@ public class SecuredChatActivity extends BaseFragment {
         floatingDateView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         listFrame.addView(floatingDateView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 0, 4, 0, 0));
 
-        emptyView = Kit.text(context, context.getString(R.string.sec_chat_empty), 14, chatResources.getColor(Theme.key_chat_serviceText), false);
+        emptyView = Kit.text(context, context.getString((notes ? R.string.secnotes_empty : R.string.sec_chat_empty)), 14, chatResources.getColor(Theme.key_chat_serviceText), false);
         emptyView.setGravity(Gravity.CENTER);
         emptyView.setPadding(dp(12), dp(6), dp(12), dp(6));
         emptyView.setBackground(Kit.roundRect(chatResources.getColor(Theme.key_chat_serviceBackground), 14));
@@ -611,7 +640,7 @@ public class SecuredChatActivity extends BaseFragment {
         if (avatarContainer == null || destroyed) return;
         final ChatSummary s = summary();
         final Context c = avatarContainer.getContext();
-        final String newName = s != null ? s.getDisplayName() : name;
+        final String newName = notes ? tg(org.telegram.messenger.R.string.SavedMessages) : s != null ? s.getDisplayName() : name;
         final String newSelf = selfName();
         if (!TextUtils.equals(newName, name) || !TextUtils.equals(newSelf, selfNameShown)) {
             name = newName;
@@ -625,15 +654,23 @@ public class SecuredChatActivity extends BaseFragment {
         }
         avatarContainer.setTitle(name);
         // AvatarDrawable takes the initials from first and last name: split at the last space ("Night Test" -> NT).
-        final String shown = name == null ? "" : name.trim();
-        final int sp = shown.lastIndexOf(' ');
-        avatarDrawable.setInfo(chatId, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+        if (notes) {
+            // Telegram's own Saved Messages avatar.
+            avatarDrawable.setAvatarType(AvatarDrawable.AVATAR_TYPE_SAVED);
+        } else {
+            final String shown = name == null ? "" : name.trim();
+            final int sp = shown.lastIndexOf(' ');
+            avatarDrawable.setInfo(chatId, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+        }
         avatarContainer.getAvatarImageView().setImageDrawable(avatarDrawable);
 
         // No last seen, no presence: the subtitle states only what the engine reports.
         final EngineState state = engine != null ? engine.state() : EngineState.FAILED;
         final CharSequence sub;
-        if (state == EngineState.FAILED) {
+        if (notes) {
+            // Notes never touch a relay, so the engine state does not matter for them.
+            sub = c.getString(R.string.secnotes_subtitle);
+        } else if (state == EngineState.FAILED) {
             sub = c.getString(R.string.sec_engine_failed_title);
         } else if (state != EngineState.RUNNING) {
             sub = c.getString(R.string.secchat_connecting);
@@ -698,7 +735,7 @@ public class SecuredChatActivity extends BaseFragment {
         final FrameLayout field = new FrameLayout(context);
         field.setBackground(Kit.roundRect(Kit.color(Theme.key_chat_messagePanelBackground), 22));
         input = new SecuredComposerEditText(context, SecuredResourcesProvider.get());
-        input.setHint(context.getString(R.string.sec_composer_hint));
+        input.setHint(context.getString(notes ? R.string.secnotes_hint : R.string.sec_composer_hint));
         input.setHintTextColor(Kit.color(Theme.key_chat_messagePanelHint));
         input.setTextColor(Kit.color(Theme.key_chat_messagePanelText));
         input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17);
@@ -896,9 +933,37 @@ public class SecuredChatActivity extends BaseFragment {
         BulletinFactory.of(this).createErrorBulletin(c.getString(R.string.secchat_action_failed, reason), chatResources).show();
     }
 
+    /**
+     * One reaction per person, like Telegram (the SimpleX core allows 3). Choosing a different reaction first removes
+     * our existing ones, then adds the new one; choosing the one we already have removes it. The engine runs item
+     * actions in the order we send them. Reactions that peers' apps send (several per person) are shown as they arrive.
+     */
     private void react(SecuredMessage m, String emoji, boolean add) {
-        if (m == null || m.getDeleted()) return;
-        itemAction(Collections.singletonList(m.getMessageId()), new ItemAction.React(emoji, add), null);
+        if (m == null || m.getDeleted() || notes) return;
+        final int idx = indexOf(m.getMessageId());
+        final SecuredMessage cur = idx >= 0 ? messages.get(idx) : m;
+        final List<Long> id = Collections.singletonList(cur.getMessageId());
+        boolean hadSame = false;
+        final ArrayList<String> others = new ArrayList<>();
+        for (ReactionCount r : cur.getReactions()) {
+            if (!r.getMine()) continue;
+            if (r.getEmoji().equals(emoji)) hadSame = true;
+            else others.add(r.getEmoji());
+        }
+        if (!add) {
+            // Removing: only what we really have.
+            if (hadSame) itemAction(id, new ItemAction.React(emoji, false), null);
+            return;
+        }
+        if (hadSame && others.isEmpty()) {
+            // The tap meant "add" from a stale chip, but we already have exactly this one: toggle it off, as Telegram does.
+            itemAction(id, new ItemAction.React(emoji, false), null);
+            return;
+        }
+        for (String old : others) {
+            itemAction(id, new ItemAction.React(old, false), null);
+        }
+        if (!hadSame) itemAction(id, new ItemAction.React(emoji, true), null);
     }
 
     private final SecuredReactionsView.Listener reactionListener = this::react;
@@ -929,7 +994,11 @@ public class SecuredChatActivity extends BaseFragment {
         final ArrayList<ChatSummary> targets = new ArrayList<>();
         try {
             for (ChatSummary c : engine.chats()) {
-                if (c.getChatId() != chatId && c.getReady()) targets.add(c);
+                if (c.getChatId() == chatId) continue;
+                final boolean saved = c.getChatId() == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID;
+                // Saved Messages is first, as in Telegram's share list.
+                if (saved) targets.add(0, c);
+                else if (c.getReady()) targets.add(c);
             }
         } catch (Throwable ignore) {
         }
@@ -939,7 +1008,7 @@ public class SecuredChatActivity extends BaseFragment {
         }
         final CharSequence[] names = new CharSequence[targets.size()];
         for (int i = 0; i < targets.size(); i++) {
-            names[i] = targets.get(i).getDisplayName();
+            names[i] = targetName(targets.get(i));
         }
         final BottomSheet.Builder builder = new BottomSheet.Builder(activity, false, chatResources);
         builder.setTitle(tg(org.telegram.messenger.R.string.ForwardTo));
@@ -952,6 +1021,11 @@ public class SecuredChatActivity extends BaseFragment {
         showDialog(builder.create());
     }
 
+    /** Saved Messages has no name from the engine: Telegram's own localized string. */
+    private String targetName(ChatSummary c) {
+        return c.getChatId() == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID ? tg(org.telegram.messenger.R.string.SavedMessages) : c.getDisplayName();
+    }
+
     private void forward(List<Long> ids, ChatSummary target) {
         if (engine == null) return;
         try {
@@ -961,7 +1035,7 @@ public class SecuredChatActivity extends BaseFragment {
                 if (result instanceof SecuredResult.Ok) {
                     if (c != null) {
                         BulletinFactory.of(this).createSimpleBulletin(org.telegram.messenger.R.raw.forward,
-                                c.getString(R.string.secchat_forwarded_to, target.getDisplayName())).show();
+                                c.getString(R.string.secchat_forwarded_to, targetName(target))).show();
                     }
                 } else {
                     showError(((SecuredResult.Err) result).getError());
@@ -1143,11 +1217,11 @@ public class SecuredChatActivity extends BaseFragment {
         final boolean deleted = m.getDeleted();
         final boolean ready = chatReady();
         final ItemOptions options = ItemOptions.makeOptions(this, cell);
-        if (!deleted && ready) {
+        if (!deleted && ready && !notes) {
             options.addView(buildReactionPicker(m, options));
             options.addGap();
         }
-        options.addIf(!deleted && ready, org.telegram.messenger.R.drawable.menu_reply, tg(org.telegram.messenger.R.string.Reply), () -> startReply(m));
+        options.addIf(!deleted && ready && !notes, org.telegram.messenger.R.drawable.menu_reply, tg(org.telegram.messenger.R.string.Reply), () -> startReply(m));
         options.addIf(!deleted, org.telegram.messenger.R.drawable.msg_copy, tg(org.telegram.messenger.R.string.Copy), () -> copyMessages(Collections.singletonList(m)));
         options.addIf(!deleted && m.getCanEdit(), org.telegram.messenger.R.drawable.msg_edit, tg(org.telegram.messenger.R.string.Edit), () -> startEdit(m));
         options.addIf(!deleted && ready, org.telegram.messenger.R.drawable.msg_forward, tg(org.telegram.messenger.R.string.Forward), () -> pickForwardTarget(Collections.singletonList(m)));
@@ -1446,7 +1520,7 @@ public class SecuredChatActivity extends BaseFragment {
         if (activity == null) return;
         final AlertDialog.Builder b = new AlertDialog.Builder(activity, chatResources);
         b.setTitle(activity.getString(R.string.secchat_clear_title));
-        b.setMessage(activity.getString(R.string.secchat_clear_text, name));
+        b.setMessage(notes ? activity.getString(R.string.secnotes_clear_text) : activity.getString(R.string.secchat_clear_text, name));
         b.setNegativeButton(activity.getString(R.string.sec_list_cancel), null);
         b.setPositiveButton(activity.getString(R.string.secchat_clear_confirm), (d, w) -> chatAction(ChatAction.ClearHistory.INSTANCE, () -> {
             // The engine reports the new list state; the open window is emptied here too.
@@ -1496,7 +1570,7 @@ public class SecuredChatActivity extends BaseFragment {
         clearSelection();
         if (avatarContainer != null) avatarContainer.setVisibility(View.GONE);
         if (composerView != null) composerView.setVisibility(View.GONE);
-        if (emptyView != null) emptyView.setText(R.string.sec_chat_empty);
+        if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
         updateJumpButton(false);
     }
@@ -1510,7 +1584,7 @@ public class SecuredChatActivity extends BaseFragment {
         searchResults.clear();
         if (avatarContainer != null) avatarContainer.setVisibility(View.VISIBLE);
         if (composerView != null) composerView.setVisibility(View.VISIBLE);
-        if (emptyView != null) emptyView.setText(R.string.sec_chat_empty);
+        if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
         final Long jump = pendingJump;
         pendingJump = null;
@@ -1640,7 +1714,7 @@ public class SecuredChatActivity extends BaseFragment {
                     }
                     return;
                 }
-                if (emptyView != null) emptyView.setText(emptyView.getContext().getString(R.string.sec_chat_empty));
+                if (emptyView != null) emptyView.setText(emptyView.getContext().getString((notes ? R.string.secnotes_empty : R.string.sec_chat_empty)));
                 final List<SecuredMessage> page = ((SecuredResult.Ok<List<SecuredMessage>>) result).getValue();
                 // Keep anything that arrived live while the first page was loading.
                 final ArrayList<SecuredMessage> early = new ArrayList<>(messages);
@@ -1825,7 +1899,7 @@ public class SecuredChatActivity extends BaseFragment {
                 lastDay = day;
             }
             next.add(new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec));
-            if (!m.getDeleted() && !m.getReactions().isEmpty()) {
+            if (!notes && !m.getDeleted() && !m.getReactions().isEmpty()) {
                 next.add(new Row(ROW_REACTIONS, m.getMessageId() * 4 + 2, m, sec));
             }
         }
@@ -2076,7 +2150,7 @@ public class SecuredChatActivity extends BaseFragment {
         public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
             final View view;
             if (viewType == VIEW_MESSAGE) {
-                final ChatMessageCell cell = new ChatMessageCell(context, currentAccount, false, sharedResources, chatResources);
+                final ChatMessageCell cell = new SecuredMessageCell(context, currentAccount, sharedResources, chatResources);
                 cell.setDelegate(cellDelegate);
                 cell.setFullyDraw(true);
                 cell.isChat = false;
@@ -2099,6 +2173,9 @@ public class SecuredChatActivity extends BaseFragment {
             if (view instanceof ChatMessageCell) {
                 final ChatMessageCell cell = (ChatMessageCell) view;
                 cell.setSlidingOffset(0);
+                if (cell instanceof SecuredMessageCell) {
+                    ((SecuredMessageCell) cell).setSecuredStatus(r.message.getOutgoing() ? r.message.getStatus() : null, notes);
+                }
                 cell.setMessageObject(objectFor(r.message), null, r.pinnedBottom, r.pinnedTop, false);
                 final boolean selecting = !selectedIds.isEmpty();
                 final boolean sel = selectedIds.contains(r.message.getMessageId());
@@ -2130,7 +2207,7 @@ public class SecuredChatActivity extends BaseFragment {
         }
 
         private boolean canSwipe(ChatMessageCell cell) {
-            if (searching || !selectedIds.isEmpty() || editing != null || !chatReady()) return false;
+            if (notes || searching || !selectedIds.isEmpty() || editing != null || !chatReady()) return false;
             final SecuredMessage m = messageFor(cell);
             return m != null && !m.getDeleted();
         }

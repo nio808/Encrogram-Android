@@ -251,7 +251,7 @@ public class EncrogramChatsHost extends ViewPagerActivity implements MainTabsAct
         selectNetwork(POSITION_SECURED);
         if (chatId != SecuredUi.NO_CHAT) {
             // Same call as a tap on a row of the Secured list: right-hand pane on tablets.
-            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId)).forceRightLayout());
+            presentFragment(new INavigationLayout.NavigationParams(new SecuredChatActivity(chatId).inRightPane()).forceRightLayout());
         }
     }
 

@@ -21,7 +21,13 @@ import app.encrogram.core.api.SecuredMessage;
  * The small row of reaction counts under a Secured bubble ("👍 2"). Our own view (reuse level 4), deliberately
  * not Telegram's ReactionsLayoutInBubble, which resolves reaction icons through MediaDataController and loads
  * them from Telegram's servers. Emoji are drawn from the app's bundled emoji pack (Emoji.replaceEmoji, assets
- * only). Tapping a chip toggles our own reaction through the listener.
+ * only).
+ * <p>
+ * Taps: the chips are deliberately NOT clickable views. The row is a RecyclerListView item, and Telegram's list
+ * delivers a tap on a non-clickable item through its own item-click pipeline ({@code OnItemClickListenerExtended},
+ * with the touch position), the same path that already works for message bubbles. Chips with their own click
+ * listeners relied on the touch falling through that pipeline to the child, which did not happen on a device.
+ * {@link #onTap} turns the position into a chip and toggles our own reaction through the listener.
  */
 final class SecuredReactionsView extends LinearLayout {
 
@@ -30,6 +36,8 @@ final class SecuredReactionsView extends LinearLayout {
     }
 
     private final Theme.ResourcesProvider resourcesProvider;
+    private SecuredMessage bound;
+    private Listener listener;
 
     SecuredReactionsView(Context context, Theme.ResourcesProvider resourcesProvider) {
         super(context);
@@ -39,6 +47,8 @@ final class SecuredReactionsView extends LinearLayout {
     }
 
     void bind(SecuredMessage message, Listener listener) {
+        this.bound = message;
+        this.listener = listener;
         removeAllViews();
         setGravity((message.getOutgoing() ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);
         final List<ReactionCount> reactions = message.getReactions();
@@ -46,11 +56,45 @@ final class SecuredReactionsView extends LinearLayout {
             final ReactionCount r = reactions.get(i);
             if (r.getCount() <= 0) continue;
             final TextView chip = chip(r);
-            chip.setOnClickListener(v -> {
-                if (listener != null) listener.onToggleReaction(message, r.getEmoji(), !r.getMine());
+            chip.setTag(r);
+            // Taps arrive through the list (onTap); TalkBack, Switch Access and Voice Access get a click action here.
+            chip.setAccessibilityDelegate(new AccessibilityDelegate() {
+                @Override
+                public void onInitializeAccessibilityNodeInfo(android.view.View host, android.view.accessibility.AccessibilityNodeInfo info) {
+                    super.onInitializeAccessibilityNodeInfo(host, info);
+                    info.addAction(android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK);
+                }
+
+                @Override
+                public boolean performAccessibilityAction(android.view.View host, int action, android.os.Bundle args) {
+                    if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK && listener != null && bound != null) {
+                        listener.onToggleReaction(bound, r.getEmoji(), !r.getMine());
+                        return true;
+                    }
+                    return super.performAccessibilityAction(host, action, args);
+                }
             });
+            chip.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
             addView(chip, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, 26, 0, 0, 4, 0));
         }
+    }
+
+    /**
+     * A tap at (x, y) in this row's own coordinates. The hit box is the chip widened by 6 dp on each side and the
+     * full row height, so a finger does not have to land on the 26 dp pill exactly. Returns true when a chip took it.
+     */
+    boolean onTap(float x, float y) {
+        if (bound == null || listener == null) return false;
+        final int slop = dp(6);
+        for (int i = 0; i < getChildCount(); i++) {
+            final android.view.View chip = getChildAt(i);
+            if (x >= chip.getLeft() - slop && x <= chip.getRight() + slop && chip.getTag() instanceof ReactionCount) {
+                final ReactionCount r = (ReactionCount) chip.getTag();
+                listener.onToggleReaction(bound, r.getEmoji(), !r.getMine());
+                return true;
+            }
+        }
+        return false;
     }
 
     private TextView chip(ReactionCount r) {

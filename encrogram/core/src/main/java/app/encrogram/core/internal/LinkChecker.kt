@@ -17,6 +17,10 @@ import java.util.Locale
  * Every host found (link host, `h=` hosts, and each SMP queue's server hosts including `srv=`) must be in the
  * allowlist; the first one that is not is reported as [LinkCheck.UnapprovedRelay]. Group, channel and relay
  * links (`/g`, `/c`, `/r`) are not supported in the MVP and are reported as [LinkCheck.Malformed].
+ *
+ * Compact links: our own invites drop the `?p=<port>&c=<keyHash>` that names our relay ([compact]); [expand] puts
+ * it back for a bare short link on one of our relays before [analyze] and before the link reaches the core, in
+ * the same way SimpleX's shortenShortLink/restoreShortLink do for its preset servers.
  */
 internal object LinkChecker {
 
@@ -80,6 +84,83 @@ internal object LinkChecker {
 
     /** Fingerprints compare as unpadded base64url. */
     private fun fpKey(fp: String): String = fp.trimEnd('=').replace('+', '-').replace('/', '_')
+
+    // ---- compact short links for our own relay ---------------------------------------------------------------
+
+    /**
+     * One of our SMP relays as the core writes it into a short link's query (simplexmq `slEncode`): its single
+     * host, its port text exactly as configured ("" = scheme default, then the core writes no `p=`) and its key
+     * hash as unpadded base64url. Relays with several hosts are left out: their links carry `h=` and stay full.
+     */
+    private class LinkRelay(val host: String, val port: String, val keyHash: String) {
+        /** The query the core appends for this relay: `?p=<port>&c=<keyHash>`, or `?c=<keyHash>` without a port. */
+        val query: String get() = if (port.isEmpty()) "?c=$keyHash" else "?p=$port&c=$keyHash"
+    }
+
+    private fun linkRelays(smpServers: List<String>): List<LinkRelay> = smpServers.mapNotNull { a ->
+        val sa = ServerAddress.parse(a)?.takeIf { it.scheme == "smp" && it.hosts.size == 1 } ?: return@mapNotNull null
+        val kh = fpKey(sa.keyHash)
+        if (kh.isEmpty() || !kh.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' || it == '_' }) return@mapNotNull null
+        LinkRelay(sa.hosts[0], sa.port, kh)
+    }
+
+    /** The relay a host names, only when exactly one of ours has it as its single host. */
+    private fun relayFor(host: String, smpServers: List<String>): LinkRelay? =
+        linkRelays(smpServers).filter { it.host == host }.singleOrNull()
+
+    /** A short https link split into its parts: `https://<host>/<path>#<main>[?<query>]`. */
+    private class ShortParts(val host: String, val beforeQuery: String, val query: String?)
+
+    private fun shortParts(link: String): ShortParts? {
+        if (!link.startsWith("https://", ignoreCase = true)) return null
+        val rest = link.substring("https://".length)
+        val authorityEnd = rest.indexOfFirst { it == '/' || it == '?' || it == '#' }
+        if (authorityEnd <= 0) return null
+        val authority = rest.substring(0, authorityEnd)
+        if (authority.contains('@') || authority.contains(':')) return null
+        val host = ServerAddress.normalizeHost(authority)
+        if (!ServerAddress.isValidHost(host)) return null
+        val tail = rest.substring(authorityEnd)
+        if (!tail.startsWith("/")) return null
+        val hash = tail.indexOf('#')
+        if (hash < 0) return null
+        val kind = kindOf(tail.substring(1, hash).removeSuffix("/"))
+        if (kind != Kind.SHORT_INVITATION && kind != Kind.SHORT_CONTACT) return null
+        val q = tail.indexOf('?', hash)
+        val cut = "https://".length + authorityEnd + (if (q >= 0) q else tail.length)
+        return ShortParts(host, link.substring(0, cut), if (q >= 0) tail.substring(q + 1) else null)
+    }
+
+    /**
+     * Shortens a short link the core made on our relay (`https://<host>/i#<id>/<key>?p=<port>&c=<keyHash>`) to
+     * `https://<host>/i#<id>/<key>` when the query names exactly that relay: same single host, same port text and
+     * same key hash, nothing else. Anything else (full links, `simplex:` links, other hosts, `h=` or extra
+     * parameters) comes back unchanged. The result always [expand]s back to exactly [link].
+     */
+    fun compact(link: String, smpServers: List<String>): String {
+        val parts = shortParts(link) ?: return link
+        val query = parts.query ?: return link
+        val params = parseQuery(query) ?: return link
+        if ((params.keys - setOf("p", "c")).isNotEmpty() || "c" !in params) return link
+        val relay = relayFor(parts.host, smpServers) ?: return link
+        if ((params["p"] ?: "") != relay.port || fpKey(params.getValue("c")) != relay.keyHash) return link
+        val short = parts.beforeQuery
+        return if (expand(short, smpServers) == link) short else link
+    }
+
+    /**
+     * The other way: a short https link on one of our relays with no query at all gets that relay's canonical
+     * `?p=<port>&c=<keyHash>` back (no `p=` when the relay is configured without a port, as the core writes it), so
+     * the core connects to our relay with its key pinned. Every other link comes back unchanged (only trimmed when
+     * expanded). The result still goes through [analyze]: expanding never approves a link on its own.
+     */
+    fun expand(link: String, smpServers: List<String>): String {
+        val s = link.trim()
+        val parts = shortParts(s) ?: return link
+        if (parts.query != null) return link
+        val relay = relayFor(parts.host, smpServers) ?: return link
+        return s + relay.query
+    }
 
     /** Returns (endpoints, normalized link) or null if malformed. [rest] follows "https://". */
     private fun parseHttps(rest: String): Pair<List<Endpoint>, String>? {

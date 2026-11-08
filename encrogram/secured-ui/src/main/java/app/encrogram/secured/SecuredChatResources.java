@@ -30,6 +30,63 @@ final class SecuredChatResources implements Theme.ResourcesProvider {
     private final OutlineIcon halfCheck = new OutlineIcon(Theme.key_drawable_msgOutHalfCheck, Theme.key_chat_outSentCheckRead);
     private final OutlineIcon halfCheckSelected = new OutlineIcon(Theme.key_drawable_msgOutHalfCheckSelected, Theme.key_chat_outSentCheckReadSelected);
 
+    private boolean hideTicks;
+    private final java.util.HashMap<String, Drawable> blanks = new java.util.HashMap<>();
+
+    /**
+     * Saved Messages: no delivery marks at all. The cell still reserves the room for ticks and asks this provider
+     * for them, so each tick key gets an invisible drawable of the same size (reuse level 2: provider-supplied).
+     */
+    void setHideTicks(boolean hide) {
+        hideTicks = hide;
+    }
+
+    private Drawable blankLike(String key) {
+        Drawable d = blanks.get(key);
+        if (d == null) {
+            final Drawable global = Theme.getThemeDrawable(key);
+            d = new BlankDrawable(global != null ? global.getIntrinsicWidth() : 0, global != null ? global.getIntrinsicHeight() : 0);
+            blanks.put(key, d);
+        }
+        return d;
+    }
+
+    private static final class BlankDrawable extends Drawable {
+        private final int w, h;
+
+        BlankDrawable(int w, int h) {
+            this.w = w;
+            this.h = h;
+        }
+
+        @Override
+        public int getIntrinsicWidth() {
+            return w;
+        }
+
+        @Override
+        public int getIntrinsicHeight() {
+            return h;
+        }
+
+        @Override
+        public void draw(android.graphics.Canvas canvas) {
+        }
+
+        @Override
+        public void setAlpha(int alpha) {
+        }
+
+        @Override
+        public void setColorFilter(android.graphics.ColorFilter colorFilter) {
+        }
+
+        @Override
+        public int getOpacity() {
+            return android.graphics.PixelFormat.TRANSPARENT;
+        }
+    }
+
     @Override
     public int getColor(int key) {
         if (key == Theme.key_chat_outBubbleGradient1 || key == Theme.key_chat_outBubbleGradient2
@@ -50,6 +107,11 @@ final class SecuredChatResources implements Theme.ResourcesProvider {
 
     @Override
     public Drawable getDrawable(String key) {
+        if (hideTicks && (Theme.key_drawable_msgOutCheck.equals(key) || Theme.key_drawable_msgOutCheckSelected.equals(key)
+                || Theme.key_drawable_msgOutCheckRead.equals(key) || Theme.key_drawable_msgOutCheckReadSelected.equals(key)
+                || Theme.key_drawable_msgOutHalfCheck.equals(key) || Theme.key_drawable_msgOutHalfCheckSelected.equals(key))) {
+            return blankLike(key);
+        }
         if (Theme.key_drawable_msgOut.equals(key)) {
             if (msgOut == null) msgOut = new MessageDrawable(MessageDrawable.TYPE_TEXT, true, false, this);
             return msgOut;

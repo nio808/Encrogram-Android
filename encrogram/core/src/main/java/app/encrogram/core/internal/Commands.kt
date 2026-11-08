@@ -5,6 +5,22 @@ import org.json.JSONObject
 import java.util.Locale
 
 /**
+ * A chat in API commands (Commands.hs chatRefP / chatTypeP): `@<contactId>` for a contact, `*<noteFolderId>` for
+ * the local note folder (Saved Messages). Only built through [contact] and [notes], so it is always one of the two.
+ */
+internal class ChatRef private constructor(private val text: String) {
+    val isNotes: Boolean get() = text.startsWith('*')
+    override fun toString(): String = text
+    override fun equals(other: Any?): Boolean = other is ChatRef && other.text == text
+    override fun hashCode(): Int = text.hashCode()
+
+    companion object {
+        fun contact(contactId: Long): ChatRef = ChatRef("@$contactId")
+        fun notes(noteFolderId: Long): ChatRef = ChatRef("*$noteFolderId")
+    }
+}
+
+/**
  * Engine command strings (CLI syntax with embedded JSON) for chat core 7.0.0.12.
  * Syntax verified against src/Simplex/Chat/Library/Commands.hs (chatCommandP) and bots/api/COMMANDS.md.
  *
@@ -89,6 +105,16 @@ internal object Commands {
         afterId: Long? = null,
         aroundId: Long? = null,
         search: String? = null,
+    ): String = getChat(ChatRef.contact(contactId), count, beforeId, afterId, aroundId, search)
+
+    /** [getChat] for any chat, including the note folder (`/_get chat *<id> ...`, getLocalChat: same pagination and search). */
+    fun getChat(
+        chat: ChatRef,
+        count: Int,
+        beforeId: Long? = null,
+        afterId: Long? = null,
+        aroundId: Long? = null,
+        search: String? = null,
     ): String {
         require(listOfNotNull(beforeId, afterId, aroundId).size <= 1) { "one cursor at most" }
         val pagination = when {
@@ -97,7 +123,7 @@ internal object Commands {
             aroundId != null -> "around=$aroundId count=$count"
             else -> "count=$count"
         }
-        val cmd = "/_get chat @$contactId $pagination"
+        val cmd = "/_get chat $chat $pagination"
         if (search == null) return cmd
         require(search.isNotEmpty() && search == InputRules.searchQuery(search)) { "search must be sanitised first" }
         return "$cmd search=$search"
@@ -117,6 +143,17 @@ internal object Commands {
     }
 
     /**
+     * APIConnectPlan (`/_connect plan <userId> <link>`, resolve mode default "unknown") -> `connectionPlan`
+     * {connLink, connectionPlan: {type: invitationLink, invitationLinkPlan: {type: ok | ownLink | connecting | known}}
+     * | {type: contactAddress, contactAddressPlan: {...}} | ...}. Never connects. A short link not known locally is
+     * read from its relay (our relay: [link] must be checked first). Unparseable link: error `invalidConnReq`.
+     */
+    fun connectPlan(userId: Long, link: String): String {
+        require(link.isNotEmpty() && link.all { it.code in 0x21..0x7E }) { "link must be checked first" }
+        return "/_connect plan $userId $link"
+    }
+
+    /**
      * APISendMessages to a contact -> `newChatItems`. With [quotedItemId] the message is a reply; the core copies
      * the quoted item's content into the message itself. Per-message ttl stays default: the contact's timer applies.
      */
@@ -127,20 +164,38 @@ internal object Commands {
         return "/_send @$contactId json " + asciiJson(JSONArray().put(composed).toString())
     }
 
+    /**
+     * APICreateChatItems: a text note in the local note folder (Saved Messages) -> `newChatItems` (chatInfo
+     * `local`, chatDir `localSnd`). Stored on this device only; nothing is sent. The core refuses quotes and
+     * mentions here, so neither is ever included.
+     */
+    fun createNote(noteFolderId: Long, text: String): String {
+        val msgContent = JSONObject().put("type", "text").put("text", text)
+        val composed = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
+        return "/_create *$noteFolderId json " + asciiJson(JSONArray().put(composed).toString())
+    }
+
     /** APIUpdateChatItem -> `chatItemUpdated` | `chatItemNotChanged`; error `invalidChatItemUpdate` when not editable. */
-    fun updateItem(contactId: Long, itemId: Long, text: String): String {
+    fun updateItem(contactId: Long, itemId: Long, text: String): String = updateItem(ChatRef.contact(contactId), itemId, text)
+
+    /** [updateItem] for any chat. For a note (`*<id>`) the core edits it locally, with no time limit. */
+    fun updateItem(chat: ChatRef, itemId: Long, text: String): String {
         val msgContent = JSONObject().put("type", "text").put("text", text)
         val updated = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
-        return "/_update item @$contactId $itemId live=off json " + asciiJson(updated.toString())
+        return "/_update item $chat $itemId live=off json " + asciiJson(updated.toString())
     }
 
     /** CIDeleteMode for [deleteItems]: `internal` (for me), `broadcast` (for everyone). */
     enum class DeleteMode(val word: String) { INTERNAL("internal"), BROADCAST("broadcast") }
 
     /** APIDeleteChatItem -> `chatItemsDeleted`. `broadcast` errors with `invalidChatItemDelete` when not allowed. */
-    fun deleteItems(contactId: Long, itemIds: List<Long>, mode: DeleteMode): String {
+    fun deleteItems(contactId: Long, itemIds: List<Long>, mode: DeleteMode): String =
+        deleteItems(ChatRef.contact(contactId), itemIds, mode)
+
+    /** [deleteItems] for any chat. Notes are always removed locally (deleteLocalCIs ignores the mode). */
+    fun deleteItems(chat: ChatRef, itemIds: List<Long>, mode: DeleteMode): String {
         require(itemIds.isNotEmpty()) { "no items" }
-        return "/_delete item @$contactId ${itemIds.joinToString(",")} ${mode.word}"
+        return "/_delete item $chat ${itemIds.joinToString(",")} ${mode.word}"
     }
 
     /** APIChatItemReaction -> `chatItemReaction`. [emoji] must pass [InputRules.reactionAllowed]. */
@@ -151,16 +206,26 @@ internal object Commands {
     }
 
     /** APIForwardChatItems -> `newChatItems` for the destination (empty when nothing could be forwarded). */
-    fun forward(toContactId: Long, fromContactId: Long, itemIds: List<Long>): String {
+    fun forward(toContactId: Long, fromContactId: Long, itemIds: List<Long>): String =
+        forward(ChatRef.contact(toContactId), ChatRef.contact(fromContactId), itemIds)
+
+    /**
+     * [forward] between any two chats: `/_forward <to> <from> <ids> ttl=default` (both chatRefP). Into the note
+     * folder the core stores local copies (createNoteFolderContentItems, ttl ignored); out of it, it sends them.
+     */
+    fun forward(to: ChatRef, from: ChatRef, itemIds: List<Long>): String {
         require(itemIds.isNotEmpty()) { "no items" }
-        return "/_forward @$toContactId @$fromContactId ${itemIds.joinToString(",")} ttl=default"
+        return "/_forward $to $from ${itemIds.joinToString(",")} ttl=default"
     }
 
     /** APISetChatSettings -> `cmdOk`. [settings] is the WHOLE ChatSettings: build it with [CoreJson.chatSettingsUpdate]. */
     fun chatSettings(contactId: Long, settings: JSONObject): String = "/_settings @$contactId " + asciiJson(settings.toString())
 
     /** APIClearChat -> `chatCleared`. Local only: nothing is sent to the contact. */
-    fun clearChat(contactId: Long): String = "/_clear chat @$contactId"
+    fun clearChat(contactId: Long): String = clearChat(ChatRef.contact(contactId))
+
+    /** [clearChat] for any chat; for the note folder it deletes every note (and its files) on this device. */
+    fun clearChat(chat: ChatRef): String = "/_clear chat $chat"
 
     /** APIDeleteChat, full -> `contactDeleted`. notify=on first tells the contact (x.directDel). */
     fun deleteContact(contactId: Long, notify: Boolean): String =

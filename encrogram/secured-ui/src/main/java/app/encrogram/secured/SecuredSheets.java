@@ -30,6 +30,7 @@ import org.telegram.ui.LaunchActivity;
 
 import app.encrogram.core.api.LinkCheck;
 import app.encrogram.core.api.SecuredEngine;
+import app.encrogram.core.api.SecuredEngineKt;
 import app.encrogram.core.api.SecuredError;
 import app.encrogram.core.api.SecuredInvite;
 import app.encrogram.core.api.SecuredResult;
@@ -214,6 +215,10 @@ final class SecuredSheets {
                     // Sheet closed before the result arrived: never drop a failure silently.
                     if (result instanceof SecuredResult.Err && appContext != null) {
                         final SecuredError late = ((SecuredResult.Err) result).getError();
+                        if (late.getKind() == SecuredError.Kind.OWN_LINK) {
+                            Toast.makeText(appContext, late.getMessage(), Toast.LENGTH_LONG).show();
+                            return;
+                        }
                         Toast.makeText(appContext, appContext.getString(R.string.sec_connect_failed, late.getMessage()), Toast.LENGTH_LONG).show();
                     }
                     return;
@@ -225,6 +230,17 @@ final class SecuredSheets {
                     connect.setEnabled(true);
                     connect.setText(R.string.sec_connect);
                     final SecuredError e = ((SecuredResult.Err) result).getError();
+                    if (e.getKind() == SecuredError.Kind.OWN_LINK) {
+                        // Our own invite: say so, then go to Saved Messages (notes to yourself).
+                        sheet.dismiss();
+                        Toast.makeText(context, e.getMessage(), Toast.LENGTH_LONG).show();
+                        if (fragment instanceof SecuredDialogsActivity) {
+                            ((SecuredDialogsActivity) fragment).openSavedMessages();
+                        } else {
+                            fragment.presentFragment(new SecuredChatActivity(SecuredEngineKt.SAVED_MESSAGES_CHAT_ID));
+                        }
+                        return;
+                    }
                     showError(error, context.getString(R.string.sec_connect_failed, e.getMessage()));
                 }
             });

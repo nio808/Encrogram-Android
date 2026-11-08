@@ -18,6 +18,7 @@ import androidx.annotation.Nullable;
 import org.telegram.messenger.UserConfig;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.DialogCell;
+import org.telegram.ui.Components.AvatarDrawable;
 
 /**
  * Telegram's own chat-list row, driven only through DialogCell.CustomDialog (reuse level 2: a subclass, no upstream
@@ -35,6 +36,8 @@ final class SecuredDialogCell extends DialogCell {
 
     private ChatRowMapper.Tick tick = ChatRowMapper.Tick.NONE;
     private boolean lock = true;
+    private boolean saved;
+    private AvatarDrawable savedAvatar;
     private int unread;
     private final Paint badgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint badgeMark = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -53,7 +56,8 @@ final class SecuredDialogCell extends DialogCell {
     /** Binds a chat row. {@code lockBadge} is false for the "Archived chats" row. */
     void bind(ChatRowMapper.Row row, boolean inArchive, boolean lockBadge) {
         tick = row.tick;
-        lock = lockBadge;
+        saved = row.saved;
+        lock = lockBadge && !row.saved;
         unread = row.unread;
         setArchiveSwipe(inArchive);
         setDialog(ChatRowMapper.toCustomDialog(row));
@@ -75,6 +79,23 @@ final class SecuredDialogCell extends DialogCell {
             overrideSwipeActionStringId = org.telegram.messenger.R.string.Archive;
             overrideSwipeActionDrawable = Theme.dialogs_archiveDrawable;
         }
+    }
+
+    /**
+     * DialogCell sets its (private) avatar from the CustomDialog on every update; for Saved Messages we then put
+     * Telegram's own saved-messages avatar (AvatarDrawable AVATAR_TYPE_SAVED) in its public ImageReceiver.
+     */
+    @Override
+    public boolean update(int mask, boolean animated) {
+        final boolean result = super.update(mask, animated);
+        if (saved) {
+            if (savedAvatar == null) {
+                savedAvatar = new AvatarDrawable(SecuredResourcesProvider.get());
+                savedAvatar.setAvatarType(AvatarDrawable.AVATAR_TYPE_SAVED);
+            }
+            avatarImage.setImage(null, "50_50", savedAvatar, null, 0);
+        }
+        return result;
     }
 
     @Override

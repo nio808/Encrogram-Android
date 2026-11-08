@@ -165,4 +165,19 @@ class CoreJsonTest {
         assertEquals(0L, CoreJson.timeMs("yesterday"))
         assertEquals(1_000L, CoreJson.timeMs("1970-01-01T00:00:01Z"))
     }
+
+    @Test
+    fun commandErrorKeepsOnlyKnownReactionTags() {
+        fun err(message: String) = CoreJson.parseError(
+            org.json.JSONObject().put("type", "error")
+                .put("errorType", org.json.JSONObject().put("type", "commandError").put("message", message))
+        )
+        assertEquals("reactionAlreadyRemoved", err("reaction already removed").subDetail)
+        assertEquals("reactionAlreadyAdded", err("reaction already added").subDetail)
+        assertEquals("tooManyReactions", err("too many reactions").subDetail)
+        assertEquals("commandError", err("too many reactions").detail)
+        // Any other text never becomes a tag.
+        assertNull(err("secret text from somewhere").subDetail)
+        assertEquals("error.commandError", err("secret text from somewhere").tag)
+    }
 }

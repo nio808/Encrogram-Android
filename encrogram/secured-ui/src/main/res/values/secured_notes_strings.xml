@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Saved Messages (notes to yourself) and the spoken delivery status of Secured bubbles. -->
+<resources>
+    <string name="secnotes_subtitle">Only on this phone</string>
+    <string name="secnotes_empty">Keep notes to yourself here. They stay on this phone and are never sent.</string>
+    <string name="secnotes_hint">Note</string>
+    <string name="secnotes_clear_text">All saved messages are removed from this phone. Nothing is sent to anyone.</string>
+    <string name="secchat_status_delivered">Delivered</string>
+    <string name="secchat_status_sent">Sent to server</string>
+    <string name="secchat_status_sending">Sending</string>
+    <string name="secchat_status_failed">Failed to send</string>
+</resources>

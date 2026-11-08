@@ -22,6 +22,8 @@ internal object ErrorMapper {
     const val CANT_REACT = "This reaction can't be used here."
     const val CANT_REPLY = "This message can't be replied to."
     const val STORAGE = "Secured storage couldn't be written. Try again."
+    const val OWN_LINK = "This is your own invite link. Notes to yourself go in Saved Messages."
+    const val NOT_IN_SAVED = "This isn't available in Saved Messages."
 
     enum class Op { START, PROFILE, INVITE, CONNECT, SEND, LOAD, READ, EDIT, DELETE, REACT, FORWARD, CHAT, VERIFY, OTHER }
 
@@ -43,6 +45,11 @@ internal object ErrorMapper {
         SecuredError(Kind.UNAPPROVED_RELAY, "This link points to a server outside Encrogram ($host). Ask your contact for a new Encrogram invite.")
 
     fun invalidLink(): SecuredError = SecuredError(Kind.INVALID_LINK, LINK_INVALID)
+
+    fun ownLink(): SecuredError = SecuredError(Kind.OWN_LINK, OWN_LINK)
+
+    /** Saved Messages (the local note folder) refuses replies, reactions, timers, mute, archive and verification. */
+    fun notInSavedMessages(): SecuredError = notAllowed(NOT_IN_SAVED)
 
     fun engine(tag: String): SecuredError = SecuredError(Kind.ENGINE, "Secured engine error ($tag).")
 
@@ -91,10 +98,26 @@ internal object ErrorMapper {
         }
     }
 
+    /**
+     * The verdict of `/_connect plan` before connecting: [ownLink] for our own invite or address (the core itself
+     * would go ahead and connect us to ourselves: connectionPlanProceed is True for ownLink), else null, and
+     * `/connect` decides as before (it refuses known and connecting links with its own `connectionPlan` reply).
+     */
+    fun planRefusal(planTag: String): SecuredError? = when (planTag) {
+        "invitationLink.ownLink", "contactAddress.ownLink" -> ownLink()
+        else -> null
+    }
+
+    /**
+     * When `/_connect plan` itself fails: refuse only when the error clearly says the link can't work (unparseable,
+     * unsupported, or a one-time link already used or expired), else null and the connect goes ahead as before.
+     */
+    fun planErrorRefusal(e: CoreError): SecuredError? =
+        fromCore(e, Op.CONNECT).takeIf { it.kind == Kind.INVALID_LINK }
+
     /** A `connectionPlan` reply means the engine refused to proceed with this link. */
     fun fromConnectionPlan(planTag: String): SecuredError = when (planTag) {
-        "invitationLink.ownLink", "contactAddress.ownLink" ->
-            SecuredError(Kind.INVALID_LINK, "This is your own invite link. Send it to your contact instead.")
+        "invitationLink.ownLink", "contactAddress.ownLink" -> ownLink()
         "invitationLink.connecting", "contactAddress.connectingProhibit", "contactAddress.connectingConfirmReconnect" ->
             SecuredError(Kind.INVALID_LINK, "You're already connecting with this contact.")
         "invitationLink.known", "contactAddress.known", "contactAddress.contactViaAddress" ->

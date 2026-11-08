@@ -19,6 +19,8 @@ import app.encrogram.core.api.MessageStatus;
  */
 final class ChatRowMapper {
 
+    private static final long SAVED_MESSAGES_CHAT_ID = app.encrogram.core.api.SecuredEngineKt.SAVED_MESSAGES_CHAT_ID;
+
     private ChatRowMapper() {}
 
     /** Honest delivery states for the list. There is no read state. */
@@ -28,10 +30,17 @@ final class ChatRowMapper {
     static final class Labels {
         final String connecting;
         final String noMessages;
+        /** Telegram's own localized "Saved Messages": the engine gives that chat no name. */
+        final String savedMessages;
 
-        Labels(String connecting, String noMessages) {
+        Labels(String connecting, String noMessages, String savedMessages) {
             this.connecting = connecting;
             this.noMessages = noMessages;
+            this.savedMessages = savedMessages;
+        }
+
+        Labels(String connecting, String noMessages) {
+            this(connecting, noMessages, "Saved Messages");
         }
     }
 
@@ -48,27 +57,30 @@ final class ChatRowMapper {
         int unread;
         int dateSeconds;
         boolean archived;
+        /** Saved Messages: Telegram's saved-messages avatar, no lock badge, no unread count, no "You:" and no tick. */
+        boolean saved;
     }
 
     static Row map(ChatSummary c, Labels labels, long nowMs) {
         final Row r = new Row();
         r.chatId = c.getChatId();
-        r.name = c.getDisplayName() != null ? c.getDisplayName() : "";
+        r.saved = r.chatId == SAVED_MESSAGES_CHAT_ID;
+        r.name = r.saved ? labels.savedMessages : c.getDisplayName() != null ? c.getDisplayName() : "";
         r.pinned = c.getPinned();
         r.muted = c.getMuted();
         r.archived = c.getArchived();
-        r.unread = Math.max(0, c.getUnreadCount());
+        r.unread = r.saved ? 0 : Math.max(0, c.getUnreadCount());
         final long t = c.getLastMessageTimeMs() > 0 ? c.getLastMessageTimeMs() : nowMs;
         r.dateSeconds = (int) (t / 1000L);
 
         final String text = c.getLastMessageText();
-        if (!c.getReady()) {
+        if (!c.getReady() && !r.saved) {
             r.message = labels.connecting;
         } else if (text == null) {
             r.message = labels.noMessages;
         } else {
             r.message = text;
-            r.outgoing = c.getLastMessageOutgoing();
+            r.outgoing = c.getLastMessageOutgoing() && !r.saved;
             if (r.outgoing) {
                 r.tick = tickFor(c.getLastMessageStatus());
             }

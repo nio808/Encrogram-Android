@@ -34,7 +34,10 @@ interface SecuredEngine {
     /** Changes the display name; sent to every contact. */
     fun updateProfile(displayName: String, callback: SecuredCallback<SecuredProfile>)
 
-    /** Current chat list, pinned first, then newest activity first. Cheap: served from the engine-side cache. */
+    /**
+     * Current chat list, pinned first, then newest activity first. Cheap: served from the engine-side cache.
+     * Always contains Saved Messages ([SAVED_MESSAGES_CHAT_ID]) once a profile exists.
+     */
     fun chats(): List<ChatSummary>
 
     /** Loads the newest [limit] messages of a chat, oldest first. Same as `messages(chatId, MessagePage(limit))`. */
@@ -49,7 +52,10 @@ interface SecuredEngine {
     /** Checks a pasted or tapped link before connecting. Never contacts a server. */
     fun checkLink(link: String): LinkCheck
 
-    /** Connects using a link that [checkLink] approved. The new chat appears via [SecuredListener.onChatsChanged]. */
+    /**
+     * Connects using a link that [checkLink] approved. The new chat appears via [SecuredListener.onChatsChanged].
+     * Our own invite fails with [SecuredError.Kind.OWN_LINK] (notes to yourself go to Saved Messages).
+     */
     fun connect(link: String, callback: SecuredCallback<Unit>)
 
     /** Sends text. Same as `sendMessage(chatId, text, null, callback)`. */
@@ -104,7 +110,7 @@ sealed class SecuredResult<out T> {
 
 /** A user-readable failure. [message] is safe to show; it never contains message text or keys. */
 data class SecuredError(val kind: Kind, val message: String) {
-    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN }
+    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN }
 }
 
 data class SecuredProfile(val displayName: String)
@@ -186,6 +192,15 @@ sealed class ChatAction {
 
 /** The only reactions the SimpleX protocol accepts. The heart is U+2764 without a variation selector. */
 val SECURED_REACTIONS: List<String> = listOf("👍", "👎", "😀", "😂", "😢", "❤", "🚀", "✅")
+
+/**
+ * Saved Messages: the user's own notes (SimpleX's local note folder). Text only, stored on this phone, never sent
+ * to any relay. Works with [SecuredEngine.messages], [SecuredEngine.sendMessage] and [ItemAction] Edit, Delete and
+ * ForwardTo (both ways); not with reactions, replies, disappearing messages, verification or mute. Its messages are
+ * outgoing with status [MessageStatus.DELIVERED]; the UI shows no ticks for them. [ChatAction.ClearHistory] clears all notes (the row stays); Delete, pin and the rest fail with NOT_ALLOWED.
+ * [ChatSummary.displayName] is empty; the UI shows its own localized name.
+ */
+const val SAVED_MESSAGES_CHAT_ID: Long = -1L
 
 data class SecuredInvite(val link: String)
 

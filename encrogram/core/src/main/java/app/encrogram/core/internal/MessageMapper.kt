@@ -1,7 +1,9 @@
 package app.encrogram.core.internal
 
 import app.encrogram.core.api.ChatSummary
+import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.QuotePreview
+import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SecuredMessage
 
 /**
@@ -22,8 +24,10 @@ internal object MessageMapper {
             replyTo = if (deleted) null else i.quote?.let { QuotePreview(it.itemId, InputRules.preview(it.text), it.outgoing) },
             edited = i.edited,
             deleted = deleted,
-            canEdit = !deleted && i.outgoing && i.shared && i.editable && i.msgContentType == "text",
-            canDeleteForEveryone = !deleted && i.outgoing && i.shared && i.deletable,
+            // Notes have no shared message id (never sent); the core edits them locally with no time limit
+            // (meta.editable: not deleted, not forwarded). "For everyone" has no meaning for a note.
+            canEdit = !deleted && i.outgoing && (i.shared || i.local) && i.editable && i.msgContentType == "text",
+            canDeleteForEveryone = !deleted && !i.local && i.outgoing && i.shared && i.deletable,
             forwarded = i.forwarded,
             reactions = if (deleted) emptyList() else i.reactions,
             expiresAtMs = i.expiresAtMs,
@@ -49,6 +53,27 @@ internal object MessageMapper {
             muted = c.muted,
             archived = archived,
             disappearingTtlSeconds = c.timedTtlSeconds,
+        )
+    }
+
+    /**
+     * The Saved Messages row ([SAVED_MESSAGES_CHAT_ID]): empty name (the UI shows its own localized one), always
+     * ready, never verified, muted, archived or unread; its last message is ours and DELIVERED.
+     */
+    fun notesSummary(chat: CoreNoteChat): ChatSummary {
+        val last = chat.lastItem?.takeIf { it.isMessage }
+        val time = last?.timeMs?.takeIf { it > 0 } ?: maxOf(chat.folder.chatTsMs, chat.lastItem?.timeMs ?: 0L)
+        return ChatSummary(
+            chatId = SAVED_MESSAGES_CHAT_ID,
+            displayName = "",
+            lastMessageText = last?.takeUnless { it.deleted }?.text,
+            lastMessageTimeMs = time,
+            unreadCount = 0,
+            verified = false,
+            ready = true,
+            lastMessageOutgoing = last != null,
+            lastMessageStatus = last?.let { MessageStatus.DELIVERED },
+            pinned = chat.folder.favorite,
         )
     }
 

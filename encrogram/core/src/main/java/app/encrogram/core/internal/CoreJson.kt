@@ -2,6 +2,7 @@ package app.encrogram.core.internal
 
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.ReactionCount
+import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SECURED_REACTIONS
 import org.json.JSONException
 import org.json.JSONObject
@@ -84,7 +85,18 @@ internal data class CoreItem(
     val forwarded: Boolean = false,
     val reactions: List<ReactionCount> = emptyList(),
     val expiresAtMs: Long? = null,
+    /**
+     * A note in the local note folder (chatDir localSnd/localRcv, or read from Saved Messages). Always [outgoing],
+     * status DELIVERED, never unread: it was stored on this phone and never sent.
+     */
+    val local: Boolean = false,
 )
+
+/** SimpleX's local note folder (ChatInfo `local`, NoteFolder in Types.hs): Saved Messages. */
+internal data class CoreNoteFolder(val noteFolderId: Long, val favorite: Boolean, val chatTsMs: Long)
+
+/** The note folder's row in `apiChats`, with its newest item. */
+internal data class CoreNoteChat(val folder: CoreNoteFolder, val lastItem: CoreItem?)
 
 /** chatItem.quotedItem: [itemId] is null when the quoted message is not stored on this device. */
 internal data class CoreQuote(val itemId: Long?, val text: String, val outgoing: Boolean)
@@ -123,7 +135,10 @@ internal object CoreJson {
         if (e == null) return CoreError("unknown", null, null)
         val type = e.str("type") ?: "unknown"
         return when (type) {
-            "error" -> CoreError(type, tagOf(e.opt("errorType")), null)
+            "error" -> {
+                val errorType = e.optJSONObject("errorType")
+                CoreError(type, tagOf(errorType), commandErrorTag(errorType))
+            }
             "errorAgent" -> {
                 val agentError = e.optJSONObject("agentError")
                 CoreError(type, tagOf(agentError), agentSubTag(agentError))
@@ -134,6 +149,19 @@ internal object CoreJson {
             else -> CoreError(type, null, null)
         }
     }
+
+    /**
+     * `commandError` carries free text; only these fixed core strings (Library/Commands.hs, checkReactionAllowed) become
+     * tags, so nothing else from the message can reach logs or the UI.
+     */
+    private val COMMAND_ERROR_TAGS = mapOf(
+        "reaction already added" to "reactionAlreadyAdded",
+        "reaction already removed" to "reactionAlreadyRemoved",
+        "too many reactions" to "tooManyReactions",
+    )
+
+    private fun commandErrorTag(errorType: JSONObject?): String? =
+        if (errorType?.str("type") == "commandError") COMMAND_ERROR_TAGS[errorType.str("message")] else null
 
     private val AGENT_SUB_KEYS = listOf(
         "smpErr", "brokerErr", "proxyErr", "connErr", "cmdErr", "agentErr", "xftpErr", "ntfErr", "fileErr", "rcpErr",
@@ -287,11 +315,29 @@ internal object CoreJson {
         return parseContact(chatInfo.optJSONObject("contact"))
     }
 
-    /** An AChatItem `{chatInfo, chatItem}` in a direct chat, else null. */
+    /** The note folder of a `local` ChatInfo `{type: "local", noteFolder: {noteFolderId, favorite, chatTs, ...}}`, else null. */
+    fun noteFolder(chatInfo: JSONObject?): CoreNoteFolder? {
+        if (chatInfo == null || tagOf(chatInfo) != "local") return null
+        val nf = chatInfo.optJSONObject("noteFolder") ?: return null
+        if (!present(nf, "noteFolderId")) return null
+        val id = nf.optLong("noteFolderId", -1L)
+        if (id <= 0) return null
+        val ts = timeMs(nf.str("chatTs")).takeIf { it > 0 } ?: timeMs(nf.str("updatedAt")).takeIf { it > 0 } ?: timeMs(nf.str("createdAt"))
+        return CoreNoteFolder(id, nf.optBoolean("favorite", false), ts)
+    }
+
+    /**
+     * Our chat id for a ChatInfo: the contact id for a direct chat, [SAVED_MESSAGES_CHAT_ID] for the note folder,
+     * null for everything else (groups, requests, pending connections).
+     */
+    fun chatIdOf(chatInfo: JSONObject?): Long? =
+        directContact(chatInfo)?.contactId ?: noteFolder(chatInfo)?.let { SAVED_MESSAGES_CHAT_ID }
+
+    /** An AChatItem `{chatInfo, chatItem}` in a direct chat or the note folder (chat id -1), else null. */
     fun parseAChatItem(aChatItem: JSONObject?): CoreItem? {
         if (aChatItem == null) return null
-        val contact = directContact(aChatItem.optJSONObject("chatInfo")) ?: return null
-        return parseChatItem(contact.contactId, aChatItem.optJSONObject("chatItem"))
+        val chatId = chatIdOf(aChatItem.optJSONObject("chatInfo")) ?: return null
+        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"))
     }
 
     fun parseChatItem(chatId: Long, item: JSONObject?): CoreItem? {
@@ -301,10 +347,12 @@ internal object CoreJson {
         val dir = tagOf(item.opt("chatDir"))
         val content = item.optJSONObject("content")
         val contentType = tagOf(content)
+        // Notes: stored here, never sent, so always ours and never "unread" (the core may tag them sndNew).
+        val local = chatId == SAVED_MESSAGES_CHAT_ID || dir == "localSnd" || dir == "localRcv"
         val outgoing = when (dir) {
             "directSnd", "groupSnd", "localSnd" -> true
-            "directRcv", "groupRcv", "channelRcv", "localRcv" -> false
-            else -> contentType?.startsWith("snd") == true
+            "directRcv", "groupRcv", "channelRcv", "localRcv" -> local
+            else -> local || contentType?.startsWith("snd") == true
         }
         // sndDeleted/rcvDeleted: legacy deleted items (before meta.itemDeleted existed). Shown as deleted messages.
         val legacyDeleted = contentType == "sndDeleted" || contentType == "rcvDeleted"
@@ -325,8 +373,8 @@ internal object CoreJson {
             text = text,
             timeMs = timeMs(meta.str("itemTs")),
             statusTag = statusTag,
-            status = StatusMapper.map(statusTag, outgoing),
-            unread = !outgoing && statusTag == "rcvNew",
+            status = if (local) MessageStatus.DELIVERED else StatusMapper.map(statusTag, outgoing),
+            unread = !local && !outgoing && statusTag == "rcvNew",
             msgContentType = tagOf(msgContent),
             quote = if (deleted) null else parseQuote(item.optJSONObject("quotedItem")),
             edited = meta.optBoolean("itemEdited", false),
@@ -335,8 +383,9 @@ internal object CoreJson {
             deletable = !deleted && meta.optBoolean("deletable", false),
             shared = meta.str("itemSharedMsgId") != null,
             forwarded = present(meta, "itemForwarded"),
-            reactions = if (deleted) emptyList() else parseReactions(item),
+            reactions = if (deleted || local) emptyList() else parseReactions(item),
             expiresAtMs = expiresAt,
+            local = local,
         )
     }
 
@@ -384,7 +433,7 @@ internal object CoreJson {
         return out
     }
 
-    /** All AChatItems of a `newChatItems` / `chatItemsStatusesUpdated` body that belong to direct chats. */
+    /** All AChatItems of a `newChatItems` / `chatItemsStatusesUpdated` body that belong to direct chats or the note folder. */
     fun parseChatItems(body: JSONObject): List<CoreItem> {
         val arr = body.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(arr.length())
@@ -413,13 +462,35 @@ internal object CoreJson {
         return out
     }
 
-    /** `apiChat` body -> items of that direct chat, oldest first. */
+    /**
+     * `apiChats` body -> the note folder (Saved Messages) with its newest item, or null when the list has none.
+     * Unread counts are ignored: notes are never unread.
+     */
+    fun parseNoteChat(body: JSONObject): CoreNoteChat? {
+        val arr = body.optJSONArray("chats") ?: return null
+        for (i in 0 until arr.length()) {
+            val chat = arr.optJSONObject(i) ?: continue
+            val folder = noteFolder(chat.optJSONObject("chatInfo")) ?: continue
+            val items = chat.optJSONArray("chatItems")
+            var last: CoreItem? = null
+            if (items != null) {
+                for (j in 0 until items.length()) {
+                    val it = parseChatItem(SAVED_MESSAGES_CHAT_ID, items.optJSONObject(j)) ?: continue
+                    if (last == null || it.itemId > last.itemId) last = it
+                }
+            }
+            return CoreNoteChat(folder, last)
+        }
+        return null
+    }
+
+    /** `apiChat` body -> items of that direct chat or of the note folder (chat id -1), oldest first. */
     fun parseChatItemsOfChat(body: JSONObject): List<CoreItem> {
         val chat = body.optJSONObject("chat") ?: return emptyList()
-        val contact = directContact(chat.optJSONObject("chatInfo")) ?: return emptyList()
+        val chatId = chatIdOf(chat.optJSONObject("chatInfo")) ?: return emptyList()
         val items = chat.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(items.length())
-        for (j in 0 until items.length()) parseChatItem(contact.contactId, items.optJSONObject(j))?.let { out.add(it) }
+        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j))?.let { out.add(it) }
         out.sortBy { it.itemId }
         return out
     }

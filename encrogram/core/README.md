@@ -111,6 +111,15 @@ UTF-8. Source of every shape: `research/simplex-chat-api-for-ui.md` §1, checked
 | `chatAction(SetDisappearing)` | `/_set prefs @<id> {whole userPreferences, timedMessages {allow:yes, ttl?}}` | `contactPrefsUpdated` |
 | `securityCode` | `/_get code @<id>` | `contactCode` |
 | `verifyContact` | `/_verify code @<id> [<digits and spaces>]` | `connectionVerified` |
+| `connect` (before connecting) | `/_connect plan <userId> <expanded link>`; `ownLink` → `OWN_LINK`, nothing connected | `connectionPlan` |
+| Saved Messages (`chatId` -1) | same commands with `*<noteFolderId>`: `/_get chat *…`, `/_create *<id> json [...]` (not `/_send`), `/_update item *…`, `/_delete item *… internal`, `/_forward` either way, `/_clear chat *…` (only for `ClearHistory`) | as above |
+
+### Saved Messages, own invites, short links (8 November 2026)
+
+- **Saved Messages** is SimpleX's local note folder (`ChatInfo` type `local`), shown as chat id `SAVED_MESSAGES_CHAT_ID` (-1). Local only: nothing is sent to a relay, items never notify. Refused with NOT_ALLOWED: reactions, replies, mute, archive, disappearing, verify, pin (the core can't set `favorite` on a note folder) and `ChatAction.Delete` (a list "delete chats" must never wipe notes; only `ClearHistory` clears them).
+- **Own invite:** `/connect` would silently connect you to yourself (`connectionPlanProceed` is true for `ownLink`), so `connect` asks for the plan first.
+- **Short links:** `createInvite` strips `?p=<port>&c=<keyHash>` when they name exactly one of our approved relays (`LinkChecker.compact`, only if `expand` restores the identical string); `checkLink` and `connect` re-add them (`LinkChecker.expand`) before validating. Without the query the core would have no key hash for the relay. Links for other hosts are untouched.
+- **Reactions:** `/_get chat around=<id>` returns the item itself without reactions (`Store/Messages.hs` `getDirectChatAround'`), so the engine doesn't pre-check own reactions; it maps the core's fixed answers (`reaction already added/removed` → ok, `too many reactions` → the limit message). Only those three strings become error tags.
 
 `sendText` is `sendMessage(…, null, …)`; `messages(chatId, limit)` is `messages(chatId, MessagePage(limit))`.
 Every action result also arrives through the listener; callbacks only say whether the action was accepted.
