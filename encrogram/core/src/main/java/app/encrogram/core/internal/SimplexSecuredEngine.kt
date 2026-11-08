@@ -12,10 +12,13 @@ import app.encrogram.core.api.EngineState
 import app.encrogram.core.api.GroupMember
 import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
+import app.encrogram.core.api.MediaInput
+import app.encrogram.core.api.MediaPlayback
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MemberStatus
 import app.encrogram.core.api.MessagePage
 import app.encrogram.core.api.MessageStatus
+import app.encrogram.core.api.PreparedMedia
 import app.encrogram.core.api.RelayConfig
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SecuredCallback
@@ -39,6 +42,17 @@ import app.encrogram.core.backup.RestoreRepair
 import app.encrogram.core.internal.ErrorMapper.Op
 import app.encrogram.core.internal.InputRules.MAX_PAGE
 import app.encrogram.core.internal.SecuredLog.Ev
+import app.encrogram.core.internal.media.CtrlGate
+import app.encrogram.core.internal.media.MediaCoordinator
+import app.encrogram.core.internal.media.MediaHost
+import app.encrogram.core.internal.media.MediaLedger
+import app.encrogram.core.internal.media.MediaVault
+import app.encrogram.core.internal.media.SimplexMediaTransport
+import app.encrogram.core.internal.media.SimplexNativeFiles
+import app.encrogram.core.internal.media.prep.MediaPreparer
+import app.encrogram.core.internal.media.prep.android.AndroidImageCodec
+import app.encrogram.core.internal.media.prep.android.AndroidVideoTool
+import app.encrogram.core.internal.media.prep.android.ContentInputOpener
 import chat.simplex.common.platform.chatCloseStore
 import chat.simplex.common.platform.chatMigrateInit
 import chat.simplex.common.platform.chatRecvMsgWait
@@ -198,6 +212,48 @@ internal class SimplexSecuredEngine(
     private val lastAutoSync = HashMap<RepairKey, Long>()
     /** Connections with a re-check queued for when their sync guard ends (R6.6), so at most one each. */
     private val syncRechecks = HashSet<RepairKey>()
+
+    // ---- media (docs/media-plan.md §4.5) ----
+    /** Native file calls vs. the store's close: every chatCloseStore runs in [CtrlGate.close], each open reopens it. */
+    private val ctrlGate = CtrlGate()
+
+    /**
+     * Built at the first store open; that creates no folder and no thread (they come with the first file prepared, read
+     * or received). Its folders and ledger sit next to `files/`, never inside it: the 12-word export swaps `files/` for
+     * an empty folder and takes nothing but the databases (Media never in the backup, media-plan §6).
+     */
+    private val media: MediaCoordinator by lazy {
+        val files = MediaVault(File(dataDir, "files"), File(dataDir, "media"), SimplexNativeFiles(ctrlGate) { ctrl })
+        MediaCoordinator(
+            // Already receiving, nothing left to cancel: answers, not command errors.
+            mediaHost, SimplexMediaTransport { send(it, setOf("fileAlreadyReceiving", "fileCancel")) }, files,
+            MediaLedger(File(dataDir, "media_ledger")),
+            MediaPreparer(ContentInputOpener(appContext), AndroidImageCodec(), AndroidVideoTool(), files),
+            config.xftpServers.mapNotNull { ServerAddress.parse(it) },
+            MediaCoordinator.lazyThread("encrogram-secured-media-prep"), MediaCoordinator.lazyThread("encrogram-secured-media-read"),
+        )
+    }
+
+    private val mediaHost = object : MediaHost {
+        override fun run(cmd: String) = send(cmd)
+        override fun toMessage(item: CoreItem) = MessageMapper.toMessage(localView(listOf(item)).first(), roleIn(item.chatId))
+        // The row's tick follows (a finished upload lifts the clock); never applyNewItems, which would make an older
+        // item the row's last message.
+        override fun messageChanged(items: List<CoreItem>) {
+            emitChanged(items)
+            applyStatuses(items)
+        }
+        override fun itemsAdded(items: List<CoreItem>) = applyNewItems(items)
+        override fun progress(chatId: Long, itemId: Long, done: Long, total: Long) {
+            main.post { for (l in listeners) l.onMediaProgress(chatId, itemId, done, total) }
+        }
+        override fun <T> deliver(callback: SecuredCallback<T>, result: SecuredResult<T>) {
+            main.post { callback.onResult(result) }
+        }
+        override fun onEngine(task: () -> Unit) = post(task)
+        override fun running() = state == EngineState.RUNNING && ctrl != 0L
+        override fun nowMs() = System.currentTimeMillis()
+    }
 
     // =============================================================================================================
     // SecuredEngine
@@ -386,8 +442,8 @@ internal class SimplexSecuredEngine(
             val quoted = itemOrErr(chatId, replyToId, callback) ?: return@post
             if (quoted.deleted) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
             // The core copies the whole quoted text into the message (it can't be shortened), so it uses up
-            // part of the body cap.
-            if (!InputRules.replyFits(text, quoted.text)) {
+            // part of the body cap; a photo's or video's preview too ([textReplyFits]).
+            if (!textReplyFits(text, quoted)) {
                 return@post err(callback, ErrorMapper.invalid("This reply is too long. Shorten it, or send it without the quote."))
             }
         }
@@ -440,12 +496,12 @@ internal class SimplexSecuredEngine(
             is ChatAction.SetArchived -> setArchivedOnEngine(chatId, action.archived, callback)
             ChatAction.ClearHistory -> {
                 val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
-                chatCommand("clear", Commands.clearChat(ref), "chatCleared", callback)
+                chatCommand("clear", Commands.clearChat(ref), "chatCleared", callback) { media.onChatRemoved(chatId) }
             }
             // The reload that follows drops the chat's archive flag (ArchiveStore.retainOnly).
             is ChatAction.Delete ->
                 if (group) deleteGroupOnEngine(chatId, action.notifyContact, callback)
-                else chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback)
+                else chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback) { media.onChatRemoved(chatId) }
             is ChatAction.SetDisappearing -> {
                 if (group) return@post refuse(callback, "disappearing_group", ErrorMapper.CONTACTS_ONLY)
                 val ttl = action.ttlSeconds
@@ -509,6 +565,41 @@ internal class SimplexSecuredEngine(
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.VERIFY))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
+    }
+
+    // ---- media: the engine's checks, then MediaCoordinator (docs/media-plan.md §4.5) ----
+
+    override fun prepareMedia(input: MediaInput, callback: SecuredCallback<PreparedMedia>) =
+        if (state != EngineState.RUNNING) err(callback, ErrorMapper.notRunning(state)) else media.prepare(input, callback)
+
+    override fun discardMedia(prepared: PreparedMedia) = media.discard(prepared)
+
+    override fun sendMedia(chatId: Long, prepared: PreparedMedia, caption: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        if (chatId == SAVED_MESSAGES_CHAT_ID) return@post refuse(callback, "media_notes", ErrorMapper.MEDIA_NOT_IN_SAVED)
+        val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
+        postRefusal(chatId)?.let { return@post refuse(callback, "send_group", it) }
+        val quoted = replyToId?.let { itemOrErr(chatId, it, callback) ?: return@post }
+        if (quoted?.deleted == true) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
+        media.send(chatId, ref, prepared, caption, quoted, callback)
+    }
+
+    override fun acceptMedia(chatId: Long, messageId: Long, callback: SecuredCallback<Unit>) =
+        withItem(chatId, messageId, callback) { media.accept(it, callback) }
+
+    override fun cancelMedia(chatId: Long, messageId: Long, callback: SecuredCallback<Unit>) =
+        withItem(chatId, messageId, callback) { media.cancel(it, callback) }
+
+    override fun readMediaBytes(chatId: Long, messageId: Long, callback: SecuredCallback<ByteArray>) =
+        withItem(chatId, messageId, callback) { media.readBytes(it, callback) }
+
+    override fun openMediaForPlayback(chatId: Long, messageId: Long, callback: SecuredCallback<MediaPlayback>) =
+        withItem(chatId, messageId, callback) { media.openPlayback(it, callback) }
+
+    /** Engine thread, RUNNING: [chatId]'s message [messageId] as the chat shows it, or the reason goes to [callback]. */
+    private fun <T> withItem(chatId: Long, messageId: Long, callback: SecuredCallback<T>, block: (CoreItem) -> Unit) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        block(itemOrErr(chatId, messageId, callback) ?: return@post)
     }
 
     // =============================================================================================================
@@ -1720,6 +1811,8 @@ internal class SimplexSecuredEngine(
 
             stopReceiver()
             closeCtrlQuietly()
+            // The store was replaced: file ids start again, so every verdict and transient file goes.
+            media.onStoreReplaced()
             val keys = DbKeyStore(appContext)
             try {
                 keys.replace(payload.dbKey)
@@ -1733,7 +1826,8 @@ internal class SimplexSecuredEngine(
                 val msg = if (tag == "errorMigration") ErrorMapper.BACKUP_NEWER_APP else ErrorMapper.BACKUP_DAMAGED
                 throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, msg), "open_$tag")
             }
-            ctrl = c
+            // Only for re-keying: the gate stays closed until openDatabase reopens it with the final controller.
+            ctrlGate.close { ctrl = c }
             val fresh = keys.freshPassphrase()
             val enc = send(Commands.storageEncryption(payload.dbKey, fresh))
             if (enc !is CoreReply.Result || enc.type != "cmdOk") {
@@ -1786,6 +1880,7 @@ internal class SimplexSecuredEngine(
         for (db in listOf("_chat.db", "_agent.db")) {
             for (suffix in listOf("", ".bak", ".exported", "-journal")) File(dir, DB_PREFIX + db + suffix).delete()
         }
+        media.onStoreReplaced()
         File(dir, "tmp").deleteRecursively()
         savePending(LinkedHashMap())
         if (vault.hasSecrets() || vault.hasPhrase()) {
@@ -2156,14 +2251,17 @@ internal class SimplexSecuredEngine(
     private fun closeCtrlQuietly() {
         val c = ctrl
         if (c == 0L) return
+        media.onStop()
         closeQuietly(c)
         ctrl = 0L
         chatStarted = false
+        media.afterClose()
     }
 
+    /** Through [CtrlGate.close]: waits for native file calls in flight, and none starts again until the next open. */
     private fun closeQuietly(c: Long) {
         try {
-            chatCloseStore(c)
+            ctrlGate.close { chatCloseStore(c) }
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.STOPPED, t)
         }
@@ -2415,6 +2513,7 @@ internal class SimplexSecuredEngine(
                 }
                 SecuredLog.i(Ev.GROUP_ACTION, tag)
                 ok(callback, Unit)
+                media.onChatRemoved(chatId)
                 refreshChats(notify = true)
             }
             is CoreReply.Error -> {
@@ -2436,13 +2535,14 @@ internal class SimplexSecuredEngine(
         notifyChatsChanged()
     }
 
-    /** Sends a chat command that answers [expected]; on success reloads the chat list (onChatsChanged). */
-    private fun chatCommand(tag: String, cmd: String, expected: String, callback: SecuredCallback<Unit>) {
+    /** Sends a chat command that answers [expected]; on success runs [done] and reloads the chat list (onChatsChanged). */
+    private fun chatCommand(tag: String, cmd: String, expected: String, callback: SecuredCallback<Unit>, done: () -> Unit = {}) {
         when (val r = send(cmd)) {
             is CoreReply.Result -> {
                 if (r.type != expected) return err(callback, unexpected(r))
                 SecuredLog.i(Ev.CHAT_ACTION, tag)
                 ok(callback, Unit)
+                done()
                 refreshChats(notify = true)
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
@@ -2687,6 +2787,8 @@ internal class SimplexSecuredEngine(
             SecuredLog.w(Ev.DB_RETRY_AFTER_PARTIAL, tag)
             chatDb.delete()
             agentDb.delete()
+            // A new store: file ids start again, so no verdict of the old one may survive.
+            media.onStoreReplaced()
             val retry = migrateInit(prefix, key)
             tag = retry.first
             c = retry.second
@@ -2708,7 +2810,7 @@ internal class SimplexSecuredEngine(
             // Never keep a half-open store (no file paths, or no local file encryption): close it so the next
             // start redoes the whole open.
             try {
-                chatCloseStore(c)
+                ctrlGate.close { chatCloseStore(c) }
             } catch (e: Throwable) {
                 SecuredLog.crash(Ev.DB_OPEN_FAILED, e)
             }
@@ -2720,6 +2822,9 @@ internal class SimplexSecuredEngine(
         // A new store (first open, restore): item ids and group ids from an earlier one mean nothing here.
         previewCache.clear()
         memberIdCache.clear()
+        // What a crash left in media prep/, view/ and link/ goes while the gate is still closed; then file calls may run.
+        media.onStoreOpened()
+        ctrlGate.reopen()
         watchNetwork()
     }
 
@@ -2822,7 +2927,7 @@ internal class SimplexSecuredEngine(
         afterRunning()
     }
 
-    /** Backup timer (an upload owed after a restore starts here), queued server deletes, and the repair of restored contacts. Never throws. */
+    /** Backup timer (an upload owed after a restore starts here), queued server deletes, the repair of restored contacts, and media catch-up. Never throws. */
     private fun afterRunning() {
         try {
             if (backupState().enabled) scheduleAuto(0L)
@@ -2838,6 +2943,12 @@ internal class SimplexSecuredEngine(
             checkAllPending()
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.RESTORE_REPAIR, t)
+        }
+        // Downloads whose passing check was recorded while the engine wasn't running (during start, or before a restart).
+        try {
+            media.catchUp()
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.MEDIA_CATCHUP, t)
         }
     }
 
@@ -2901,12 +3012,16 @@ internal class SimplexSecuredEngine(
         }
         stopReceiver()
         stopChatQuietly()
-        try {
-            chatCloseStore(ctrl)
-        } catch (t: Throwable) {
-            SecuredLog.crash(Ev.STOPPED, t)
+        media.onStop()
+        ctrlGate.close {
+            try {
+                chatCloseStore(ctrl)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.STOPPED, t)
+            }
+            ctrl = 0L
         }
-        ctrl = 0L
+        media.afterClose()
         userId = 0L
         chatCache.clear()
         lastItemIds.clear()
@@ -2995,6 +3110,8 @@ internal class SimplexSecuredEngine(
     }
 
     private fun handleEvent(reply: CoreReply) {
+        // Our check of a file description, in any state (a pure check and a ledger write); catch-up acts on it later.
+        if (reply is CoreReply.Result && reply.type == "rcvFileDescrReady") return media.recordDescription(reply.body)
         if (state != EngineState.RUNNING) return
         if (reply is CoreReply.Result) {
             try {
@@ -3038,6 +3155,8 @@ internal class SimplexSecuredEngine(
                     SecuredLog.i(Ev.EVENT, if (reply.body.optBoolean("timed", false)) "chatItemsDeleted.timed" else reply.type)
                     applyDeletions(CoreJson.parseDeletions(reply.body))
                 }
+                // File states and progress: onMessageChanged / onMediaProgress only, never a new message or notification.
+                in MediaCoordinator.EVENTS -> media.onEvent(reply.type, reply.body)
                 in CHAT_LIST_EVENTS -> {
                     SecuredLog.i(Ev.EVENT, reply.type)
                     refreshSoon()
@@ -3176,10 +3295,11 @@ internal class SimplexSecuredEngine(
     /**
      * Items as this phone shows them, on every path that maps items (a chat page and search, new items, edits and
      * reactions, the list's last item, single-item checks): link joins worded ([withLinkJoins]) and our own earlier
-     * messages in a rejoin's history made ours when proven ([GroupRules.markOwnHistory] with [earlierProofs]).
+     * messages in a rejoin's history made ours when proven ([GroupRules.markOwnHistory] with [earlierProofs]), and what
+     * this phone knows about their files ([MediaCoordinator.annotate]; nothing to do for items without one).
      */
     private fun localView(items: List<CoreItem>): List<CoreItem> =
-        GroupRules.markOwnHistory(withLinkJoins(items)) { earlierProofs[it] }
+        media.annotate(GroupRules.markOwnHistory(withLinkJoins(items)) { earlierProofs[it] })
 
     /**
      * Our own sent messages in an ended group row ([GroupRules.ownSent] over its newest [OWN_SENT_READ] items: a rejoin's
@@ -3382,6 +3502,8 @@ internal class SimplexSecuredEngine(
             val now = d.replacement
             if (now == null || !now.shown) removed.getOrPut(d.chatId) { ArrayList() }.add(d.itemId) else marked.add(now)
         }
+        // Removed or only marked deleted: their playbacks close and their files' ledger rows go.
+        deletions.groupBy({ it.chatId }, { it.itemId }).forEach { (chatId, ids) -> media.onRemoved(chatId, ids) }
         if (removed.isNotEmpty()) {
             val gone = removed.mapValues { it.value.toList() }
             main.post { for ((chatId, ids) in gone) for (l in listeners) l.onMessagesRemoved(chatId, ids) }
@@ -3626,3 +3748,10 @@ internal class SimplexSecuredEngine(
         )
     }
 }
+
+/**
+ * A text reply's body budget: the core copies the quoted text (a captionless file: its name) and, for a photo or video,
+ * its preview into the reply (Internal.hs:314-335, quoteContent). For a text quote this is plain [InputRules.replyFits].
+ */
+internal fun textReplyFits(text: String, quoted: CoreItem): Boolean =
+    InputRules.replyFits(text, quoted.text.ifEmpty { quoted.file?.name.orEmpty() }, quoted.preview?.length ?: 0)
