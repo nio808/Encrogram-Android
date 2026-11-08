@@ -269,6 +269,14 @@ internal class MediaCoordinator(
         if (!host.running()) return stopped()
         return when (val r = transport.receive(checked)) {
             is TransportReply.Item -> {
+                val got = r.item
+                if (got != null && (got.chatId != entry.chatId || got.itemId != entry.itemId)) {
+                    // The core started another message's file (a reused id): not what we checked. Stop it at once.
+                    transport.cancel(entry.fileId)
+                    ledger.remove(entry.fileId)
+                    SecuredLog.w(Ev.MEDIA_FAILED, "mismatch")
+                    return ErrorMapper.mediaFailure(MediaFailure.CHECK_FAILED)
+                }
                 ledger.markAccepted(entry.fileId)
                 movingSizes[entry.chatId to entry.itemId] = entry.sizeBytes
                 SecuredLog.i(Ev.MEDIA_ACCEPTED, entry.kind.name)
@@ -354,7 +362,14 @@ internal class MediaCoordinator(
         SecuredLog.i(Ev.MEDIA_CATCHUP, null, due.size)
         for (entry in due) {
             if (!host.running()) break
-            fetchIfWanted(entry, null)
+            // A file id can be reused once its message is deleted (the core's files.file_id has no AUTOINCREMENT), so
+            // the verdict counts only for the very message it was recorded for, still holding that file (MD9 finding 1).
+            val item = host.currentItem(entry.chatId, entry.itemId)
+            if (item == null || item.deleted || item.file?.fileId != entry.fileId || ledger.get(entry.fileId, item.sharedMsgId) == null) {
+                ledger.remove(entry.fileId)
+                continue
+            }
+            if (item.file?.statusTag == RCV_INVITATION) fetchIfWanted(entry, item)
         }
     }
 

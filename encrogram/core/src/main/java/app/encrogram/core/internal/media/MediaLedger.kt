@@ -45,9 +45,9 @@ internal class MediaLedger(private val file: File) {
         return m
     }
 
-    /** The entry for [fileId] when it belongs to this message: hashes must match (both absent also matches). */
+    /** The entry for [fileId] when it belongs to this message: hashes must match, and a message without one matches nothing (MD9). */
     fun get(fileId: Long, sharedMsgId: String?): LedgerEntry? =
-        loaded()[fileId]?.takeIf { it.msgHash == hashOf(sharedMsgId) }
+        loaded()[fileId]?.takeIf { it.msgHash != null && it.msgHash == hashOf(sharedMsgId) }
 
     /** Stores [entry] bound to [sharedMsgId] (its own msgHash is replaced). Returns false if saving failed. */
     fun put(entry: LedgerEntry, sharedMsgId: String?): Boolean {

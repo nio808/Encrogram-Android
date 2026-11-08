@@ -237,6 +237,12 @@ internal class SimplexSecuredEngine(
     private val mediaHost = object : MediaHost {
         override fun run(cmd: String) = send(cmd)
         override fun toMessage(item: CoreItem) = MessageMapper.toMessage(localView(listOf(item)).first(), roleIn(item.chatId))
+        override fun currentItem(chatId: Long, itemId: Long): CoreItem? {
+            val ref = refOf(chatId) ?: return null
+            val r = send(Commands.getChat(ref, 1, aroundId = itemId)) as? CoreReply.Result ?: return null
+            if (r.type != "apiChat") return null
+            return localView(CoreJson.parseChatItemsOfChat(r.body)).firstOrNull { it.itemId == itemId && it.isMessage }
+        }
         // The row's tick follows (a finished upload lifts the clock); never applyNewItems, which would make an older
         // item the row's last message.
         override fun messageChanged(items: List<CoreItem>) {
@@ -3503,7 +3509,11 @@ internal class SimplexSecuredEngine(
             if (now == null || !now.shown) removed.getOrPut(d.chatId) { ArrayList() }.add(d.itemId) else marked.add(now)
         }
         // Removed or only marked deleted: their playbacks close and their files' ledger rows go.
-        deletions.groupBy({ it.chatId }, { it.itemId }).forEach { (chatId, ids) -> media.onRemoved(chatId, ids) }
+        try {
+            deletions.groupBy({ it.chatId }, { it.itemId }).forEach { (chatId, ids) -> media.onRemoved(chatId, ids) }
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.MEDIA_IO_FAILED, t)   // the UI must still hear about the deletions below
+        }
         if (removed.isNotEmpty()) {
             val gone = removed.mapValues { it.value.toList() }
             main.post { for ((chatId, ids) in gone) for (l in listeners) l.onMessagesRemoved(chatId, ids) }

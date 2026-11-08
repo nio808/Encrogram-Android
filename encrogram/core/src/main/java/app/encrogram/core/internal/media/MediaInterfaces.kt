@@ -24,6 +24,9 @@ internal interface MediaHost {
     /** The item as the UI sees it (localView + MessageMapper + role). Engine thread. */
     fun toMessage(item: CoreItem): SecuredMessage
 
+    /** Engine thread: [chatId]'s message [itemId] as the store holds it now (localView), or null when it is gone. */
+    fun currentItem(chatId: Long, itemId: Long): CoreItem?
+
     /** onMessageChanged only (never onMessageReceived, never markChanged). Engine thread; delivered on main. */
     fun messageChanged(items: List<CoreItem>)
 

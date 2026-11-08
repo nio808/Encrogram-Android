@@ -28,6 +28,13 @@ internal class FakeMediaHost(var now: Long) : MediaHost {
 
     override fun toMessage(item: CoreItem): SecuredMessage = MessageMapper.toMessage(coordinator.annotate(listOf(item)).first())
 
+    /** The store as the fake engine holds it: the latest item registered per (chatId, itemId), unless [lookup] is set. */
+    val store = HashMap<Pair<Long, Long>, CoreItem>()
+    var lookup: ((Long, Long) -> CoreItem?)? = null
+
+    override fun currentItem(chatId: Long, itemId: Long): CoreItem? =
+        lookup?.invoke(chatId, itemId) ?: store[chatId to itemId]
+
     override fun messageChanged(items: List<CoreItem>) {
         for (i in items) changed += toMessage(i)
     }

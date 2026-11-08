@@ -89,7 +89,8 @@ internal object MediaMapper {
         return cutBytes(clean, MAX_NAME_BYTES)
     }
 
-    private val BIDI: Set<Int> = setOf(0x061C, 0x200E, 0x200F) + (0x202A..0x202E) + (0x2066..0x2069)
+    /** Bidi controls, plus invisible characters that make look-alike names (zero-width, word joiner, soft hyphen). */
+    private val BIDI: Set<Int> = setOf(0x061C, 0x200E, 0x200F, 0x200B, 0x200C, 0x200D, 0x2060, 0x00AD) + (0x202A..0x202E) + (0x2066..0x2069)
 
     private fun cutBytes(s: String, max: Int): String {
         if (utf8(s) <= max) return s

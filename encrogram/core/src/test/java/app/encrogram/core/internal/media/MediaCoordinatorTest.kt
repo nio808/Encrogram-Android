@@ -114,9 +114,14 @@ class MediaCoordinatorTest {
         "rcvNew",
     )
 
-    private fun item(json: String): CoreItem = CoreJson.parseChatItem(CHAT, JSONObject(json))!!
+    /** Parses the item and records it as the store's current state of that message (what catch-up looks up). */
+    private fun item(json: String): CoreItem =
+        CoreJson.parseChatItem(CHAT, JSONObject(json))!!.also { host.store[it.chatId to it.itemId] = it }
 
-    private fun descr(itemJson: String, fileId: Long, text: String) = JSONObject(MediaSamples.descrReady(itemJson, fileId, text = text))
+    private fun descr(itemJson: String, fileId: Long, text: String): JSONObject {
+        item(itemJson)
+        return JSONObject(MediaSamples.descrReady(itemJson, fileId, text = text))
+    }
 
     private fun honest(size: Long) = DescriptionSamples.oneChunk(size)
 
@@ -253,6 +258,29 @@ class MediaCoordinatorTest {
         host.running = true
         coordinator.catchUp()
         assertEquals(listOf(7L), transport.receives)
+    }
+
+    @Test
+    fun catchUpNeverReusesAVerdictForAReusedFileId() {
+        host.running = false
+        val old = rcvJson(10, 7, MIB)
+        coordinator.recordDescription(descr(old, 7, honest(MIB)))
+        // Message 10 is deleted during start and the peer's next file gets the same file id 7 in message 20.
+        host.store.remove(CHAT to 10L)
+        item(rcvJson(20, 7, MIB))
+        host.running = true
+        coordinator.catchUp()
+        assertTrue(transport.receives.isEmpty())
+        assertTrue(ledger.entries().isEmpty())
+    }
+
+    @Test
+    fun aReceiveThatComesBackForAnotherMessageIsStopped() {
+        val j = rcvJson(10, 7, MIB)
+        transport.receiveReply = { TransportReply.Item(item(rcvJson(20, 7, MIB, status = "rcvAccepted"))) }
+        coordinator.recordDescription(descr(j, 7, honest(MIB)))
+        assertEquals(listOf(7L), transport.cancels)
+        assertTrue(ledger.entries().isEmpty())
     }
 
     @Test
@@ -652,6 +680,7 @@ class MediaCoordinatorTest {
                 assertTrue("seed $seed: receive before its description", id in delivered)
                 assertTrue("seed $seed: no recorded pass", ledger.entries().any { it.fileId == id && it.verdict == Verdict.PASSED })
             }
+            host.lookup = { _, itemId -> specs.firstOrNull { it.itemId == itemId }?.let { item(json(it)) } }
             transport.receiveReply = { id -> status[id] = "rcvAccepted"; TransportReply.Item(item(json(specOf(id)))) }
             transport.cancelReply = { id -> status[id] = "rcvInvitation"; TransportReply.Item(item(json(specOf(id)))) }
 

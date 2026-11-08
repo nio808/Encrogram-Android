@@ -139,6 +139,9 @@ internal data class CoreItem(
 
     /** Shown in a chat: a message or a service row we know. Every other service item is skipped, never shown raw. */
     val shown: Boolean get() = isMessage || event != null
+
+    /** Ids and status only: text, quote and preview are user content (MD9). */
+    override fun toString() = "CoreItem($chatId/$itemId, $statusTag)"
 }
 
 /**

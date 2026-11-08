@@ -49,10 +49,10 @@ class MediaLedgerTest {
     }
 
     @Test
-    fun withoutSharedMsgIdItStaysInMemory() {
+    fun withoutSharedMsgIdItStaysInMemoryAndMatchesNothing() {
         val l = MediaLedger(file)
         l.put(entry(1), null)
-        assertNotNull(l.get(1, null))
+        assertNull(l.get(1, null))   // bound to no message, so no message can use it (MD9)
         assertNull(l.get(1, "x"))
         assertFalse(file.isFile && file.readText().isNotEmpty())
         assertNull(MediaLedger(file).get(1, null))

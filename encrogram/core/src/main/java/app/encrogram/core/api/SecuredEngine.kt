@@ -356,7 +356,10 @@ data class SecuredMessage @JvmOverloads constructor(
     val event: GroupEvent? = null,
     /** Photo, GIF, video, voice or file; [text] is then its caption (may be empty). Null for text, service rows and deleted messages. */
     val media: SecuredMedia? = null,
-)
+) {
+    /** Ids and status only: text and quotes are user content and must never reach a log. */
+    override fun toString() = "SecuredMessage($chatId/$messageId, $status${media?.let { ", $it" } ?: ""})"
+}
 
 /** [mediaKind]: the quoted message carries media (the UI shows "Photo"... when [text] is empty). */
 data class QuotePreview @JvmOverloads constructor(
