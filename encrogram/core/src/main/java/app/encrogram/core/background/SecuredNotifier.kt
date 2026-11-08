@@ -17,8 +17,8 @@ import androidx.core.app.NotificationManagerCompat
 import app.encrogram.core.internal.SecuredLog
 
 /**
- * Posts Secured's own notifications. Hidden mode only: title "Encrogram", text "New Secured message", never a
- * sender or message text (see [NotificationText]). It uses only the chat id and a count; it cannot see Telegram's
+ * Posts Secured's own notifications. Hidden mode only: title "Secured", one combined notification ("5 new messages in 3 chats"), never a
+ * sender or message text (see [NotificationText]). It uses only chat ids and counts; it cannot see Telegram's
  * NotificationsController and Telegram cannot see it.
  */
 internal object SecuredNotifier {
@@ -27,8 +27,6 @@ internal object SecuredNotifier {
     private const val GROUP_ID = "encrogram_secured"
     const val MESSAGES_CHANNEL = "encrogram_secured_messages"
     const val SERVICE_CHANNEL = "encrogram_secured_service"
-    private const val GROUP_KEY = "app.encrogram.secured.MESSAGES"
-    private const val EXTRA_COUNT = "encrogram_count"
 
     private fun manager(context: Context) = context.getSystemService(NotificationManager::class.java)
 
@@ -80,68 +78,67 @@ internal object SecuredNotifier {
             .build()
     }
 
-    /** One more unseen incoming message in [chatId]. The count lives in the posted notification's own extras. */
+    private val unread = UnreadTracker()
+
+    /** One more unseen incoming message in [chatId]: updates the one combined notification. */
     fun onIncoming(context: Context, config: NotificationConfig, chatId: Long) {
         try {
             ensureChannels(context)
-            val id = NotificationText.notificationId(chatId)
-            val previous = manager(context).activeNotifications
-                .firstOrNull { it.tag == TAG && it.id == id }?.notification?.extras?.getInt(EXTRA_COUNT, 0) ?: 0
-            val count = previous + 1
-
-            val generic = NotificationText.messageText(1)
-            val publicVersion = NotificationCompat.Builder(context, MESSAGES_CHANNEL)
-                .setSmallIcon(config.smallIconRes)
-                .setColor(config.accentColor)
-                .setContentTitle(NotificationText.TITLE)
-                .setContentText(generic)
-                .build()
-            val message = NotificationCompat.Builder(context, MESSAGES_CHANNEL)
-                .setSmallIcon(config.smallIconRes)
-                .setColor(config.accentColor)
-                .setContentTitle(NotificationText.TITLE)
-                .setContentText(NotificationText.messageText(count))
-                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setPublicVersion(publicVersion)
-                .setGroup(GROUP_KEY)
-                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
-                .setAutoCancel(true)
-                .addExtras(android.os.Bundle().apply { putInt(EXTRA_COUNT, count) })
-                .setContentIntent(tap(context, config, chatId, id))
-                .build()
-            val summary = NotificationCompat.Builder(context, MESSAGES_CHANNEL)
-                .setSmallIcon(config.smallIconRes)
-                .setColor(config.accentColor)
-                .setContentTitle(NotificationText.TITLE)
-                .setContentText(generic)
-                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setPublicVersion(publicVersion)
-                .setGroup(GROUP_KEY)
-                .setGroupSummary(true)
-                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
-                .setAutoCancel(true)
-                .setContentIntent(tap(context, config, null, NotificationText.SUMMARY_ID))
-                .build()
-            val nm = NotificationManagerCompat.from(context)
-            nm.notify(TAG, id, message)
-            nm.notify(TAG, NotificationText.SUMMARY_ID, summary)
+            // Swiped away (or cancelled by the system): start counting again instead of resurrecting old counts.
+            if (!isShown(context)) unread.clearAll()
+            unread.add(chatId)
+            post(context, config, alert = true)
         } catch (t: Throwable) {
             SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)
         }
     }
 
-    /** Cancels one chat's notification, and the summary when no chat notification is left. */
-    fun clear(context: Context, chatId: Long) {
+    private fun post(context: Context, config: NotificationConfig, alert: Boolean) {
+        val publicVersion = NotificationCompat.Builder(context, MESSAGES_CHANNEL)
+            .setSmallIcon(config.smallIconRes)
+            .setColor(config.accentColor)
+            .setContentTitle(NotificationText.TITLE)
+            .setContentText(NotificationText.PUBLIC_TEXT)
+            .build()
+        val message = NotificationCompat.Builder(context, MESSAGES_CHANNEL)
+            .setSmallIcon(config.smallIconRes)
+            .setColor(config.accentColor)
+            .setContentTitle(NotificationText.TITLE)
+            .setContentText(NotificationText.combinedText(unread.total(), unread.chats()))
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion)
+            .setOnlyAlertOnce(!alert)
+            .setAutoCancel(true)
+            .setContentIntent(tap(context, config, unread.singleChat(), NotificationText.MESSAGES_ID))
+            .build()
+        NotificationManagerCompat.from(context).notify(TAG, NotificationText.MESSAGES_ID, message)
+    }
+
+    /** The user has seen [chatId]: drop its share; cancels the notification when nothing unseen is left. */
+    fun clear(context: Context, config: NotificationConfig?, chatId: Long) {
         try {
-            val nm = manager(context)
-            nm.cancel(TAG, NotificationText.notificationId(chatId))
-            if (nm.activeNotifications.none { it.tag == TAG && it.id != NotificationText.SUMMARY_ID }) {
-                nm.cancel(TAG, NotificationText.SUMMARY_ID)
-            }
+            unread.clear(chatId)
+            if (!isShown(context)) unread.clearAll()  // swiped away: never bring it back
+            if (unread.total() == 0 || config == null) cancel(context)
+            else post(context, config, alert = false)
         } catch (t: Throwable) {
             SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)
         }
     }
+
+    /** The user opened the Secured list: everything counts as seen. */
+    fun clearAll(context: Context) {
+        try {
+            unread.clearAll()
+            cancel(context)
+        } catch (t: Throwable) {
+            SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)
+        }
+    }
+
+    private fun cancel(context: Context) = manager(context).cancel(TAG, NotificationText.MESSAGES_ID)
+
+    private fun isShown(context: Context) =
+        manager(context).activeNotifications.any { it.tag == TAG && it.id == NotificationText.MESSAGES_ID }
 }

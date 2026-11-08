@@ -290,6 +290,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         }
         o.add(org.telegram.messenger.R.drawable.msg_remove, c.getString(channel ? R.string.secgroup_remove_member_channel : R.string.secgroup_remove_member), true, () -> confirmRemove(m));
         o.show();
+        Kit.securePopup(o.actionBarPopupWindow);
     }
 
     private void setRole(GroupMember m, MemberRole role) {
@@ -327,7 +328,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
             }
         });
         final AlertDialog dialog = b.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         dialog.redPositive();
     }
 

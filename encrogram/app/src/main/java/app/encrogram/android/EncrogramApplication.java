@@ -68,5 +68,7 @@ public class EncrogramApplication extends ApplicationLoader {
         // Debug builds of Telegram show a "Test Backend" box on login and write request logs to disk; Encrogram wants neither.
         BuildVars.DEBUG_VERSION = false;
         BuildVars.LOGS_ENABLED = false;
+        // Also turns off Telegram's ?enablelogs / ?sendlogs deep links, which debug builds otherwise keep.
+        BuildVars.DEBUG_PRIVATE_VERSION = false;
     }
 }

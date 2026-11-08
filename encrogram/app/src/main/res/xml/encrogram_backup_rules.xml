@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 11 and older: Telegram's manifest allows backup. Secured data lives in noBackupFilesDir and is never
+    backed up; these two preference files are excluded too. The first holds the Keystore-wrapped database key
+    (useless elsewhere, but it has no business in a backup); the second would reveal that Secured is in use.
+    Keep in step with encrogram_data_extraction_rules.xml.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="encrogram_secured_keys.xml" />
+    <exclude domain="sharedpref" path="encrogram_secured_ui.xml" />
+</full-backup-content>

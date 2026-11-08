@@ -55,8 +55,7 @@ final class SecuredGroupLinkSheet {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
-        Kit.secure(sheet);
-        fragment.showDialog(sheet);
+        Kit.show(fragment, sheet);
 
         try {
             engine.groupLink(chatId, result -> {
@@ -138,7 +137,7 @@ final class SecuredGroupLinkSheet {
             }
         });
         final AlertDialog dialog = b.create();
-        fragment.showDialog(dialog);
+        Kit.show(fragment, dialog);
         dialog.redPositive();
     }
 }

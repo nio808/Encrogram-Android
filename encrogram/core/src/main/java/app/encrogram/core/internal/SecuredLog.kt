@@ -1,6 +1,7 @@
 package app.encrogram.core.internal
 
 import android.util.Log
+import app.encrogram.core.BuildConfig
 
 /**
  * The only logger in :encrogram-core.
@@ -14,9 +15,9 @@ internal object SecuredLog {
 
     private const val TAG = "EncroSecured"
 
-    /** Turned off by tests and, if wanted, by the app for release builds. */
+    /** On in debug builds only (event names and counts, never content). Tests turn it off. */
     @Volatile
-    var enabled: Boolean = true
+    var enabled: Boolean = BuildConfig.DEBUG
 
     enum class Ev {
         NATIVE_LOADED, NATIVE_LOAD_FAILED,

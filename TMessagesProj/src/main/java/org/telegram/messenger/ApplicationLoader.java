@@ -397,6 +397,7 @@ public class ApplicationLoader extends Application {
     }
 
     private void initPushServices() {
+        if (EncrogramHooks.get().holdTelegramPush(this::initPushServices)) return; // ENCROGRAM-HOOK(telegramAsleep)
         AndroidUtilities.runOnUIThread(() -> {
             if (getPushProvider().hasServices()) {
                 getPushProvider().onRequestPushToken();
@@ -601,6 +602,7 @@ public class ApplicationLoader extends Application {
     }
 
     public static boolean isNetworkOnline() {
+        if (EncrogramHooks.get().keepTelegramOffline()) return false; // ENCROGRAM-HOOK(telegramAsleep)
         boolean result = isNetworkOnlineRealtime();
         if (BuildVars.DEBUG_PRIVATE_VERSION) {
             boolean result2 = isNetworkOnlineFast();

@@ -201,7 +201,7 @@ final class SecuredBackupSettingsActivity extends SecuredBackupScreen {
         b.setTitle(title);
         b.setMessage(message);
         b.setPositiveButton(c.getString(R.string.sec_bs_ok), null);
-        showDialog(b.create());
+        Kit.show(this, b.create());
     }
 
     // ---- turn off --------------------------------------------------------------------------------------------
@@ -214,7 +214,7 @@ final class SecuredBackupSettingsActivity extends SecuredBackupScreen {
         b.setNegativeButton(c.getString(R.string.sec_bs_cancel), null);
         b.setPositiveButton(c.getString(R.string.sec_bs_confirm_off_button), (d, w) -> turnOff(c));
         final AlertDialog dialog = b.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         final View ok = dialog.getButton(DialogInterface.BUTTON_POSITIVE);
         if (ok instanceof TextView) ((TextView) ok).setTextColor(Theme.getColor(Theme.key_text_RedBold, SecuredResourcesProvider.get()));
     }

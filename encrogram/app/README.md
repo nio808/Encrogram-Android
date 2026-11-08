@@ -15,10 +15,18 @@ Modelled on `TMessagesProj_App/build.gradle`, which stays untouched. Output: `en
 - Not copied: Google voice search client (GoogleVoiceClientActivity/Service).
 
 ## Upstream hooks (all marked `ENCROGRAM-HOOK`)
-Upstream files changed: settings.gradle, MainTabsActivity, DialogsActivity, DialogStoriesCell (4) plus new file `messenger/EncrogramHooks.java`.
+Upstream files changed: 6 of 6 (the limit), plus the new file `messenger/EncrogramHooks.java` (no-op defaults; it can't conflict on a merge):
+settings.gradle, MainTabsActivity, DialogsActivity, DialogStoriesCell, LaunchActivity, ApplicationLoader. No hook budget is left: new
+needs go through the existing hooks or our own modules.
 - `settings.gradle:19` settings - include encrogram modules.
-- `ui/MainTabsActivity.java:805` and `:832` chatsHost - wrap DialogsActivity in the two-page host.
-- `ui/DialogsActivity.java:3192` titleOverlay - route Telegram's connection text to the control.
-- `ui/DialogsActivity.java:3523` titleSwitcher - install the control in the action-bar title.
-- `ui/Stories/DialogStoriesCell.java:336` and `:2211` storiesTitle - control in the stories title slot; keep it visible.
-- Each of the three files also has one `import` line marked `ENCROGRAM-HOOK(import)`.
+- `ui/MainTabsActivity.java:804` and `:831` chatsHost - wrap DialogsActivity in the two-page host.
+- `ui/DialogsActivity.java:3191` titleOverlay - route Telegram's connection text to the control.
+- `ui/DialogsActivity.java:3522` titleSwitcher - install the control in the action-bar title.
+- `ui/Stories/DialogStoriesCell.java:335` and `:2210` storiesTitle - control in the stories title slot; keep it visible.
+- `ui/LaunchActivity.java:1095` and `:1264` loggedOut - our welcome screen (or the Secured list in Secured-only mode) when no Telegram account is active.
+- `ui/LaunchActivity.java:1535` openSecured - Secured notification taps and links, before any Telegram account switch.
+- `ui/LaunchActivity.java:8632` telegramAsleep - wake Telegram's network when its intro or login screen opens.
+- `messenger/ApplicationLoader.java:400` and `:605` telegramAsleep - with no Telegram account (and no login in progress),
+  Telegram's network sees "offline" and its push-token request waits (gaps audit L3, owner 8 November 2026). Device-tested:
+  no socket to Telegram until the Telegram tab or "Continue with Telegram" is tapped. Logic: `SecuredHooks` ("Telegram asleep").
+- Line numbers drift on upstream merges; `grep -rn ENCROGRAM-HOOK` is the source of truth.

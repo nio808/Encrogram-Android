@@ -16,12 +16,14 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.telegram.ui.ActionBar.BaseFragment;
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.LayoutHelper;
@@ -65,8 +67,7 @@ final class SecuredSheets {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
-        Kit.secure(sheet);
-        fragment.showDialog(sheet);
+        Kit.show(fragment, sheet);
 
         try {
             engine.createInvite(result -> {
@@ -124,7 +125,8 @@ final class SecuredSheets {
     static void copyToClipboard(Context context, String text, boolean sensitive) {
         final ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
         if (cm == null) return;
-        final ClipData clip = ClipData.newPlainText("Encrogram", text);
+        final String label = "Encrogram-" + (++copySeq);
+        final ClipData clip = ClipData.newPlainText(label, text);
         if (sensitive) {
             final PersistableBundle extras = new PersistableBundle();
             // Same key as ClipDescription.EXTRA_IS_SENSITIVE (API 33); the string works on every level.
@@ -132,6 +134,35 @@ final class SecuredSheets {
             clip.getDescription().setExtras(extras);
         }
         cm.setPrimaryClip(clip);
+        // Keyboard clipboard histories would keep it: clear it again after a minute if it is still ours.
+        final int mine = copySeq;
+        final Context app = context.getApplicationContext();
+        AndroidUtilities.runOnUIThread(() -> clearIfStillOurs(app != null ? app : context, label, mine), CLIPBOARD_CLEAR_MS);
+    }
+
+    private static final long CLIPBOARD_CLEAR_MS = 60_000;
+    private static int copySeq;   // memory only: a later Secured copy owns the clipboard and has its own timer
+
+    /**
+     * Clears the clipboard only when our clip is still on it. The description (label) is readable from the background;
+     * the text is not (Android 10+). Unreadable or empty description: nothing else is known to be there, so clear.
+     * A different label means the user copied something else: leave it alone.
+     */
+    private static void clearIfStillOurs(Context context, String label, int seq) {
+        if (seq != copySeq) return;
+        try {
+            final ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null) return;
+            final ClipDescription d = cm.getPrimaryClipDescription();
+            if (d != null && d.getLabel() != null && !label.contentEquals(d.getLabel())) return;
+            if (Build.VERSION.SDK_INT >= 28) {
+                cm.clearPrimaryClip();
+            } else {
+                cm.setPrimaryClip(ClipData.newPlainText("", ""));
+            }
+        } catch (Throwable ignored) {
+            // clipboard not accessible: nothing more to do
+        }
     }
 
     /** Android's own share sheet. Encrogram's Telegram share target is excluded so the link cannot slip into Telegram by accident. */
@@ -160,6 +191,8 @@ final class SecuredSheets {
         input.setTextColor(Kit.color(Theme.key_windowBackgroundWhiteBlackText));
         input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        input.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING); // keyboard doesn't learn invite links
+        input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         input.setMinLines(2);
         input.setMaxLines(5);
         input.setGravity(Gravity.TOP | Gravity.START);
@@ -190,7 +223,6 @@ final class SecuredSheets {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, true, SecuredResourcesProvider.get());
         builder.setCustomView(box);
         final BottomSheet sheet = builder.create();
-        Kit.secure(sheet);
 
         connect.setOnClickListener(v -> {
             final String link = input.getText().toString().trim();
@@ -253,7 +285,7 @@ final class SecuredSheets {
                 showError(error, context.getString(R.string.sec_connect_failed, t.getClass().getSimpleName()));
             }
         });
-        if (fragment.showDialog(sheet) == null) return false;
+        if (Kit.show(fragment, sheet) == null) return false;
         if (prefill == null) {
             input.requestFocus();
         }

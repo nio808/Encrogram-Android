@@ -81,10 +81,16 @@ object SecuredBackground {
         openChatId = chatId
     }
 
-    /** Cancels that chat's notification (call when the user has seen the chat). */
+    /** Takes that chat out of the combined notification (call when the user has seen the chat). */
     @JvmStatic
     fun clearChat(chatId: Long) {
-        SecuredNotifier.clear(appContext ?: return, chatId)
+        SecuredNotifier.clear(appContext ?: return, config, chatId)
+    }
+
+    /** Cancels the combined notification (call when the Secured chat list comes on screen). */
+    @JvmStatic
+    fun clearAll() {
+        SecuredNotifier.clearAll(appContext ?: return)
     }
 
     internal fun isChatOnScreen(chatId: Long): Boolean = resumedActivities > 0 && openChatId == chatId

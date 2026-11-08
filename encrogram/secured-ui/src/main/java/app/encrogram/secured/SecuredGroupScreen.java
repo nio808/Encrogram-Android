@@ -143,6 +143,13 @@ abstract class SecuredGroupScreen extends BaseFragment implements SecuredScreen 
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
         }
         if (flagSecure != null) flagSecure.attach();
+        Kit.reassertSecure(getParentActivity());
+    }
+
+    @Override
+    public void onBecomeFullyVisible() {
+        super.onBecomeFullyVisible();
+        Kit.reassertSecure(getParentActivity());
     }
 
     // Kept through onPause (Home, Recents snapshot); dropped only when covered or gone, as in SecuredChatActivity.

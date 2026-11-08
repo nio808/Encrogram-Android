@@ -9,7 +9,8 @@ package app.encrogram.core.api
  * - Errors are reported as [SecuredError], never as raw engine JSON or exceptions.
  *
  * v2 (docs/v2-plan.md): one profile, one-time invites, 1:1 text chats with reply, edit, delete,
- * reactions, forward, search, disappearing messages and chat flags. Later: groups, files, voice.
+ * reactions, forward, search, disappearing messages and chat flags; groups, roles and group links (step 6).
+ * Files and voice come with media (step 5).
  * Changes caused by our own actions and by the peer arrive the same way: through [SecuredListener].
  */
 interface SecuredEngine {

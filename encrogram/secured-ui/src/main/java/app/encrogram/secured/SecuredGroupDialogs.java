@@ -35,7 +35,7 @@ final class SecuredGroupDialogs {
         }
         b.setNegativeButton(activity.getString(R.string.sec_list_cancel), null);
         final AlertDialog dialog = b.create();
-        fragment.showDialog(dialog);
+        Kit.show(fragment, dialog);
         dialog.redPositive();
     }
 }

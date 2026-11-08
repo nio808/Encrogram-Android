@@ -341,6 +341,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
         }
         if (flagSecure != null) flagSecure.attach();
+        Kit.reassertSecure(getParentActivity());
         ensureEngine();
         if (host == null) {
             background.arm();
@@ -360,6 +361,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         super.onPause();
         resumed = false;
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
+    }
+
+    @Override
+    public void onBecomeFullyVisible() {
+        super.onBecomeFullyVisible();
+        Kit.reassertSecure(getParentActivity());
     }
 
     // FLAG_SECURE stays through onPause (Home, Recents snapshot); dropped when covered, on the Telegram tab, or gone.
@@ -415,6 +422,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         // The ⋮ menu (only on the list): Backup. Same construction as the chat screen's menu.
         final ActionBarMenu menu = actionBar.createMenu();
         moreItem = menu.addItem(0, org.telegram.messenger.R.drawable.ic_ab_other, SecuredResourcesProvider.get());
+        Kit.securePopup(moreItem.getPopupLayout());
         moreItem.setContentDescription(context.getString(R.string.sec_bk_menu_more));
         moreItem.addSubItem(ID_BACKUP, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.sec_bk_menu), SecuredResourcesProvider.get());
         moreItem.setVisibility(mode == Mode.LIST ? View.VISIBLE : View.GONE);
@@ -544,6 +552,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         nameInput.setHintTextColor(Kit.color(Theme.key_windowBackgroundWhiteGrayText));
         nameInput.setTextColor(Kit.color(Theme.key_windowBackgroundWhiteBlackText));
         nameInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17);
+        nameInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         nameInput.setSingleLine(true);
         nameInput.setMaxLines(1);
         nameInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -697,7 +706,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                     else if (which == 1) SecuredSheets.showConnect(this, engine, null);
                     else presentFragment(new SecuredNewGroupActivity(which == 3, host != null));   // new group / new channel
                 });
-        showDialog(b.create());
+        Kit.show(this, b.create());
     }
 
     // ---- backup (12 words): offer, banner ----------------------------------------------------------------------
@@ -1011,6 +1020,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         mode.addItemWithWidth(ID_DELETE, org.telegram.messenger.R.drawable.msg_delete, dp(48), context.getString(R.string.sec_list_delete));
         otherItem = mode.addItemWithWidth(0, org.telegram.messenger.R.drawable.ic_ab_other, dp(48), context.getString(R.string.sec_list_more));
         otherItem.addSubItem(ID_READ, org.telegram.messenger.R.drawable.msg_markread, context.getString(R.string.sec_list_mark_read));
+        Kit.securePopup(otherItem.getPopupLayout());
     }
 
     private void updateActionMode() {
@@ -1188,7 +1198,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             clearSelection();
         });
         final AlertDialog dialog = b.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         final View ok = dialog.getButton(DialogInterface.BUTTON_POSITIVE);
         if (ok instanceof TextView) ((TextView) ok).setTextColor(Theme.getColor(Theme.key_text_RedBold, SecuredResourcesProvider.get()));
     }

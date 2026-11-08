@@ -204,8 +204,8 @@ input (empty, too long, bad page) is `UNKNOWN`, as before.
 
 Package `app.encrogram.core.background`. No Telegram imports; the app passes the small icon, accent colour and the tap intent through `NotificationConfig` (`SecuredBackground.install`).
 - **What runs:** `SecuredService`, a foreground service of type `remoteMessaging`, keeps the process alive so the engine's relay connections stay open. It starts the engine (idempotent), never stops it, and turns incoming messages (not outgoing, not from muted chats, not the chat on screen) into notifications. `SecuredBootReceiver` restarts it after boot or an update, only if the flag file `noBackupFilesDir/encrogram-secured/background_on` exists (outside Android backups, so a restored phone never starts it by itself). Tap intents carry a random per-install token (`open_token` in the same folder); `SecuredHooks` ignores `OPEN_CHAT` intents without it, because `LaunchActivity` is exported. There is no swipe-from-Recents restart: Android refuses background service starts from an alarm, so the service relies on `START_STICKY`. `BatteryHelper` has the battery-exemption checks and request intent.
-- **Channels:** group `encrogram_secured`; `encrogram_secured_messages` (high) and `encrogram_secured_service` (low, no badge). Posted with tag `encrogram_secured`, id = the local chat id's hash, so Telegram's untagged ids cannot touch them.
-- **What a notification shows:** hidden mode only. Title "Encrogram", text "New Secured message" ("3 new Secured messages" for several), no sender, no text, no actions, private on the lock screen. The tap intent carries only the local chat id.
+- **Channels:** group `encrogram_secured`; `encrogram_secured_messages` (high) and `encrogram_secured_service` (low, no badge). Posted with tag `encrogram_secured` and one fixed id (`NotificationText.MESSAGES_ID`), so Telegram's untagged ids cannot touch it.
+- **What a notification shows:** one combined notification for all Secured chats (owner, 8 November 2026), hidden mode only. Title "Secured", text "1 new message", "5 new messages" or "5 new messages in 3 chats"; no sender, no text, no actions; the lock screen shows "New Secured message" without counts. A tap opens the chat when everything unseen is from one chat, otherwise the list. Opening the list clears it; opening a chat takes that chat out of the count. Counts live in memory (`UnreadTracker`), so a restart can only undercount.
 - **Known limits:** force-stop stops it until the app is opened again. No reply or mark-read actions yet. Prompt delivery while the phone is idle (Doze) needs the battery exemption. After the user swipes the app away, the restart alarm may be refused by Android 12+ and then the service returns only at the next app launch or boot. Battery cost is not measured yet.
 
 ## Backup with 12 words
@@ -267,13 +267,11 @@ addresses or keys.
   (`useServerCfgs`), and the agent's `mkUserServers`/`knownHosts` can use disabled servers when no enabled server
   has a role. We verify on every start that this cannot happen with the stored config, but nothing in the
   engine enforces it afterwards. The real fix is the preset fork plus a transport-level allowlist (§4.2, §4.4).
-- **Our relay still proxies to foreign relays.** With `smp-proxy=unknown` and no fallback the phone never opens
-  a connection to an unknown SMP relay, but if a peer moves its queue elsewhere our relay forwards to it until
-  the server-side `PRXY` patch (§4.4 step 2) lands. Links to other relays are refused before connecting.
-- **No background receiving.** The engine runs only while the app process runs; no service, no notifications.
-- **Group, channel and relay links** (`/g`, `/c`, `/r`) are reported as `Malformed` by `checkLink`. One-time
-  invites (`/i`, `/invitation`) and contact addresses (`/a`, `/contact`) are accepted; accepting incoming contact
-  requests is not implemented.
+- **Foreign relays.** With `smp-proxy=unknown` and no fallback the phone never opens a connection to an unknown
+  SMP relay, and our relay's forwarding block is live (see `LOG.md`), so it no longer forwards to foreign relays.
+  Links to other relays are refused before connecting.
+- **Channel and relay links** (`/c`, `/r`) are reported as `Malformed` by `checkLink`. One-time invites, contact
+  addresses and group links (`/g`) are accepted.
 - New-user window: a brand-new user is seeded with presets until step 4 finishes. That window is now covered by
   the first-run lock (all traffic forced to a closed local SOCKS port until our servers are verified). Checked
   against simplexmq v7.0.1 source; the core's exact pinned revision isn't available locally, and it hasn't
@@ -284,9 +282,9 @@ addresses or keys.
   core's uncompressed message limit).
 - The GHC runtime (`-A64m -H64m`, fixed in the prebuilt glue) runs inside Telegram's process and cannot be
   restarted; `stop()` stops the chat and closes the store, and a later `start()` opens a new controller.
-- The passphrase is a Java `String` and cannot be wiped from memory. Telegram's manifest allows backup: the
-  wrapped passphrase in `encrogram_secured_keys` may be backed up, but it is useless without the device-bound
-  Keystore key, and the databases live in `noBackupFilesDir`.
+- The passphrase is a Java `String` and cannot be wiped from memory. Telegram's manifest allows backup; our app
+  manifest excludes `encrogram_secured_keys` and `encrogram_secured_ui` from cloud backup and device transfer
+  (`app/src/main/res/xml/encrogram_*_rules.xml`), and the databases live in `noBackupFilesDir`.
 - The JNI glue's returned C strings are never freed (upstream defect, small leak per call).
 - A reply keeps the quoted text (it is part of the reply's own message), so `replyTo.text` can still show text of a
   message that was later deleted. Hiding it needs a lookup per quote; not done yet.

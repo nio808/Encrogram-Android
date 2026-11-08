@@ -17,7 +17,7 @@ class BackgroundTextTest {
     fun hiddenTextNeverHasNamesOrMessageText() {
         val secretText = "meet at the bridge"
         val secretName = "Alice"
-        val all = listOf(1, 2, 3, 99).map { NotificationText.messageText(it) } +
+        val all = listOf(1, 2, 3, 99).map { NotificationText.combinedText(it, it) } + NotificationText.PUBLIC_TEXT +
             NotificationText.TITLE + NotificationText.SERVICE_TEXT + NotificationText.SERVICE_TITLE
         for (s in all) {
             assertFalse(s.contains(secretText))
@@ -26,35 +26,36 @@ class BackgroundTextTest {
     }
 
     @Test
-    fun countText() {
-        assertEquals("New Secured message", NotificationText.messageText(1))
-        assertEquals("New Secured message", NotificationText.messageText(0))
-        assertEquals("3 new Secured messages", NotificationText.messageText(3))
+    fun combinedCountText() {
+        assertEquals("1 new message", NotificationText.combinedText(1, 1))
+        assertEquals("1 new message", NotificationText.combinedText(0, 0))
+        assertEquals("5 new messages", NotificationText.combinedText(5, 1))
+        assertEquals("5 new messages in 3 chats", NotificationText.combinedText(5, 3))
+        assertEquals("2 new messages in 2 chats", NotificationText.combinedText(2, 2))
     }
 
     @Test
-    fun notificationIdIsStableAndNeverTheSummary() {
-        assertEquals(NotificationText.notificationId(42L), NotificationText.notificationId(42L))
-        assertEquals(42, NotificationText.notificationId(42L))
-        assertNotEquals(NotificationText.notificationId(1L), NotificationText.notificationId(2L))
-        assertNotEquals(NotificationText.SUMMARY_ID, NotificationText.notificationId(1L))
+    fun singleMessageIdForEveryChat() {
+        // One id, tagged: no per-chat ids left for notification listeners to count by.
+        assertEquals(1, NotificationText.MESSAGES_ID)
+        assertNotEquals(NotificationText.SERVICE_ID, NotificationText.MESSAGES_ID)
     }
 
     @Test
-    fun groupNotificationIdsNeverMeetContactIds() {
-        val base = app.encrogram.core.api.GROUP_CHAT_ID_BASE
-        // The old `chatId xor (chatId ushr 32)` folded group 3 onto contact 259 (3 xor 256): the kind is mixed in now.
-        for (g in listOf(1L, 3L, 256L, 0x3FFFFFFFL)) {
-            val id = NotificationText.notificationId(base + g)
-            assertTrue("groups use the negative half", id < -1)
-            assertNotEquals(NotificationText.SUMMARY_ID, id)
-            for (c in listOf(g, g xor 256L, 1L, 259L, Int.MAX_VALUE.toLong())) assertNotEquals(NotificationText.notificationId(c), id)
-        }
-        assertEquals(Int.MIN_VALUE + 3, NotificationText.notificationId(base + 3))
-        assertNotEquals(NotificationText.notificationId(base + 3), NotificationText.notificationId(base + 4))
-        // Contacts keep the ids they had.
-        assertEquals(259, NotificationText.notificationId(259L))
-        assertEquals(Int.MAX_VALUE, NotificationText.notificationId(Int.MAX_VALUE.toLong()))
+    fun unreadTrackerCountsAndPicksTapTarget() {
+        val t = UnreadTracker()
+        assertEquals(0, t.total())
+        assertEquals(null, t.singleChat())
+        t.add(5); t.add(5)
+        assertEquals(2, t.total()); assertEquals(1, t.chats()); assertEquals(5L, t.singleChat())
+        t.add(GROUP_CHAT_ID_BASE + 3)
+        assertEquals(3, t.total()); assertEquals(2, t.chats()); assertEquals(null, t.singleChat())
+        t.clear(5)
+        assertEquals(1, t.total()); assertEquals(GROUP_CHAT_ID_BASE + 3, t.singleChat())
+        t.clear(GROUP_CHAT_ID_BASE + 3)
+        assertEquals(0, t.total())
+        t.add(1); t.add(2); t.clearAll()
+        assertEquals(0, t.chats())
     }
 
     @Test

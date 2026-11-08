@@ -80,6 +80,30 @@ public final class EncrogramHooks {
         default BaseFragment loggedOutIntro(BaseFragment intro) {
             return intro;
         }
+
+        /**
+         * ApplicationLoader.isNetworkOnline. Return true to make Telegram's network layer see no network: it then opens
+         * no connection and starts no DNS fallback. Encrogram returns true while no Telegram account is activated and no
+         * Telegram login is in progress, until Telegram's intro or login screen opens. The default returns false.
+         */
+        default boolean keepTelegramOffline() {
+            return false;
+        }
+
+        /**
+         * ApplicationLoader.initPushServices, before the push-token request. Return true to postpone it; Encrogram then
+         * runs {@code initPushServices} itself when Telegram wakes. The default returns false: the request goes out now.
+         */
+        default boolean holdTelegramPush(Runnable initPushServices) {
+            return false;
+        }
+
+        /**
+         * LaunchActivity.needPresentFragment, before a screen is shown. Encrogram wakes Telegram's network here when
+         * Telegram's intro or login screen opens. The default does nothing.
+         */
+        default void willPresentFragment(BaseFragment fragment) {
+        }
     }
 
     private static final Hooks DEFAULT = new Hooks() {};

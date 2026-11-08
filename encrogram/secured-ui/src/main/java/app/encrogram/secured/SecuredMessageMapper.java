@@ -1,8 +1,10 @@
 package app.encrogram.secured;
 
 import android.content.Context;
+import android.text.Spannable;
 import android.text.SpannableString;
 import android.text.Spanned;
+import android.text.style.ClickableSpan;
 import android.text.style.URLSpan;
 import android.text.util.Linkify;
 
@@ -14,6 +16,8 @@ import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AnimatedEmojiSpan;
 import org.telegram.ui.Components.AvatarDrawable;
+import org.telegram.ui.Components.URLSpanBrowser;
+import org.telegram.ui.Components.URLSpanMono;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,7 +48,8 @@ import app.encrogram.core.api.SecuredMessage;
  * mention, hashtag or bot command entities;</li>
  * <li>peer, sender and dialog id are the sentinel {@link #SENTINEL_ID};</li>
  * <li>the subclass {@link SecuredMessageObject} switches off the big animated emoji sticker lookup, the
- * emoji-to-Lottie replacement, avatars and the share button;</li>
+ * emoji-to-Lottie replacement, avatars and the share button, and removes Telegram's own link spans (mention,
+ * hashtag, cashtag, bot command, ...) every time Telegram parses the text ({@link LinkSpans});</li>
  * <li>{@code out}, {@code id} sign, {@code send_state} and {@code unread} follow our honest status mapping:
  * clock while sending, one tick on our server, two ticks when delivered (no "read" state exists), error when
  * failed.</li>
@@ -417,6 +422,117 @@ public final class SecuredMessageMapper {
         public boolean isOutOwner() {
             return messageOwner != null && messageOwner.out;
         }
+
+        /**
+         * Every text pass of Telegram's {@code applyEntities} ends here, after {@code addLinks} and
+         * {@code addUrlsByPattern} and before {@code generateLayout} builds the layout from the same text. That covers
+         * construction, re-layout ({@code checkLayout} on resize or font change), {@code applyNewText} and
+         * {@code setQuery}. Strip Telegram's link spans here so neither the drawn text nor a tap can reach them.
+         */
+        @Override
+        public boolean addEntitiesToText(CharSequence text, boolean photoViewer, boolean useManualParse) {
+            final boolean hasUrls = super.addEntitiesToText(text, photoViewer, useManualParse);
+            LinkSpans.strip(text);
+            return hasUrls;
+        }
+
+        /**
+         * Backstop in case an upstream change adds link spans outside {@link #addEntitiesToText}: strip again from the
+         * text taps read ({@code messageText}) and the text each layout block draws. It counts what it had to remove,
+         * so {@link SecuredMessageMapper#selfCheck} notices when the hook above stops running.
+         */
+        @Override
+        public void generateLayout(TLRPC.User fromUser) {
+            super.generateLayout(fromUser);
+            int removed = LinkSpans.strip(messageText);
+            if (textLayoutBlocks != null) {
+                for (int i = 0; i < textLayoutBlocks.size(); i++) {
+                    final MessageObject.TextLayoutBlock block = textLayoutBlocks.get(i);
+                    if (block != null && block.textLayout != null) {
+                        removed += LinkSpans.strip(block.textLayout.getText());
+                    }
+                }
+            }
+            backstopRemovals += removed;
+        }
+    }
+
+    /** Spans the {@code generateLayout} backstop removed because the {@code addEntitiesToText} hook missed them. Main thread. */
+    private static int backstopRemovals;
+
+    // ---- link spans -------------------------------------------------------------------------------------------
+
+    /**
+     * Keeps Telegram's own link spans out of Secured bubbles (research/gaps-audit.md, L4). Runs in every build.
+     * <p>
+     * Why: for a pending or failed outgoing bubble (negative id, send state not "sent") Telegram's
+     * {@code MessageObject.applyEntities} ignores our entities and re-parses the text ({@code useManualParse}):
+     * {@code addLinks} adds plain {@link URLSpan}s for http, https, tg and tonsite addresses, and
+     * {@code addUrlsByPattern} adds {@code URLSpanNoUnderline} for @mention, #hashtag and $cashtag and
+     * {@code URLSpanBotCommand} for /command. Their own {@code onClick} opens t.me through Telegram's Browser.
+     * <p>
+     * Rule (an allowlist, so a new upstream span type is refused too): a span that is not clickable (emoji, our italic
+     * labels, colours) stays. A clickable span stays only when its class is exactly Android's {@link URLSpan}
+     * (Telegram's re-parse) or Telegram's {@link URLSpanBrowser} (our URL entities) and its address is http or https;
+     * SecuredChatActivity asks "Open link?" before either opens. Everything else is removed, including
+     * {@link URLSpanMono} (tap to copy) and {@link AnimatedEmojiSpan} (Telegram documents). The text itself is never
+     * changed and never logged.
+     */
+    static final class LinkSpans {
+
+        private LinkSpans() {
+        }
+
+        /** Whether a span of this class, pointing at this address, may stay in a Secured bubble. Pure. */
+        static boolean allowed(Class<?> type, String url) {
+            if (type == null) return false;
+            if (AnimatedEmojiSpan.class.isAssignableFrom(type) || URLSpanMono.class.isAssignableFrom(type)) return false;
+            if (!ClickableSpan.class.isAssignableFrom(type)) return true;
+            return (type == URLSpan.class || type == URLSpanBrowser.class) && isWebUrl(url);
+        }
+
+        static boolean isWebUrl(String url) {
+            return url != null && (url.regionMatches(true, 0, "https://", 0, 8) || url.regionMatches(true, 0, "http://", 0, 7));
+        }
+
+        /** The spans of {@code text} that {@link #allowed} refuses; empty for clean or plain text. Never throws. */
+        static List<Object> refused(CharSequence text) {
+            final ArrayList<Object> out = new ArrayList<>();
+            if (!(text instanceof Spanned)) return out;
+            try {
+                final Spanned s = (Spanned) text;
+                for (Object span : s.getSpans(0, s.length(), Object.class)) {
+                    if (span != null && !allowedSpan(span)) out.add(span);
+                }
+            } catch (Throwable ignore) {
+                // Unreadable text: nothing to report. The chat screen's didPressUrl still refuses non-web links.
+            }
+            return out;
+        }
+
+        /** Removes the refused spans in place. Returns how many were removed. Never throws, never logs. */
+        static int strip(CharSequence text) {
+            if (!(text instanceof Spannable)) return 0;
+            final Spannable s = (Spannable) text;
+            int removed = 0;
+            for (Object span : refused(text)) {
+                try {
+                    s.removeSpan(span);
+                    removed++;
+                } catch (Throwable ignore) {
+                    // Keep going: one bad span must not leave the others in place.
+                }
+            }
+            return removed;
+        }
+
+        private static boolean allowedSpan(Object span) {
+            try {
+                return allowed(span.getClass(), span instanceof URLSpan ? ((URLSpan) span).getURL() : null);
+            } catch (Throwable t) {
+                return false; // cannot inspect it: remove it
+            }
+        }
     }
 
     // ---- self-check -------------------------------------------------------------------------------------------
@@ -425,11 +541,15 @@ public final class SecuredMessageMapper {
      * Builds sample Secured messages and checks the shape rules above. Returns the list of failures (empty when all
      * pass). Needs an Android context (Telegram's MessageObject uses Theme resources), so it runs on a device or
      * emulator, on the main thread, for example from a debug menu: {@code SecuredMessageMapper.selfCheck(ctx, account)}.
+     * Debug builds only (SecuredUi.debugSelfCheck): it builds sample objects and reloads Theme chat resources. The
+     * protection it checks, {@link LinkSpans}, runs in every build and fails safe on its own (strip and continue).
+     * Run it after every upstream merge: the L4 block fails if Telegram's text parse changed under the hook.
      */
     public static List<String> selfCheck(Context context, int account) {
         final ArrayList<String> failures = new ArrayList<>();
         try {
             Theme.createChatResources(context, false);
+            final int backstopBefore = backstopRemovals;
             final SecuredMessageMapper mapper = new SecuredMessageMapper(context, account);
             mapper.setNames("Peer", "Me");
             final String canary = "secured-canary-7f3a";
@@ -447,7 +567,7 @@ public final class SecuredMessageMapper {
 
             final SecuredMessage delivered = sample(1, true, "hello " + canary + " https://example.com/x", MessageStatus.DELIVERED, null, false, false, reactions);
             final SecuredMessage server = sample(2, true, "one tick", MessageStatus.SENT_TO_SERVER, null, false, false, reactions);
-            final SecuredMessage sending = sample(3, true, "@someone #tag /start", MessageStatus.SENDING, null, false, false, reactions);
+            final SecuredMessage sending = sample(3, true, LINK_SAMPLE, MessageStatus.SENDING, null, false, false, reactions);
             final SecuredMessage failed = sample(4, true, "not sent", MessageStatus.FAILED, null, false, false, reactions);
             final SecuredMessage emoji1 = sample(5, false, "😀", MessageStatus.RECEIVED, null, false, false, reactions);
             final SecuredMessage emoji2 = sample(6, false, "😀😂", MessageStatus.RECEIVED, null, false, false, reactions);
@@ -482,6 +602,21 @@ public final class SecuredMessageMapper {
             check(failures, d.replyMessageObject == null, "deleted message has no quote");
             check(failures, !mapped[0].messageOwner.message.isEmpty() && hasUrlEntity(mapped[0]), "plain URL becomes a URL entity");
 
+            // L4: pending and failed bubbles make Telegram re-parse the text; sent and incoming ones use our entities.
+            // In every state, and after a re-layout, only the https link may stay clickable.
+            final MessageStatus[] states = {MessageStatus.SENDING, MessageStatus.FAILED, MessageStatus.SENT_TO_SERVER,
+                    MessageStatus.DELIVERED, MessageStatus.RECEIVED};
+            for (int i = 0; i < states.length; i++) {
+                final boolean outgoing = states[i] != MessageStatus.RECEIVED;
+                final MessageObject lm = mapper.map(sample(20 + i, outgoing, LINK_SAMPLE, states[i], null, false, false, reactions));
+                final String label = "links " + states[i];
+                checkShape(failures, label, lm, outgoing);
+                checkOnlyWebLink(failures, label, lm);
+                lm.generateLayout(null); // what checkLayout does on a resize or font-size change
+                checkOnlyWebLink(failures, label + " after re-layout", lm);
+            }
+            check(failures, backstopRemovals == backstopBefore, "link spans are removed in addEntitiesToText (backstop unused)");
+
             // Group bubble: member name, colour and avatar fields only; the sentinel stays the only peer id.
             final SecuredMessageMapper group = new SecuredMessageMapper(context, account);
             group.setKind(ChatKind.GROUP);
@@ -500,6 +635,34 @@ public final class SecuredMessageMapper {
     }
 
     private static final long GROUP_CHAT_ID_BASE_FOR_CHECK = app.encrogram.core.api.SecuredEngineKt.GROUP_CHAT_ID_BASE + 1;
+
+    /** Everything Telegram's parse links (mention, hashtag, cashtag, bot command) plus one real web link. */
+    static final String LINK_SAMPLE = "@durov #tag $USD /start https://example.com";
+    static final String LINK_SAMPLE_URL = "https://example.com";
+
+    /** The L4 sample keeps exactly one clickable span: the https link, of a kind our "Open link?" flow handles. */
+    private static void checkOnlyWebLink(List<String> failures, String label, MessageObject mo) {
+        if (!(mo.messageText instanceof Spanned)) {
+            failures.add(label + ": no link span (text not spanned)");
+            return;
+        }
+        final Spanned s = (Spanned) mo.messageText;
+        final ClickableSpan[] links = s.getSpans(0, s.length(), ClickableSpan.class);
+        final String url = links.length == 1 && links[0] instanceof URLSpan ? ((URLSpan) links[0]).getURL() : null;
+        check(failures, url != null && LINK_SAMPLE_URL.equals(url) && LinkSpans.allowed(links[0].getClass(), url),
+                label + ": only the https link is clickable");
+    }
+
+    /** No refused span in the text taps read or in the text any layout block draws. */
+    private static void checkNoTelegramSpans(List<String> failures, String label, MessageObject mo) {
+        check(failures, LinkSpans.refused(mo.messageText).isEmpty(), label + ": no Telegram link spans");
+        if (mo.textLayoutBlocks == null) return;
+        for (int i = 0; i < mo.textLayoutBlocks.size(); i++) {
+            final MessageObject.TextLayoutBlock b = mo.textLayoutBlocks.get(i);
+            check(failures, b == null || b.textLayout == null || LinkSpans.refused(b.textLayout.getText()).isEmpty(),
+                    label + ": no Telegram link spans in the drawn text");
+        }
+    }
 
     private static boolean hasUrlEntity(MessageObject mo) {
         for (TLRPC.MessageEntity e : mo.messageOwner.entities) {
@@ -538,6 +701,7 @@ public final class SecuredMessageMapper {
             final Spanned s = (Spanned) mo.messageText;
             check(failures, s.getSpans(0, s.length(), AnimatedEmojiSpan.class).length == 0, label + ": no custom or animated emoji");
         }
+        checkNoTelegramSpans(failures, label, mo);
         check(failures, mo.emojiAnimatedSticker == null && mo.emojiAnimatedStickerId == null, label + ": no emoji sticker");
         check(failures, mo.getDocument() == null && (mo.photoThumbs == null || mo.photoThumbs.isEmpty()), label + ": no document or thumbs");
         check(failures, mo.type == MessageObject.TYPE_TEXT || mo.type == MessageObject.TYPE_EMOJIS, label + ": text type");

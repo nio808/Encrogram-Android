@@ -12,13 +12,16 @@ import android.content.res.ColorStateList;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.PopupWindow;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.core.graphics.ColorUtils;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AvatarDrawable;
 
@@ -30,6 +33,62 @@ final class Kit {
     /** A dialog or sheet is its own window, so the activity's FLAG_SECURE does not cover it: no screenshots, blank in Recents. */
     static void secure(Dialog d) {
         if (d != null && d.getWindow() != null) d.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    }
+
+    /**
+     * Telegram's story viewer and payment screen clear the activity's FLAG_SECURE directly, behind FlagSecureReason's back.
+     * Call when a Secured screen becomes visible again: puts the flag back only while some Secured screen holds a reason.
+     */
+    static void reassertSecure(android.app.Activity activity) {
+        if (activity == null || activity.getWindow() == null) return;
+        if (org.telegram.messenger.FlagSecureReason.isSecuredNow(activity.getWindow())) {
+            activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        }
+    }
+
+    /** The one way a Secured screen shows a dialog or sheet: FLAG_SECURE first, then Telegram's showDialog (null during a screen transition). */
+    static Dialog show(BaseFragment fragment, Dialog d) {
+        secure(d);
+        return fragment.showDialog(d);
+    }
+
+    /**
+     * A PopupWindow (message menu, "more" menu) is its own window too and has no getWindow(): once its content is attached,
+     * add FLAG_SECURE to the window's layout params. Safe to call before or after the popup shows; it re-applies on every show.
+     */
+    static void securePopup(View content) {
+        if (content == null) return;
+        if (content.isAttachedToWindow()) {
+            secureRootWindow(content);
+        }
+        content.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View v) {
+                v.post(() -> secureRootWindow(v));
+            }
+
+            @Override
+            public void onViewDetachedFromWindow(View v) {}
+        });
+    }
+
+    static void securePopup(PopupWindow popup) {
+        if (popup != null) securePopup(popup.getContentView());
+    }
+
+    private static void secureRootWindow(View v) {
+        try {
+            final View root = v.getRootView();
+            final ViewGroup.LayoutParams lp = root.getLayoutParams();
+            if (!(lp instanceof WindowManager.LayoutParams)) return;
+            final WindowManager.LayoutParams p = (WindowManager.LayoutParams) lp;
+            if ((p.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0) return;
+            p.flags |= WindowManager.LayoutParams.FLAG_SECURE;
+            final WindowManager wm = (WindowManager) v.getContext().getSystemService(Context.WINDOW_SERVICE);
+            if (wm != null) wm.updateViewLayout(root, p);
+        } catch (Throwable ignored) {
+            // popup already gone
+        }
     }
 
     static int color(int key) {

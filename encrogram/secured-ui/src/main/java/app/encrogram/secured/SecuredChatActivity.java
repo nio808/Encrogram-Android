@@ -94,6 +94,7 @@ import app.encrogram.core.api.MessageSender;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.ItemAction;
+import app.encrogram.core.api.LinkCheck;
 import app.encrogram.core.api.MessagePage;
 import app.encrogram.core.api.MessageStatus;
 import app.encrogram.core.api.ReactionCount;
@@ -358,6 +359,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         super.onFragmentDestroy();
     }
 
+    @Override
+    public void onBecomeFullyVisible() {
+        super.onBecomeFullyVisible();
+        Kit.reassertSecure(getParentActivity());
+    }
+
     // FLAG_SECURE stays through onPause (Home, Recents snapshot); dropped only when covered or gone, like ChatActivity.
     @Override
     public void onBecomeFullyHidden() {
@@ -532,6 +539,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         searchItem.setContentDescription(tg(org.telegram.messenger.R.string.Search));
         final ActionBarMenuItem more = menu.addItem(0, org.telegram.messenger.R.drawable.ic_ab_other, chatResources);
+        Kit.securePopup(more.getPopupLayout());
         more.setContentDescription(tg(org.telegram.messenger.R.string.AccDescrMoreOptions));
         if (!notes) {
             muteSubItem = more.addSubItem(MENU_MUTE, org.telegram.messenger.R.drawable.msg_mute, context.getString(R.string.sec_list_mute), chatResources);
@@ -1238,7 +1246,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             clearSelection();
             forward(ids, target);
         });
-        showDialog(builder.create());
+        Kit.show(this, builder.create());
     }
 
     /** Saved Messages has no name from the engine: Telegram's own localized string. */
@@ -1304,11 +1312,30 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         });
         builder.setNegativeButton(tg(org.telegram.messenger.R.string.Cancel), null);
         final AlertDialog dialog = builder.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         dialog.redPositive();
     }
 
     // ---- links -----------------------------------------------------------------------------------------------
+
+    /**
+     * One of our own invite or group links (valid or not: Approved, or a SimpleX link to an unapproved relay) never goes to
+     * a browser, whose history would keep the key part. It opens the connect sheet, prefilled, so its normal checks and readable
+     * errors (expired, own invite, unknown relay) apply. checkLink is a local parse, called on the main thread like the sheet does.
+     * Nothing is logged. Returns false for any other URL.
+     */
+    private boolean openSecuredLink(String url) {
+        if (TextUtils.isEmpty(url) || engine == null) return false;
+        final LinkCheck check;
+        try {
+            check = engine.checkLink(url.trim());
+        } catch (Throwable t) {
+            return false;
+        }
+        if (check instanceof LinkCheck.Malformed) return false;
+        SecuredSheets.showConnect(this, engine, url.trim());
+        return true;
+    }
 
     /** Links never go through Telegram's Browser: confirm, then a plain ACTION_VIEW that never targets our own app. */
     private void confirmOpenLink(String url) {
@@ -1331,7 +1358,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         builder.setNeutralButton(tg(org.telegram.messenger.R.string.CopyLink), (dialog, which) -> SecuredSheets.copyToClipboard(activity, url, true));
         builder.setNegativeButton(tg(org.telegram.messenger.R.string.Cancel), null);
-        showDialog(builder.create());
+        Kit.show(this, builder.create());
     }
 
     private void openExternally(Uri uri) {
@@ -1382,7 +1409,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             }
             // Mentions, hashtags, bot commands, cards and code spans mean Telegram actions: they do nothing here.
             if (!(url instanceof URLSpan) || url instanceof URLSpanNoUnderline) return;
-            confirmOpenLink(((URLSpan) url).getURL());
+            final String tapped = ((URLSpan) url).getURL();
+            if (!openSecuredLink(tapped)) confirmOpenLink(tapped);
         }
 
         @Override
@@ -1457,6 +1485,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         options.setGravity(m.getOutgoing() ? Gravity.RIGHT : Gravity.LEFT);
         openMenu = options;
         options.show();
+        Kit.securePopup(options.actionBarPopupWindow);
     }
 
     /** Our 8-emoji picker: only the reactions the SimpleX protocol accepts (SECURED_REACTIONS). */
@@ -1760,7 +1789,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             rebuildRows(false);
         }));
         final AlertDialog dialog = b.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         dialog.redPositive();
     }
 
@@ -1789,7 +1818,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         b.setPositiveButton(activity.getString(R.string.sec_list_delete_confirm), (d, w) ->
                 chatAction(new ChatAction.Delete(also.isChecked()), this::finishFragment));
         final AlertDialog dialog = b.create();
-        showDialog(dialog);
+        Kit.show(this, dialog);
         dialog.redPositive();
     }
 
@@ -2331,6 +2360,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             flagSecure = new FlagSecureReason(getParentActivity().getWindow(), () -> true);
         }
         if (flagSecure != null) flagSecure.attach();
+        Kit.reassertSecure(getParentActivity());
         AndroidUtilities.requestAdjustResize(getParentActivity(), classGuid);
         if (engine != null) engine.markRead(chatId);
         SecuredBackground.setOpenChat(chatId);

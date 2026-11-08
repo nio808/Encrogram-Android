@@ -21,19 +21,7 @@ All Secured screens and the "Telegram | Secured" control live here. Telegram's o
 Upstream hooks (see `encrogram/app/README.md` for file:line list) call `wrapChats`, `chatsTitle`, `routeTitleOverlay`, `storiesTitleView`, `storiesTitleVisibility`.
 The engine is created and started lazily when the Secured page is first resumed.
 
-## TODO for follow-up micro tasks
-- Compile and fix `:encrogram-secured-ui` once `:encrogram-core` compiles (code was written without a successful compile) - all files.
-- Visual check of the switcher in the DialogsActivity title and the stories title (position sync, emoji status, RTL, large fonts) - ChatsSwitcherView.java, SecuredHooks.java.
-- Verify `SendButton` renders and animates correctly outside ChatActivityEnterView - SecuredChatActivity.java.
-- Telegram unread counter on the Telegram segment - ChatsSwitcherView.java.
-- Chats-tab `openFolder` should switch back to Telegram - needs a hook in MainTabsActivity (budget) - EncrogramChatsHost.java.
-- Deep link only handled when Chats tab is resumed; handle other tabs/screens - EncrogramChatsHost.java.
-- Telegram "Connecting..." tap action (proxy setup) is dropped when routed to the dot - SecuredHooks.java.
-- "N stories" title is suppressed while the control is shown - SecuredHooks.java.
-- Disable text-style formatting in `EditTextCaption` (uses MediaDataController locally) - SecuredChatActivity.java.
-- Message long-press menu only has Copy; no reply/delete/info - SecuredChatActivity.java.
-- Verified badge / shield, avatar images, typing line, swipe actions in the list - SecuredDialogsActivity.java.
-- Secured search (local only) - SecuredDialogsActivity.java.
-- Insets: bottom padding uses AndroidUtilities.navigationBarHeight, not live insets - SecuredDialogsActivity.java.
-- Share-sheet exclusion of LaunchActivity should be checked on a device - SecuredSheets.java.
-- Notifications, background receiving, Secured lock, groups/files/voice: out of MVP.
+## Open items
+Open work lives in `docs/tasks.md` (workspace root) and `research/gaps-audit.md`; the old TODO list here was
+written before the first compile and is gone. Still open in this module: media (step 5), the composer's emoji
+panel, partial text selection, message info, and a device check of the share-sheet exclusion.

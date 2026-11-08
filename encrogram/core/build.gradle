@@ -32,6 +32,7 @@ android {
     }
 
     testOptions { unitTests.returnDefaultValues = true }
+    buildFeatures { buildConfig true }   // BuildConfig.DEBUG: SecuredLog is off in release builds
 }
 
 dependencies {

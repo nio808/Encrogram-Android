@@ -34,8 +34,12 @@ final class SecuredBackgroundPrompt {
         this.fragment = fragment;
     }
 
-    /** Waits (through a listener, which replays the state at once) for the engine to be RUNNING with a profile. */
+    /**
+     * Called whenever the Secured list comes on screen (host or standalone). Clears the combined Secured notification,
+     * then waits (through a listener, which replays the state at once) for the engine to be RUNNING with a profile.
+     */
     void arm() {
+        SecuredBackground.clearAll();
         if (bgListener != null) {
             return;
         }
@@ -104,7 +108,7 @@ final class SecuredBackgroundPrompt {
                 requestNotificationPermission(activity);
             });
             b.setNegativeButton(activity.getString(R.string.sec_bg_not_now), (d, w) -> requestNotificationPermission(activity));
-            fragment.showDialog(b.create());
+            Kit.show(fragment, b.create());
         } catch (Throwable ignored) {
         }
     }

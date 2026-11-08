@@ -233,7 +233,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
         b.setMessage(activity.getString(R.string.secgroup_fact_channel_size));
         b.setNegativeButton(activity.getString(R.string.sec_list_cancel), null);
         b.setPositiveButton(activity.getString(R.string.secgroup_create_channel_confirm), (d, w) -> create(name));
-        showDialog(b.create());
+        Kit.show(this, b.create());
     }
 
     private void create(String name) {

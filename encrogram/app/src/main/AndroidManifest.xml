@@ -5,7 +5,18 @@
 
     <application
         android:name="app.encrogram.android.EncrogramApplication"
+        android:fullBackupContent="@xml/encrogram_backup_rules"
+        android:dataExtractionRules="@xml/encrogram_data_extraction_rules"
         tools:replace="name">
+
+        <!--
+            No Firebase token at process start (boot wakes included). Telegram asks for its token itself in
+            initPushServices, which the telegramAsleep hook holds while no Telegram account exists
+            (research/gaps-audit.md L3). An explicit getToken() still works with auto-init off.
+        -->
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
 
         <!--
             Secured invite / address links (https://encrogram.nytmanager.com/i#... and /a#...).

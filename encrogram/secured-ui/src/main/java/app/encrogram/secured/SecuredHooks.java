@@ -3,6 +3,7 @@ package app.encrogram.secured;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.util.Log;
@@ -17,13 +18,17 @@ import android.widget.ImageView;
 import androidx.annotation.NonNull;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.EncrogramHooks;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.UserConfig;
+import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.DialogsActivity;
+import org.telegram.ui.IntroActivity;
+import org.telegram.ui.LoginActivity;
 
 import java.lang.ref.WeakReference;
 import java.util.Map;
@@ -201,6 +206,121 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
         } catch (Throwable t) {
             fail("loggedOutIntro", t);
             return intro;
+        }
+    }
+
+    // ---- Telegram asleep: no Telegram account, so no Telegram network and no push token --------------------------
+    //
+    // Asleep = no Telegram account is activated and no Telegram login is half done, decided once per process before
+    // Telegram's network starts. That covers the welcome screen and the Secured-only list. While asleep, Telegram's
+    // network layer sees "no network" (its own offline state: no socket, no DNS fallback) and its push-token request
+    // waits. Opening Telegram's intro or login screen wakes it with the call Telegram makes when the network returns.
+    // With a Telegram account the state is "awake" from the first call, and every hook below returns Telegram's own
+    // behaviour unchanged.
+
+    private static final int TG_UNDECIDED = 0;
+    private static final int TG_ASLEEP = 1;
+    private static final int TG_AWAKE = 2;
+
+    private final Object telegramLock = new Object();
+    private volatile int telegramState = TG_UNDECIDED;
+    private Runnable heldPush;   // guarded by telegramLock
+
+    @Override
+    public boolean keepTelegramOffline() {
+        return telegramAsleep();
+    }
+
+    @Override
+    public boolean holdTelegramPush(Runnable initPushServices) {
+        try {
+            synchronized (telegramLock) {
+                if (!telegramAsleep()) {
+                    return false;
+                }
+                heldPush = initPushServices;
+                return true;
+            }
+        } catch (Throwable t) {
+            fail("holdTelegramPush", t);
+            return false;
+        }
+    }
+
+    @Override
+    public void willPresentFragment(BaseFragment fragment) {
+        try {
+            if (telegramState != TG_AWAKE && (fragment instanceof IntroActivity || fragment instanceof LoginActivity)) {
+                wakeTelegram();
+            }
+        } catch (Throwable t) {
+            fail("willPresentFragment", t);
+        }
+    }
+
+    /** Hot path (every isNetworkOnline call): one volatile read once decided. */
+    private boolean telegramAsleep() {
+        int state = telegramState;
+        if (state == TG_UNDECIDED) {
+            synchronized (telegramLock) {
+                if (telegramState == TG_UNDECIDED) {
+                    boolean asleep;
+                    try {
+                        asleep = !telegramInUse();
+                    } catch (Throwable t) {
+                        fail("telegramAsleep", t);
+                        asleep = false;   // when unsure, behave exactly like Telegram
+                    }
+                    telegramState = asleep ? TG_ASLEEP : TG_AWAKE;
+                    debugLog(asleep ? "asleep" : "awake");
+                }
+                state = telegramState;
+            }
+        }
+        return state == TG_ASLEEP;
+    }
+
+    /** An activated Telegram account, or a half-done login (LaunchActivity then reopens LoginActivity at start). */
+    private static boolean telegramInUse() {
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            final UserConfig config = UserConfig.getInstance(a);
+            config.loadConfig();   // idempotent; Telegram loads the same file at start
+            if (config.isClientActivated()) {
+                return true;
+            }
+        }
+        return LoginActivity.loadCurrentState(false, 0).getInt("currentViewNum", 0) != 0;
+    }
+
+    private void wakeTelegram() {
+        final Runnable push;
+        synchronized (telegramLock) {
+            final boolean wasAsleep = telegramState == TG_ASLEEP;
+            telegramState = TG_AWAKE;
+            push = heldPush;
+            heldPush = null;
+            if (!wasAsleep) {
+                return;
+            }
+        }
+        debugLog("woken");
+        // Telegram's own reaction to "network is back": each account re-reads isNetworkOnline and reconnects.
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            ConnectionsManager.getInstance(a).checkConnection();
+        }
+        if (push != null) {
+            push.run();   // Telegram's initPushServices, now unheld
+        }
+    }
+
+    /** Debug builds only: one content-free state line (logcat tag EncrogramHooks) for the device test. */
+    private static void debugLog(String state) {
+        try {
+            final Context context = ApplicationLoader.applicationContext;
+            if (context != null && (context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+                Log.i("EncrogramHooks", "telegram network " + state);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

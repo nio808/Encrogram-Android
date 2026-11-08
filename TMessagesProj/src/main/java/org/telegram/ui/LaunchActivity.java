@@ -8629,6 +8629,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     @Override
     public boolean needPresentFragment(INavigationLayout layout, INavigationLayout.NavigationParams params) {
+        org.telegram.messenger.EncrogramHooks.get().willPresentFragment(params.fragment); // ENCROGRAM-HOOK(telegramAsleep)
         BaseFragment fragment = params.fragment;
         boolean removeLast = params.removeLast;
         boolean forceWithoutAnimation = params.noAnimation;

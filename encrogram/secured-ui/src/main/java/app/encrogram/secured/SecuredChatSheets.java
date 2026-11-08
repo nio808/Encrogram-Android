@@ -65,7 +65,7 @@ final class SecuredChatSheets {
             });
             box.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         }
-        fragment.showDialog(sheet);
+        Kit.show(fragment, sheet);
     }
 
     /** [onAction] gets true for "Mark as verified" (with the code shown here) and false for "Clear verification". */
@@ -100,7 +100,7 @@ final class SecuredChatSheets {
             sheet.dismiss();
             onAction.accept(!verified);
         });
-        fragment.showDialog(sheet);
+        Kit.show(fragment, sheet);
     }
 
     /** Digits in groups of five, three groups a line; anything unexpected is shown as the core returned it. */

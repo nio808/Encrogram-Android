@@ -2666,7 +2666,11 @@ internal class SimplexSecuredEngine(
         }
         ctrl = c
         try {
-            val temp = File(dir, "tmp").also { it.deleteRecursively() }
+            // Keep the core's tmp: it is the file-transfer work folder (ciphertext chunks), needed to resume
+            // transfers after a restart. Only our own backup and restore leftovers (database archives) go.
+            val temp = File(dir, "tmp").also { t ->
+                t.listFiles()?.filter { it.name.startsWith("backup-") || it.name.startsWith("restore-") }?.forEach { it.deleteRecursively() }
+            }
             expectResult(send(filePathsCommand(File(dir, "files"), temp, File(dir, "assets"))), "file_paths", "cmdOk")
             expectResult(send(Commands.ENCRYPT_LOCAL_FILES), "encrypt_files", "cmdOk")
         } catch (t: Throwable) {
