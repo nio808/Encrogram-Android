@@ -37,6 +37,12 @@ final class ChatRowMapper {
         String invitation = "Invitation to join";
         /** Groups: "Name: message" with %1$s = sender and %2$s = text. */
         String senderFormat = "%1$s: %2$s";
+        /** Groups: words a service row ("Ann joined") for the preview; null leaves "No messages yet". */
+        EventWords events;
+
+        interface EventWords {
+            String text(app.encrogram.core.api.GroupEvent event, app.encrogram.core.api.ChatKind kind);
+        }
 
         /** Group wording (secured_group_strings.xml); the contact labels above are unchanged. */
         Labels withGroup(String invitation, String senderFormat) {
@@ -95,6 +101,8 @@ final class ChatRowMapper {
             r.message = labels.invitation;   // no preview of anything before you join
         } else if (!c.getReady() && !r.saved) {
             r.message = labels.connecting;
+        } else if (text == null && c.getLastEvent() != null && labels.events != null) {
+            r.message = labels.events.text(c.getLastEvent(), c.getKind());
         } else if (text == null) {
             r.message = labels.noMessages;
         } else {
@@ -211,6 +219,15 @@ final class ChatRowMapper {
         r = map(g, labels, now);
         check(bad, "group preview is Name: message", "Ann: hello".equals(r.message) && r.group && !r.outgoing);
         check(bad, "group row never verified", !toCustomDialog(r).verified);
+        final app.encrogram.core.api.GroupEvent joined = new app.encrogram.core.api.GroupEvent(app.encrogram.core.api.GroupEvent.Kind.JOINED, "Bo");
+        g = new ChatSummary(gBase + 2, "Team", null, 1000, 0, false, true, false, null, false, false, false, null,
+                ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, true, null, false, joined);
+        r = map(g, labels, now);
+        check(bad, "service-row preview without words falls back", "No messages yet".equals(r.message));
+        labels.events = (e, k) -> e.getKind() + ":" + e.getMemberName();
+        r = map(g, labels, now);
+        check(bad, "service-row preview is worded", "JOINED:Bo".equals(r.message) && !r.outgoing);
+        labels.events = null;
         g = new ChatSummary(gBase + 2, "Club", "secret", 1000, 1, false, true, false, null, false, false, false, null,
                 ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, false, "Ann", true);
         r = map(g, labels, now);

@@ -9,18 +9,26 @@ import java.util.Locale
  * or the native core, so it is safe on any thread and in JVM tests.
  *
  * Accepted shapes (formats from simplexmq Agent/Protocol.hs, `StrEncoding ConnShortLink` and `crEncode`):
- *  - short:  `https://<host>/i#<linkId>/<linkKey>[?h=<hosts>&p=<port>&c=<fp>]`, `https://<host>/a#<linkKey>[?...]`
- *  - short, app scheme: `simplex:/i#<linkId>/<linkKey>?h=<hosts>[&p=..&c=..]`, `simplex:/a#<linkKey>?h=...`
- *  - full:   `simplex:/invitation#/?v=..&smp=<queue URIs>&e2e=..`, `simplex:/contact#/?v=..&smp=..`
+ *  - short:  `https://<host>/i#<linkId>/<linkKey>[?h=<hosts>&p=<port>&c=<fp>]`, `https://<host>/a#<linkKey>[?...]`,
+ *            group links `https://<host>/g#<linkKey>[?...]` (CCTGroup, `ctTypeChar` 'G' written lower-case by slEncode,
+ *            simplexmq Agent/Protocol.hs:1604,1686-1691)
+ *  - short, app scheme: `simplex:/i#<linkId>/<linkKey>?h=<hosts>[&p=..&c=..]`, `simplex:/a#<linkKey>?h=...`,
+ *            `simplex:/g#<linkKey>?h=...`
+ *  - full:   `simplex:/invitation#/?v=..&smp=<queue URIs>&e2e=..`, `simplex:/contact#/?v=..&smp=..[&data=..]`
+ *            (a full group link is a contact link whose `data` names the group link, Commands.hs:3248)
  *            and the same behind `https://<host>/invitation#/?...`
  *
  * Every host found (link host, `h=` hosts, and each SMP queue's server hosts including `srv=`) must be in the
- * allowlist; the first one that is not is reported as [LinkCheck.UnapprovedRelay]. Group, channel and relay
- * links (`/g`, `/c`, `/r`) are not supported in the MVP and are reported as [LinkCheck.Malformed].
+ * allowlist; the first one that is not is reported as [LinkCheck.UnapprovedRelay]. Channel and relay links (`/c`,
+ * `/r`) join through chat relays on other servers (Commands.hs:4497-4498 joinChannelViaRelays) and are reported as
+ * [LinkCheck.Malformed]: never supported.
  *
- * Compact links: our own invites drop the `?p=<port>&c=<keyHash>` that names our relay ([compact]); [expand] puts
- * it back for a bare short link on one of our relays before [analyze] and before the link reaches the core, in
- * the same way SimpleX's shortenShortLink/restoreShortLink do for its preset servers.
+ * A short link names only where its data lives; the connection request inside that data is checked again once the
+ * core has read it ([ConnectPlan]).
+ *
+ * Compact links: our own invites and group links drop the `?p=<port>&c=<keyHash>` that names our relay
+ * ([compact]); [expand] puts it back for a bare short link on one of our relays before [analyze] and before the
+ * link reaches the core, in the same way SimpleX's shortenShortLink/restoreShortLink do for its preset servers.
  */
 internal object LinkChecker {
 
@@ -28,7 +36,11 @@ internal object LinkChecker {
 
     class Analysis(val result: LinkCheck, val normalized: String?)
 
-    private enum class Kind { SHORT_INVITATION, SHORT_CONTACT, FULL_INVITATION, FULL_CONTACT }
+    private enum class Kind { SHORT_INVITATION, SHORT_CONTACT, SHORT_GROUP, FULL_INVITATION, FULL_CONTACT }
+
+    private val SHORT_KINDS = setOf(Kind.SHORT_INVITATION, Kind.SHORT_CONTACT, Kind.SHORT_GROUP)
+
+    private val SHORT_LINK_KEYS = setOf("h", "p", "c")
 
     private val MALFORMED = Analysis(LinkCheck.Malformed, null)
 
@@ -125,15 +137,15 @@ internal object LinkChecker {
         val hash = tail.indexOf('#')
         if (hash < 0) return null
         val kind = kindOf(tail.substring(1, hash).removeSuffix("/"))
-        if (kind != Kind.SHORT_INVITATION && kind != Kind.SHORT_CONTACT) return null
+        if (kind !in SHORT_KINDS) return null
         val q = tail.indexOf('?', hash)
         val cut = "https://".length + authorityEnd + (if (q >= 0) q else tail.length)
         return ShortParts(host, link.substring(0, cut), if (q >= 0) tail.substring(q + 1) else null)
     }
 
     /**
-     * Shortens a short link the core made on our relay (`https://<host>/i#<id>/<key>?p=<port>&c=<keyHash>`) to
-     * `https://<host>/i#<id>/<key>` when the query names exactly that relay: same single host, same port text and
+     * Shortens a short link the core made on our relay (`https://<host>/i#<id>/<key>?p=<port>&c=<keyHash>`, and the
+     * same for `/a#<key>` and `/g#<key>`) to `https://<host>/i#<id>/<key>` when the query names exactly that relay: same single host, same port text and
      * same key hash, nothing else. Anything else (full links, `simplex:` links, other hosts, `h=` or extra
      * parameters) comes back unchanged. The result always [expand]s back to exactly [link].
      */
@@ -193,7 +205,7 @@ internal object LinkChecker {
         val fragment = tail.substring(hash + 1)
         val out = ArrayList<Endpoint>()
         when (kind) {
-            Kind.SHORT_INVITATION, Kind.SHORT_CONTACT -> {
+            Kind.SHORT_INVITATION, Kind.SHORT_CONTACT, Kind.SHORT_GROUP -> {
                 val extra = parseShortFragment(kind, fragment) ?: return null
                 // The app-scheme form has no authority: its server must come from h=.
                 if (linkHost == null && extra.hosts.isEmpty()) return null
@@ -211,9 +223,10 @@ internal object LinkChecker {
     private fun kindOf(path: String): Kind? = when (path) {
         "i" -> Kind.SHORT_INVITATION
         "a", "A" -> Kind.SHORT_CONTACT
+        "g" -> Kind.SHORT_GROUP
         "invitation" -> Kind.FULL_INVITATION
         "contact" -> Kind.FULL_CONTACT
-        else -> null // g, c, r (groups, channels, relays) are out of MVP scope
+        else -> null // c, r (relay channels, chat relays): never supported, fail closed
     }
 
     /** "<linkId>/<linkKey>[?query]" or "<linkKey>[?query]". Returns the h= hosts (possibly empty), p= and c=. */
@@ -225,6 +238,9 @@ internal object LinkChecker {
         val expected = if (kind == Kind.SHORT_INVITATION) 2 else 1
         if (tokens.size != expected || tokens.any { !isLinkToken(it) }) return null
         val params = parseQuery(query) ?: return null
+        // slEncode writes only h, p and c (simplexmq Agent/Protocol.hs:1614-1618); anything else is not a link the
+        // core made, so it is refused rather than passed on to a parser that ignores it.
+        if ((params.keys - SHORT_LINK_KEYS).isNotEmpty()) return null
         val p = params["p"]
         if (p != null && (p.isEmpty() || p.length > 5 || !p.all { it in '0'..'9' })) return null
         val c = params["c"]

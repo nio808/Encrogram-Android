@@ -10,7 +10,7 @@ import org.telegram.ui.LaunchActivity;
 import app.encrogram.secured.SecuredUi;
 
 /**
- * Receives https://encrogram.nytmanager.com/i#... and /a#... links.
+ * Receives https://encrogram.nytmanager.com/i#..., /a#... and /g#... (group) links.
  *
  * It only checks the link's shape (https, our host, exact path, length) and contacts nothing; anything else is dropped. It hands the link, in memory only, to the Secured connect flow
  * (which runs the engine's checkLink before connecting) and brings the normal app forward. The Secured page
@@ -30,7 +30,7 @@ public class SecuredLinkActivity extends Activity {
                 && host != null && host.equalsIgnoreCase(BuildConfig.SECURED_LINK_HOST)
                 && u.getUserInfo() == null
                 && (u.getPort() == -1 || u.getPort() == 443)
-                && ("/i".equals(path) || "/a".equals(path))
+                && ("/i".equals(path) || "/a".equals(path) || "/g".equals(path))
                 && u.toString().length() <= MAX_LINK_LENGTH;
     }
 

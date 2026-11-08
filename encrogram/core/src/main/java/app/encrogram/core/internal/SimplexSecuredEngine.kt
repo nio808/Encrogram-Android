@@ -296,16 +296,24 @@ internal class SimplexSecuredEngine(
             LinkCheck.Approved -> Unit
         }
         val normalized = analysis.normalized ?: return@post err(callback, ErrorMapper.invalidLink())
-        // Our own invite: the core would connect us to ourselves (it proceeds on ownLink). Ask for the plan first.
-        when (val plan = send(Commands.connectPlan(userId, normalized))) {
-            is CoreReply.Result -> if (plan.type == "connectionPlan") {
-                ErrorMapper.planRefusal(CoreJson.connectionPlanTag(plan.body))?.let {
-                    SecuredLog.i(Ev.CONNECT_REFUSED, "own_link")
-                    return@post err(callback, it)
-                }
+        // Always ask for the plan first, and connect only on its verdict (ConnectPlan): the request a short link holds
+        // must be on our relay too, our own invite would connect us to ourselves (the core proceeds on ownLink), and
+        // group links are joined with exactly the checked request. No plan, no connect: a short link we couldn't
+        // resolve here would only fail the same way inside /connect.
+        val verdict = when (val plan = send(Commands.connectPlan(userId, normalized))) {
+            is CoreReply.Result ->
+                if (plan.type == "connectionPlan") ConnectPlan.verdict(plan.body, config.allowedHosts, config.smpServers)
+                else ConnectPlan.Verdict.Refuse(unexpected(plan), "plan_reply")
+            is CoreReply.Error -> ConnectPlan.Verdict.Refuse(ErrorMapper.fromCore(plan.error, Op.CONNECT), "plan_error")
+            CoreReply.Invalid -> ConnectPlan.Verdict.Refuse(ErrorMapper.engine("invalid_reply"), "plan_reply")
+        }
+        when (verdict) {
+            is ConnectPlan.Verdict.Refuse -> {
+                SecuredLog.i(Ev.CONNECT_REFUSED, verdict.logTag)
+                return@post err(callback, verdict.error)
             }
-            is CoreReply.Error -> ErrorMapper.planErrorRefusal(plan.error)?.let { return@post err(callback, it) }
-            CoreReply.Invalid -> Unit
+            is ConnectPlan.Verdict.JoinGroup -> return@post joinGroupLinkOnEngine(verdict, callback)
+            ConnectPlan.Verdict.Connect -> Unit
         }
         when (val r = send(Commands.connect(normalized))) {
             is CoreReply.Result -> when (r.type) {
@@ -575,6 +583,141 @@ internal class SimplexSecuredEngine(
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
+    }
+
+    // ---- Roles, removal and group links (G3) ----------------------------------------------------------------------
+
+    /**
+     * `/_member role #g <groupMemberId> <role>`, after the core's own rule ([GroupRules.roleChangeRefusal]) on a fresh
+     * member list. Everyone sees a "X is now <role>" row (ROLE_CHANGED), which arrives as newChatItems.
+     */
+    override fun setMemberRole(chatId: Long, memberId: Long, role: MemberRole, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        val members = membersOrErr(g, callback) ?: return@post
+        GroupRules.roleChangeRefusal(members.firstOrNull { it.isMe }, members.firstOrNull { !it.isMe && it.groupMemberId == memberId }, role)
+            ?.let { return@post refuse(callback, "role", it) }
+        chatCommand("member_role", Commands.setMemberRole(g.groupId, memberId, role), "membersRoleUser", callback)
+    }
+
+    /**
+     * `/_remove #g <groupMemberId> messages=off`, after [GroupRules.removeRefusal]. Members see "X was removed"; the
+     * removed member's row gets YOU_REMOVED and their chat stays readable (status removed, can't post) until deleted.
+     */
+    override fun removeMember(chatId: Long, memberId: Long, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        val members = membersOrErr(g, callback) ?: return@post
+        GroupRules.removeRefusal(members.firstOrNull { it.isMe }, members.firstOrNull { !it.isMe && it.groupMemberId == memberId })
+            ?.let { return@post refuse(callback, "remove", it) }
+        chatCommand("member_remove", Commands.removeMember(g.groupId, memberId), "userDeletedMembers", callback)
+    }
+
+    /**
+     * The group's link: the existing one (`/_get link #g`) or a new one (`/_create link #g <role>`). People join as
+     * members, or as observers in a channel; an existing link with another role is set right (`/_set link role`).
+     * Both the link and the connection request behind it (what a joiner's core reads from the short link) must be
+     * on our relay, else the link is deleted and nothing is handed out. The short link is compacted like our invites
+     * (`https://<relay>/g#<key>`, the relay's `?p=..&c=..` dropped); without a short link the full link is returned.
+     */
+    override fun groupLink(chatId: Long, callback: SecuredCallback<SecuredInvite>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        GroupRules.linkRefusal(g)?.let { return@post refuse(callback, "link_role", it) }
+        val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
+        var created = false
+        var link: CoreGroupLink? = when (val r = send(Commands.getGroupLink(g.groupId))) {
+            // A link exists: never create a second one (the core would make an unused connection, then refuse).
+            is CoreReply.Result ->
+                if (r.type == "groupLink") CoreJson.parseGroupLink(r.body) ?: return@post err(callback, ErrorMapper.engine("group_link.reply"))
+                else return@post err(callback, unexpected(r))
+            // No link yet (StoreError SEGroupLinkNotFound, Store/Groups.hs:342-345): create one below.
+            is CoreReply.Error ->
+                if (r.error.type == "errorStore" && r.error.detail == "groupLinkNotFound") null
+                else return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+            CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        if (link == null) {
+            link = when (val r = send(Commands.createGroupLink(g.groupId, role))) {
+                is CoreReply.Result -> if (r.type == "groupLinkCreated") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
+                is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+                CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+            }
+            created = true
+        } else if (CoreJson.roleWord(link.role) != role) {
+            link = when (val r = send(Commands.setGroupLinkRole(g.groupId, role))) {
+                is CoreReply.Result -> if (r.type == "groupLink") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
+                is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+                CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+            }
+            SecuredLog.i(Ev.GROUP_ACTION, "link_role_fixed")
+        }
+        val l = link ?: return@post err(callback, ErrorMapper.engine("group_link.no_link"))
+        val full = l.fullLink
+        val approved = full != null && listOfNotNull(full, l.shortLink).all {
+            LinkChecker.check(it, config.allowedHosts, config.smpServers) == LinkCheck.Approved
+        }
+        if (!approved) {
+            // Never hand out a link that would bring people to a server we don't run.
+            SecuredLog.e(Ev.INVITE_REFUSED, "group_link")
+            send(Commands.deleteGroupLink(g.groupId))
+            return@post err(callback, SecuredError(SecuredError.Kind.UNAPPROVED_RELAY, ErrorMapper.GROUP_LINK_ELSEWHERE))
+        }
+        // A channel link must let people in as observers only; never hand out one that doesn't.
+        if (CoreJson.roleWord(l.role) != role) return@post err(callback, ErrorMapper.engine("group_link.role"))
+        SecuredLog.i(Ev.GROUP_ACTION, if (created) "link_create" else "link_get")
+        ok(callback, SecuredInvite(compactInvite(l.shortLink ?: full!!)))
+    }
+
+    /** `/_delete link #g` (admins and the owner). No link is not an error: the result is the same. */
+    override fun deleteGroupLink(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        GroupRules.linkRefusal(g)?.let { return@post refuse(callback, "link_role", it) }
+        when (val r = send(Commands.deleteGroupLink(g.groupId))) {
+            is CoreReply.Result -> {
+                if (r.type != "groupLinkDeleted") return@post err(callback, unexpected(r))
+                SecuredLog.i(Ev.GROUP_ACTION, "link_delete")
+                ok(callback, Unit)
+            }
+            is CoreReply.Error ->
+                if (r.error.type == "errorStore" && r.error.detail == "groupLinkNotFound") ok(callback, Unit)
+                else err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /**
+     * Joins a group by its link with exactly the request [ConnectPlan] checked (`/_connect <userId> <full> <short>`)
+     * -> `sentInvitation`. Nothing shows until the admin's phone answers: then the group appears
+     * (groupLinkConnecting, a chat-list event) with the link's role, connecting, and later connected.
+     */
+    private fun joinGroupLinkOnEngine(join: ConnectPlan.Verdict.JoinGroup, callback: SecuredCallback<Unit>) {
+        when (val r = send(Commands.connectResolved(userId, join.fullLink, join.shortLink))) {
+            is CoreReply.Result -> when (r.type) {
+                "sentInvitation" -> {
+                    SecuredLog.i(Ev.GROUP_ACTION, "join_link")
+                    ok(callback, Unit)
+                    refreshChats(notify = true)
+                }
+                else -> err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /** `/_members #g` parsed (us first), or null after reporting an error to [callback]. */
+    private fun <T> membersOrErr(g: CoreGroup, callback: SecuredCallback<T>): List<CoreMember>? {
+        when (val r = send(Commands.listMembers(g.groupId))) {
+            is CoreReply.Result -> {
+                if (r.type == "groupMembers") return CoreJson.parseMembers(r.body)
+                err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.LOAD))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        return null
     }
 
     // =============================================================================================================
@@ -2817,14 +2960,15 @@ internal class SimplexSecuredEngine(
             val c = chat.contact
             if (c.isContactCard || c.removed) continue
             chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId))
-            chat.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[c.contactId] = it.itemId }
+            // Messages and the service rows we show (lastEvent): edits and deletions of either reload the row.
+            chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
         }
         for (chat in groups) {
             val id = chat.group.chatId
             groupCache[id] = chat.group
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
-            chat.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[id] = it.itemId }
+            chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
         }
         // Saved Messages: the user's note folder (the core creates one with every user).
         val notes = CoreJson.parseNoteChat(r.body)
@@ -2841,7 +2985,10 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    /** Updates the cached rows for new items; reloads the list when an item belongs to a chat we don't know. */
+    /**
+     * Updates the cached rows for new messages and service rows we show (ChatSummary.lastEvent); reloads the list when
+     * an item belongs to a chat we don't know.
+     */
     private fun applyNewItems(items: List<CoreItem>) {
         if (items.isNotEmpty()) markChanged()
         var changed = false
@@ -2852,7 +2999,7 @@ internal class SimplexSecuredEngine(
                 unknownChat = true
                 continue
             }
-            if (!item.isMessage) continue
+            if (!item.shown) continue
             chatCache[item.chatId] = MessageMapper.withNewItem(row, item)
             lastItemIds[item.chatId] = item.itemId
             changed = true

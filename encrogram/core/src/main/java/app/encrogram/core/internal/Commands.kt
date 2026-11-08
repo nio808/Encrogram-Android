@@ -1,5 +1,6 @@
 package app.encrogram.core.internal
 
+import app.encrogram.core.api.MemberRole
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -350,6 +351,63 @@ internal object Commands {
      * (Controller.hs:793); progress arrives as `groupMemberSwitch` events (Controller.hs:926).
      */
     fun switchGroupMember(groupId: Long, groupMemberId: Long): String = "/_switch ${ChatRef.group(groupId)} $groupMemberId"
+
+    // ---- Roles, removal and group links (G3) ----
+
+    /**
+     * APIMembersRole (`/_member role #<groupId> <groupMemberIds> <role>`, Commands.hs:5512; handler :2877-2905) ->
+     * `membersRoleUser` (Controller.hs:881). One member at a time; check [GroupRules.roleChangeRefusal] first.
+     */
+    fun setMemberRole(groupId: Long, groupMemberId: Long, role: MemberRole): String {
+        require(groupMemberId > 0) { "member id" }
+        return "/_member role ${ChatRef.group(groupId)} $groupMemberId ${CoreJson.roleWord(role)}"
+    }
+
+    /**
+     * APIRemoveMembers (`/_remove #<groupId> <groupMemberIds>[ messages=on|off]`, Commands.hs:5514; handler
+     * :3014-3060) -> `userDeletedMembers` (Controller.hs:831). messages=off (the default): what they sent stays, as
+     * in Telegram without "delete all their messages". Check [GroupRules.removeRefusal] first.
+     */
+    fun removeMember(groupId: Long, groupMemberId: Long): String {
+        require(groupMemberId > 0) { "member id" }
+        return "/_remove ${ChatRef.group(groupId)} $groupMemberId messages=off"
+    }
+
+    /**
+     * APICreateGroupLink (`/_create link #<groupId> <role>`, Commands.hs:5634; handler :3241-3254) ->
+     * `groupLinkCreated {groupInfo, groupLink}` (Controller.hs:886). Admin only; the core refuses roles above member
+     * (:3244). Creates a short link `https://<our relay>/g#<key>?p=..&c=..` (setShortLinkType CCTGroup, :3251) when the
+     * relay supports short links. A second create fails (SEDuplicateGroupLink) after making an unused connection, so
+     * the engine always tries [getGroupLink] first.
+     */
+    fun createGroupLink(groupId: Long, role: String): String {
+        require(role == ROLE_MEMBER || role == ROLE_OBSERVER) { "link role" }
+        return "/_create link ${ChatRef.group(groupId)} $role"
+    }
+
+    /** APIGroupLinkMemberRole (`/_set link role #<groupId> <role>`, Commands.hs:5635; :3255-3264) -> `groupLink`. */
+    fun setGroupLinkRole(groupId: Long, role: String): String {
+        require(role == ROLE_MEMBER || role == ROLE_OBSERVER) { "link role" }
+        return "/_set link role ${ChatRef.group(groupId)} $role"
+    }
+
+    /** APIGetGroupLink (`/_get link #<groupId>`, Commands.hs:5637; :3269-3272) -> `groupLink`; none: errorStore groupLinkNotFound. */
+    fun getGroupLink(groupId: Long): String = "/_get link ${ChatRef.group(groupId)}"
+
+    /** APIDeleteGroupLink (`/_delete link #<groupId>`, Commands.hs:5636; :3265-3268) -> `groupLinkDeleted`. */
+    fun deleteGroupLink(groupId: Long): String = "/_delete link ${ChatRef.group(groupId)}"
+
+    /**
+     * APIConnect (`/_connect <userId> <full link>[ <short link>]`, Commands.hs:5658, connLinkP :5781-5784; handler
+     * :2337-2348) -> `sentInvitation` for a group link. Joins with exactly the request `/_connect plan` resolved and
+     * [ConnectPlan] checked: the core doesn't read the link again and never joins through chat relays (unlike
+     * `/connect`, which plans again, :2350-2357, :4489-4500).
+     */
+    fun connectResolved(userId: Long, fullLink: String, shortLink: String?): String {
+        require(fullLink.isNotEmpty() && fullLink.all { it.code in 0x21..0x7E }) { "link must be checked first" }
+        require(shortLink == null || (shortLink.isNotEmpty() && shortLink.all { it.code in 0x21..0x7E })) { "link must be checked first" }
+        return "/_connect $userId $fullLink" + if (shortLink != null) " $shortLink" else ""
+    }
 
     /** Role words of the core's memberRole parser (Commands.hs:5914-5921). */
     const val ROLE_MEMBER = "member"

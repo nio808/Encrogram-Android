@@ -54,18 +54,19 @@ class OwnLinkPlanTest {
     }
 
     @Test
-    fun aFailedPlanStopsOnlyForClearlyInvalidLinks() {
-        fun refusal(json: String) = ErrorMapper.planErrorRefusal((CoreJson.parseReply(json) as CoreReply.Error).error)
+    fun aFailedPlanStopsTheConnectWithAReadableReason() {
+        // G3: no plan, no connect (the request behind a short link must be checked first). The engine reports the
+        // plan's own error the way a failed connect would have.
+        fun refusal(json: String) = ErrorMapper.fromCore((CoreJson.parseReply(json) as CoreReply.Error).error, ErrorMapper.Op.CONNECT)
 
         val invalid = refusal("""{"error":{"type":"error","errorType":{"type":"invalidConnReq"}}}""")
-        assertEquals(Kind.INVALID_LINK, invalid?.kind)
-        assertEquals(ErrorMapper.LINK_INVALID, invalid?.message)
+        assertEquals(Kind.INVALID_LINK, invalid.kind)
+        assertEquals(ErrorMapper.LINK_INVALID, invalid.message)
         // A one-time link already used or expired: the relay says AUTH.
-        assertEquals(ErrorMapper.LINK_USED, refusal(Samples.AGENT_SMP_AUTH)?.message)
-        // Network trouble or anything unclear: connect as before.
-        assertNull(refusal(Samples.AGENT_BROKER_TIMEOUT))
-        assertNull(refusal(Samples.STORE_DUPLICATE))
-        assertNull(refusal("""{"error":{"type":"error","errorType":{"type":"chatNotStarted"}}}"""))
+        assertEquals(ErrorMapper.LINK_USED, refusal(Samples.AGENT_SMP_AUTH).message)
+        // Network trouble: the network message, not a raw error.
+        assertEquals(Kind.NETWORK, refusal(Samples.AGENT_BROKER_TIMEOUT).kind)
+        assertEquals(Kind.ENGINE_NOT_RUNNING, refusal("""{"error":{"type":"error","errorType":{"type":"chatNotStarted"}}}""").kind)
     }
 
     @Test

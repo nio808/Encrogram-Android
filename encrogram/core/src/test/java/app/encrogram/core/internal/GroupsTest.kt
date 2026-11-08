@@ -189,6 +189,9 @@ class GroupsTest {
         val joined = row(groupInfo(), listOf(gItem(10, "groupRcv", msg("hi"), from = bob), gItem(12, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = carol)))
         assertNull(joined.lastMessageText)
         assertNull(joined.lastMessageSender)
+        assertEquals(GroupEvent(GroupEvent.Kind.JOINED, "Carol"), joined.lastEvent)
+        // A message as the newest item: no lastEvent.
+        assertNull(row(groupInfo(), listOf(gItem(10, "groupRcv", msg("hi"), from = bob))).lastEvent)
     }
 
     @Test
@@ -279,12 +282,13 @@ class GroupsTest {
         val sent = CoreJson.parseAChatItem(JSONObject("""{"chatInfo":$bobChat,"chatItem":${
             gItem(40, "directSnd", """{"type":"sndGroupInvitation","groupInvitation":$invitation,"memberRole":"member"}""", status("sndSent"))}}"""))!!
         assertEquals(5L, sent.chatId)
-        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, "Bob"), sent.event)
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, "Bob", groupName = "Party"), sent.event)
         assertEquals("", sent.text)
-        // Bob invited us: "You were invited", never the group's name in the row.
+        // Bob invited us: "You were invited to Party" (G3 fills groupName; the text itself is still empty).
         val got = CoreJson.parseAChatItem(JSONObject("""{"chatInfo":$bobChat,"chatItem":${
             gItem(41, "directRcv", """{"type":"rcvGroupInvitation","groupInvitation":$invitation,"memberRole":"member"}""")}}"""))!!
-        assertEquals(GroupEvent(GroupEvent.Kind.INVITED), got.event)
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, groupName = "Party"), got.event)
+        assertEquals("", got.text)
         assertNull(got.sender)
         assertTrue(got.shown)
     }
@@ -558,6 +562,79 @@ class GroupsTest {
         assertEquals("/_sync #3 12", Commands.syncGroupMember(3, 12))
         assertEquals("/_sync #3 12 force=on", Commands.syncGroupMember(3, 12, force = true))
         assertEquals("/_switch #3 12", Commands.switchGroupMember(3, 12))
+    }
+
+    // ---- G3: the contract fields G1 left empty, and being removed ----
+
+    @Test
+    fun invitationRowNamesTheGroupEvenWithoutAProfileName() {
+        val bobChat = """{"type":"direct","contact":${Samples.contact(5, "Bob", "ready")}}"""
+        fun got(invitation: String) = CoreJson.parseAChatItem(JSONObject("""{"chatInfo":$bobChat,"chatItem":${
+            gItem(41, "directRcv", """{"type":"rcvGroupInvitation","groupInvitation":$invitation,"memberRole":"member"}""")}}"""))!!.event
+        // The core's local name when the profile has none; nothing when neither is there (the row still shows).
+        assertEquals("party_1", got("""{"groupId":4,"groupMemberId":2,"localDisplayName":"party_1","groupProfile":{"displayName":"","fullName":""},"status":"pending"}""")!!.groupName)
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED), got("""{"groupId":4,"groupMemberId":2,"status":"pending"}"""))
+    }
+
+    @Test
+    fun theNewestServiceRowIsTheRowsLastEvent() {
+        // A 1:1 chat whose newest item is an invitation: lastEvent, no text, no ticks.
+        val invitation = """{"groupId":4,"groupMemberId":2,"localDisplayName":"party","groupProfile":{"displayName":"Party","fullName":""},"status":"pending"}"""
+        val bobChat = """{"chatInfo":{"type":"direct","contact":${Samples.contact(5, "Bob", "ready")}},"chatItems":[${
+            gItem(41, "directRcv", """{"type":"rcvGroupInvitation","groupInvitation":$invitation,"memberRole":"member"}""", status("rcvNew"))}],
+            "chatStats":{"unreadCount":1}}"""
+        val bobRow = MessageMapper.summaryOf(CoreJson.parseChats(body(bobChat))[0], archived = false)
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, groupName = "Party"), bobRow.lastEvent)
+        assertNull(bobRow.lastMessageText)
+        assertFalse(bobRow.lastMessageOutgoing)
+        assertNull(bobRow.lastMessageStatus)
+        // We invited Bob: "Bob was invited to Party", named from the contact in the list too.
+        val sentChat = bobChat.replace("""{"type":"rcvGroupInvitation""", """{"type":"sndGroupInvitation""").replace(""""type":"directRcv""", """"type":"directSnd""")
+        val sentRow = MessageMapper.summaryOf(CoreJson.parseChats(body(sentChat))[0], archived = false)
+        assertEquals(GroupEvent(GroupEvent.Kind.INVITED, "Bob", groupName = "Party"), sentRow.lastEvent)
+        assertFalse(sentRow.lastMessageOutgoing)
+
+        // Live: a new service row sets it, the next message clears it; our own service row shows no ticks.
+        val row = MessageMapper.groupSummary(CoreJson.parseGroupChats(body(groupChat(groupInfo())))[0], archived = false)
+        val left = MessageMapper.withNewItem(row, parse(gItem(60, "groupRcv", rcvEvent("""{"type":"memberLeft"}"""), status("rcvNew"), from = carol)))
+        assertEquals(GroupEvent(GroupEvent.Kind.LEFT, "Carol"), left.lastEvent)
+        assertNull(left.lastMessageText)
+        assertNull(left.lastMessageSender)
+        assertEquals(1, left.unreadCount)
+        val roleRow = MessageMapper.withNewItem(left, parse(gItem(61, "groupSnd",
+            sndEvent("""{"type":"memberRole","groupMemberId":5,${profile("Bob")},"role":"admin"}"""), status("sndSent"))))
+        assertEquals(GroupEvent(GroupEvent.Kind.ROLE_CHANGED, "Bob", MemberRole.ADMIN), roleRow.lastEvent)
+        assertFalse(roleRow.lastMessageOutgoing)
+        assertNull(roleRow.lastMessageStatus)
+        val next = MessageMapper.withNewItem(roleRow, parse(gItem(62, "groupRcv", msg("hi"), from = bob)))
+        assertNull(next.lastEvent)
+        assertEquals("hi", next.lastMessageText)
+        assertEquals("Bob", next.lastMessageSender)
+        // Invited: no preview at all, not even a service row.
+        assertNull(MessageMapper.withNewItem(row.copy(invited = true), parse(gItem(63, "groupRcv", rcvEvent("""{"type":"memberLeft"}"""), from = carol))).lastEvent)
+        val invitedRow = MessageMapper.groupSummary(CoreJson.parseGroupChats(body(groupChat(groupInfo(myRole = "member", myStatus = "invited"),
+            listOf(gItem(12, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = carol)))))[0], archived = false)
+        assertNull(invitedRow.lastEvent)
+    }
+
+    @Test
+    fun anAdminRemovingYouLeavesAReadableChatYouCantPostIn() {
+        // xGrpMemDel for our own member id (Subscriber.hs:3625-3636): status removed, a userDeleted row from the admin.
+        val removedBy = member(6, "Carol", role = "admin")
+        val row = MessageMapper.groupSummary(CoreJson.parseGroupChats(body(groupChat(groupInfo(myRole = "member", myStatus = "removed"),
+            listOf(gItem(70, "groupRcv", rcvEvent("""{"type":"userDeleted"}"""), status("rcvNew"), from = removedBy)), unread = 1)))[0], archived = false)
+        assertEquals(chat3, row.chatId)
+        assertEquals(GroupEvent(GroupEvent.Kind.YOU_REMOVED), row.lastEvent)
+        assertFalse(row.canPost)
+        assertFalse(row.invited)
+        assertEquals(MemberRole.MEMBER, row.myRole)
+        // The row in the chat itself.
+        val m = MessageMapper.toMessage(parse(gItem(70, "groupRcv", rcvEvent("""{"type":"userDeleted"}"""), from = removedBy)), MemberRole.MEMBER)
+        assertEquals(GroupEvent(GroupEvent.Kind.YOU_REMOVED), m.event)
+        assertEquals("", m.text)
+        // And every link or role action is refused readably from now on.
+        val g = CoreJson.parseGroup(JSONObject(groupInfo(myRole = "admin", myStatus = "removed")))!!
+        assertEquals(ErrorMapper.NOT_A_MEMBER, GroupRules.linkRefusal(g))
     }
 
     // ---- errors ----

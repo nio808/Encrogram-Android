@@ -312,13 +312,23 @@ public final class SecuredMessageMapper {
 
     /** Our own wording for a group service row ("X joined"). Plain text; shown through ChatActionCell.setCustomText. */
     public String eventText(GroupEvent e) {
+        return eventText(context, kind, e);
+    }
+
+    /** The same wording for the chat list's preview when the newest item is a service row. */
+    static String eventText(Context context, ChatKind kind, GroupEvent e) {
         final boolean channel = kind == ChatKind.CHANNEL;
         final String who = e.getMemberName();
+        final String group = e.getGroupName();
+        final boolean grouped = group != null && !group.isEmpty();
         final boolean named = who != null && !who.isEmpty();
         switch (e.getKind()) {
             case CREATED:
                 return context.getString(channel ? R.string.secgroup_event_created_channel : R.string.secgroup_event_created_group);
             case INVITED:
+                if (grouped) {
+                    return named ? context.getString(R.string.secgroup_event_invited_to, who, group) : context.getString(R.string.secgroup_event_invited_you_to, group);
+                }
                 return named ? context.getString(R.string.secgroup_event_invited, who) : context.getString(R.string.secgroup_event_invited_you);
             case JOINED:
                 return named ? context.getString(R.string.secgroup_event_joined, who) : context.getString(R.string.secgroup_event_joined_you);
@@ -329,7 +339,7 @@ public final class SecuredMessageMapper {
             case YOU_REMOVED:
                 return context.getString(channel ? R.string.secgroup_event_you_removed_channel : R.string.secgroup_event_you_removed_group);
             case ROLE_CHANGED: {
-                final String role = roleWithArticle(e.getRole());
+                final String role = roleWithArticle(context, e.getRole());
                 return named ? context.getString(R.string.secgroup_event_role, who, role) : context.getString(R.string.secgroup_event_role_you, role);
             }
             case GROUP_DELETED:
@@ -343,7 +353,7 @@ public final class SecuredMessageMapper {
         }
     }
 
-    private String roleWithArticle(MemberRole role) {
+    private static String roleWithArticle(Context context, MemberRole role) {
         if (role == null) return context.getString(R.string.secgroup_role_member_a);
         switch (role) {
             case OWNER:

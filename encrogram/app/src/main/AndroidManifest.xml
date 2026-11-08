@@ -28,6 +28,7 @@
                 <data android:host="encrogram.nytmanager.com" />
                 <data android:path="/i" />
                 <data android:path="/a" />
+                <data android:path="/g" />
             </intent-filter>
         </activity>
     </application>

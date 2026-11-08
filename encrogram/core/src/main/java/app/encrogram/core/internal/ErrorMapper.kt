@@ -42,6 +42,21 @@ internal object ErrorMapper {
     const val ALREADY_JOINED = "You already joined this group."
     const val DECLINE_INSTEAD = "You haven't joined this group. Decline the invitation instead."
 
+    // ---- roles, removal and group links (G3) ----
+    const val ONLY_ADMINS_ROLES = "Only admins can change roles."
+    const val ONLY_OWNERS_OWNERS = "Only owners can make someone an owner or change an owner's role."
+    const val OWN_ROLE = "You can't change your own role."
+    const val ONLY_ADMINS_REMOVE = "Only admins can remove people."
+    const val ONLY_OWNERS_REMOVE_OWNERS = "Only owners can remove an owner."
+    const val REMOVE_SELF = "You can't remove yourself. Leave the group instead."
+    const val MEMBER_PENDING = "This person is still waiting to be approved."
+    const val ONLY_ADMINS_LINK = "Only admins can manage the group's link."
+    const val GROUP_LINK_ELSEWHERE = "The group link wasn't made on Encrogram's server, so it was removed. Try again."
+    const val OWN_GROUP_LINK = "This is your group's link."
+    const val ALREADY_IN_GROUP = "You're already in this group."
+    const val ALREADY_JOINING = "You're already joining this group. It appears in your chats once it connects."
+    const val UNSUPPORTED_GROUP_LINK = "This link is for a kind of channel Encrogram doesn't support."
+
     /** Some of the people could not be added; the others were. Counts only, never names. */
     fun addFailed(failed: Int, total: Int): SecuredError =
         SecuredError(Kind.ENGINE, if (failed == total) "No one could be added. Try again." else "$failed of $total people couldn't be added. Try again for them.")
@@ -108,6 +123,7 @@ internal object ErrorMapper {
                 "groupMemberNotFound" -> return SecuredError(Kind.ENGINE, MEMBER_GONE)
                 "groupInvitationNotFound" -> return SecuredError(Kind.ENGINE, INVITATION_GONE)
                 "groupAlreadyJoined" -> return notAllowed(ALREADY_JOINED)
+                "groupLinkNotFound" -> return SecuredError(Kind.ENGINE, "This group has no link yet.")
                 "invalidQuote" -> return notAllowed(CANT_REPLY)
                 // encodeChatMessage: the whole message would be over maxEncodedMsgLength.
                 "largeMsg" -> return invalid(TOO_LONG)
@@ -134,21 +150,23 @@ internal object ErrorMapper {
     }
 
     /**
-     * The verdict of `/_connect plan` before connecting: [ownLink] for our own invite or address (the core itself
-     * would go ahead and connect us to ourselves: connectionPlanProceed is True for ownLink), else null, and
-     * `/connect` decides as before (it refuses known and connecting links with its own `connectionPlan` reply).
+     * The verdict of `/_connect plan` before connecting (ConnectPlan.verdict). Our own invite or address: [ownLink]
+     * (the core itself would go ahead and connect us to ourselves: connectionPlanProceed is True for ownLink,
+     * Controller.hs:1163-1182). Group links (GroupLinkPlan, Controller.hs:1127-1134): our own group's link (the core
+     * would also proceed), a group we're in or still joining, and relay channels (noRelays, updateRequired) are refused
+     * here, since groups are joined with `/_connect`, which doesn't refuse them itself. Else null: a 1:1 `/connect`
+     * decides as before (it refuses known and connecting links with its own `connectionPlan` reply).
+     *
+     * A group plan never uses [Kind.OWN_LINK]: that kind means "notes to yourself go to Saved Messages".
      */
     fun planRefusal(planTag: String): SecuredError? = when (planTag) {
         "invitationLink.ownLink", "contactAddress.ownLink" -> ownLink()
+        "groupLink.ownLink" -> SecuredError(Kind.INVALID_LINK, OWN_GROUP_LINK)
+        "groupLink.known" -> SecuredError(Kind.INVALID_LINK, ALREADY_IN_GROUP)
+        "groupLink.connectingProhibit" -> SecuredError(Kind.INVALID_LINK, ALREADY_JOINING)
+        "groupLink.noRelays", "groupLink.updateRequired" -> notAllowed(UNSUPPORTED_GROUP_LINK)
         else -> null
     }
-
-    /**
-     * When `/_connect plan` itself fails: refuse only when the error clearly says the link can't work (unparseable,
-     * unsupported, or a one-time link already used or expired), else null and the connect goes ahead as before.
-     */
-    fun planErrorRefusal(e: CoreError): SecuredError? =
-        fromCore(e, Op.CONNECT).takeIf { it.kind == Kind.INVALID_LINK }
 
     // ---- 12-word backup ------------------------------------------------------------------------------------------
 
@@ -231,6 +249,6 @@ internal object ErrorMapper {
             SecuredError(Kind.INVALID_LINK, "You're already connecting with this contact.")
         "invitationLink.known", "contactAddress.known", "contactAddress.contactViaAddress" ->
             SecuredError(Kind.INVALID_LINK, "You're already connected with this contact.")
-        else -> SecuredError(Kind.INVALID_LINK, LINK_INVALID)
+        else -> planRefusal(planTag) ?: SecuredError(Kind.INVALID_LINK, LINK_INVALID)
     }
 }

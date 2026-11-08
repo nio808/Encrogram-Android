@@ -2,6 +2,7 @@ package app.encrogram.core.internal
 
 import app.encrogram.core.api.ChatKind
 import app.encrogram.core.api.ChatSummary
+import app.encrogram.core.api.GroupEvent
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MessageSender
 import app.encrogram.core.api.MessageStatus
@@ -48,7 +49,10 @@ internal object MessageMapper {
         )
     }
 
-    /** One chat-list row. [archived] is our local flag ([ArchiveStore]); everything else comes from the engine. */
+    /**
+     * One chat-list row. [archived] is our local flag ([ArchiveStore]); everything else comes from the engine. A
+     * service row as the newest item (an invitation row) becomes [ChatSummary.lastEvent], with no message text.
+     */
     fun summaryOf(chat: CoreChat, archived: Boolean): ChatSummary {
         val c = chat.contact
         val last = chat.lastItem?.takeIf { it.isMessage }
@@ -67,12 +71,17 @@ internal object MessageMapper {
             muted = c.muted,
             archived = archived,
             disappearingTtlSeconds = c.timedTtlSeconds,
+            lastEvent = lastEventOf(chat.lastItem),
         )
     }
+
+    /** The newest item's service row, when the newest item is one we show (never for a message). */
+    private fun lastEventOf(item: CoreItem?): GroupEvent? = item?.takeIf { !it.isMessage }?.event
 
     /**
      * A group or channel row. Invited: no preview of anything before joining (the UI shows the invitation), and no
      * posting until [ChatSummary.invited] is accepted. Not ready while still connecting after accepting or joining.
+     * A service row as the newest item ("Ann joined", "You were removed") is [ChatSummary.lastEvent].
      */
     fun groupSummary(chat: CoreGroupChat, archived: Boolean): ChatSummary {
         val g = chat.group
@@ -97,6 +106,7 @@ internal object MessageMapper {
             canPost = !g.invited && CoreJson.canPost(g),
             lastMessageSender = last?.takeIf { !it.outgoing && !it.deleted }?.sender?.displayName,
             invited = g.invited,
+            lastEvent = if (g.invited) null else lastEventOf(chat.lastItem),
         )
     }
 
@@ -121,15 +131,22 @@ internal object MessageMapper {
         )
     }
 
-    /** A row after a new message in its chat (no reload). */
-    fun withNewItem(row: ChatSummary, item: CoreItem): ChatSummary = row.copy(
-        lastMessageText = if (row.invited) null else item.takeUnless { it.deleted }?.text,
-        lastMessageTimeMs = if (item.timeMs > 0) item.timeMs else row.lastMessageTimeMs,
-        unreadCount = row.unreadCount + if (item.unread) 1 else 0,
-        lastMessageOutgoing = item.outgoing,
-        lastMessageStatus = if (item.outgoing) item.status else null,
-        lastMessageSender = item.takeIf { it.group && !it.outgoing && !it.deleted }?.sender?.displayName,
-    )
+    /**
+     * A row after a new message, or a new service row we show, in its chat (no reload). A service row becomes
+     * [ChatSummary.lastEvent] with no text, sender or ticks; a message clears it.
+     */
+    fun withNewItem(row: ChatSummary, item: CoreItem): ChatSummary {
+        val event = item.takeIf { !it.isMessage }?.event
+        return row.copy(
+            lastMessageText = if (row.invited || event != null) null else item.takeUnless { it.deleted }?.text,
+            lastMessageTimeMs = if (item.timeMs > 0) item.timeMs else row.lastMessageTimeMs,
+            unreadCount = row.unreadCount + if (item.unread) 1 else 0,
+            lastMessageOutgoing = event == null && item.outgoing,
+            lastMessageStatus = if (event == null && item.outgoing) item.status else null,
+            lastMessageSender = item.takeIf { event == null && it.group && !it.outgoing && !it.deleted }?.sender?.displayName,
+            lastEvent = if (row.invited) null else event,
+        )
+    }
 
     /** The contract's order: pinned first, then newest activity first (ties by id, so the order is stable). */
     fun sortChats(rows: Collection<ChatSummary>): List<ChatSummary> = rows.sortedWith(

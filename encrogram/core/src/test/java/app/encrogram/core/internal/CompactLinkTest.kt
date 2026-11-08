@@ -99,7 +99,7 @@ class CompactLinkTest {
             "https://smp8.simplex.im/i#$linkId/$linkKey?p=5223&c=$fp",             // another host
             "simplex:/i#$linkId/$linkKey?h=$host&p=5223&c=$fp",                    // app scheme
             "https://$host/invitation#/?v=2-7&smp=x",                               // full link
-            "https://$host/g#$linkKey?p=5223&c=$fp",                               // group link
+            "https://$host/c#$linkKey?p=5223&c=$fp",                               // channel link
             compactLink,                                                           // already compact
         )
         for (link in keep) assertEquals(link, link, LinkChecker.compact(link, smp))

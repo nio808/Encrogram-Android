@@ -145,7 +145,15 @@ internal data class CoreMember(
     val memberContactId: Long?,
     /** memberStatus connected or complete: the member's own connection works (the restore repair needs it). */
     val active: Boolean = false,
+    /** memberStatus pending_approval or pending_review (knocking): the core refuses role changes for them (Commands.hs:2886). */
+    val pending: Boolean = false,
 )
+
+/**
+ * A group's link (GroupLink, Types.hs:569-576): `connLinkContact` {connFullLink, connShortLink?} and the role people
+ * join with (acceptMemberRole).
+ */
+internal data class CoreGroupLink(val fullLink: String?, val shortLink: String?, val role: MemberRole)
 
 /** SimpleX's local note folder (ChatInfo `local`, NoteFolder in Types.hs): Saved Messages. */
 internal data class CoreNoteFolder(val noteFolderId: Long, val favorite: Boolean, val chatTsMs: Long)
@@ -500,10 +508,10 @@ internal object CoreJson {
         return when (contentType) {
             "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender)
             "sndGroupEvent" -> sndGroupEvent(content.optJSONObject("sndGroupEvent"))
-            // In the inviting contact's 1:1 chat: "You were invited" (CIRcvGroupInvitation, CIContent.hs:152).
-            "rcvGroupInvitation" -> GroupEvent(GroupEvent.Kind.INVITED)
-            // In our 1:1 chat with the person we invited: "Bob was invited".
-            "sndGroupInvitation" -> peerName?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
+            // In the inviting contact's 1:1 chat: "You were invited to <group>" (CIRcvGroupInvitation, CIContent.hs:152).
+            "rcvGroupInvitation" -> GroupEvent(GroupEvent.Kind.INVITED, groupName = invitedGroupName(content))
+            // In our 1:1 chat with the person we invited: "Bob was invited to <group>".
+            "sndGroupInvitation" -> peerName?.let { GroupEvent(GroupEvent.Kind.INVITED, it, groupName = invitedGroupName(content)) }
             // Created with every new group (Commands.hs:4182-4187 createNewGroupItems; CIContent.hs:172).
             "sndGroupE2EEInfo" -> GroupEvent(GroupEvent.Kind.CREATED)
             else -> null
@@ -544,6 +552,16 @@ internal object CoreJson {
             "memberAccepted" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
             else -> null
         }
+    }
+
+    /**
+     * The group an invitation row is about: `groupInvitation` (CIGroupInvitation, CIContent.hs:269-276; JSON
+     * JCIRcvGroupInvitation/JCISndGroupInvitation {groupInvitation, memberRole}, :489-490) -> its profile's displayName,
+     * else the core's local name for it. Null when neither is there.
+     */
+    private fun invitedGroupName(content: JSONObject): String? {
+        val inv = content.optJSONObject("groupInvitation") ?: return null
+        return inv.optJSONObject("groupProfile")?.str("displayName")?.ifEmpty { null } ?: inv.str("localDisplayName")?.ifEmpty { null }
     }
 
     /** `profile.displayName` of an event about a member (Profile, not LocalProfile: no alias). */
@@ -674,6 +692,7 @@ internal object CoreJson {
             isMe = isMe,
             memberContactId = contactId,
             active = statusWord == "connected" || statusWord == "complete",
+            pending = statusWord == "pending_approval" || statusWord == "pending_review",
         )
     }
 
@@ -685,6 +704,20 @@ internal object CoreJson {
         parseMember(group.optJSONObject("groupInfo")?.optJSONObject("membership"), isMe = true)?.let { out.add(it) }
         group.optJSONArray("members").forEachObject { m -> parseMember(m, isMe = false)?.let { out.add(it) } }
         return out
+    }
+
+    /**
+     * `groupLink` / `groupLinkCreated` body {groupInfo, groupLink} (Controller.hs:886-887) -> the link, or null when the
+     * body has no groupLink. Links are kept exactly as the core wrote them; the engine checks them before use.
+     */
+    fun parseGroupLink(body: JSONObject): CoreGroupLink? {
+        val gl = body.optJSONObject("groupLink") ?: return null
+        val links = gl.optJSONObject("connLinkContact")
+        return CoreGroupLink(
+            fullLink = links?.str("connFullLink")?.ifEmpty { null },
+            shortLink = links?.str("connShortLink")?.ifEmpty { null },
+            role = memberRole(gl.str("acceptMemberRole") ?: "member"),
+        )
     }
 
     /** `groupCreated` body {groupInfo} (Controller.hs:815) -> the new groupId. */
@@ -815,7 +848,8 @@ internal object CoreJson {
             var last: CoreItem? = null
             if (items != null) {
                 for (j in 0 until items.length()) {
-                    val it = parseChatItem(contact.contactId, items.optJSONObject(j)) ?: continue
+                    // The contact's name too, so "Bob was invited" can be the row's lastEvent.
+                    val it = parseChatItem(contact.contactId, items.optJSONObject(j), contact.displayName.ifEmpty { null }) ?: continue
                     if (last == null || it.itemId > last.itemId) last = it
                 }
             }

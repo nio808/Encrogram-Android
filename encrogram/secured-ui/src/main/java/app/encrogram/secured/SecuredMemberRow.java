@@ -62,7 +62,7 @@ final class SecuredMemberRow extends FrameLayout {
 
         if (withCheck) {
             check = new CheckBox2(context, 21, SecuredResourcesProvider.get());
-            check.setColor(-1, Theme.key_windowBackgroundWhite, Theme.key_checkboxCheck);
+            check.setColor(Theme.key_radioBackgroundChecked, Theme.key_checkboxDisabled, Theme.key_checkboxCheck);   // style 10 as in NewContactBottomSheet
             check.setDrawUnchecked(true);
             check.setDrawBackgroundAsArc(10);
             addView(check, LayoutHelper.createFrame(24, 24, Gravity.RIGHT | Gravity.CENTER_VERTICAL, 0, 0, 16, 0));

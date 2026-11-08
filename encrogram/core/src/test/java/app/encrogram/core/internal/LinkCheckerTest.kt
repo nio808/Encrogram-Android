@@ -139,8 +139,9 @@ class LinkCheckerTest {
             "https://encrogram.nytmanager.com/i#$linkId/$linkKey extra",   // spaces would split the command
             "https://encrogram.nytmanager.com:443/i#$linkId/$linkKey",     // engine accepts a bare host only
             "https://user@encrogram.nytmanager.com/i#$linkId/$linkKey",
-            "https://encrogram.nytmanager.com/g#$linkKey",                 // groups: not in the MVP
-            "https://encrogram.nytmanager.com/c#$linkKey",                 // channels: not in the MVP
+            "https://encrogram.nytmanager.com/c#$linkKey",                 // relay channels: never
+            "https://encrogram.nytmanager.com/r#$linkKey",                 // chat relays: never
+            "https://encrogram.nytmanager.com/g#$linkId/$linkKey",         // a group link has one token
             "https://encrogram.nytmanager.com/i#$linkId/$linkKey?h=bad_host!",
             "https://encrogram.nytmanager.com/i#$linkId/$linkKey?p=port",
             "https://xn--80ak6aa92e.com/i#$linkId/$linkKey".replace("xn--80ak6aa92e", "аррӏе"),

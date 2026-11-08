@@ -8,6 +8,8 @@
     <string name="secgroup_event_created_channel">Channel created</string>
     <string name="secgroup_event_invited">%1$s was invited</string>
     <string name="secgroup_event_invited_you">You were invited</string>
+    <string name="secgroup_event_invited_to">%1$s was invited to %2$s</string>
+    <string name="secgroup_event_invited_you_to">You were invited to %1$s</string>
     <string name="secgroup_event_joined">%1$s joined</string>
     <string name="secgroup_event_joined_you">You joined</string>
     <string name="secgroup_event_left">%1$s left</string>
