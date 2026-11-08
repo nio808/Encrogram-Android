@@ -68,8 +68,26 @@ internal object InputRules {
      * The core copies the WHOLE quoted text into the reply's wire message and cannot be told to shorten it
      * (`/_send` takes only `quotedItemId`). So the new text gets what is left of the body cap.
      */
-    fun replyFits(text: String, quotedText: String): Boolean =
-        encodedTextBytes(text) + encodedTextBytes(quotedText) + QUOTE_OVERHEAD_BYTES <= MAX_TEXT_BYTES
+    fun replyFits(text: String, quotedText: String): Boolean = replyFits(text, quotedText, 0)
+
+    /**
+     * Same, for a reply to a photo or video: the core also copies the quoted PREVIEW into the reply (Internal.hs:314-335),
+     * so its data URL ([quotedPreviewChars], 0 when the quoted message has none) counts too. A data URL is ASCII.
+     */
+    fun replyFits(text: String, quotedText: String, quotedPreviewChars: Int): Boolean =
+        encodedTextBytes(text) + encodedTextBytes(quotedText) + QUOTE_OVERHEAD_BYTES + quotedPreviewChars.coerceAtLeast(0) <= MAX_TEXT_BYTES
+
+    /** Everything in a media message except the preview, the caption, the name and a quote (envelope, file record, JSON). */
+    const val MEDIA_OVERHEAD_BYTES = 600
+
+    /**
+     * A media message must stay under [MAX_TEXT_BYTES] without relying on compression (docs/media-plan.md §2.8):
+     * preview + caption + file name + quote + [MEDIA_OVERHEAD_BYTES]. [nameBytes]: the file name's encoded bytes.
+     * [quoteBytes]: 0 without a quote; with one, the quoted text's encoded bytes plus [QUOTE_OVERHEAD_BYTES].
+     */
+    fun mediaFits(caption: String, previewChars: Int, nameBytes: Int, quoteBytes: Int = 0): Boolean =
+        previewChars.coerceAtLeast(0).toLong() + encodedTextBytes(caption) + nameBytes.coerceAtLeast(0) +
+            quoteBytes.coerceAtLeast(0) + MEDIA_OVERHEAD_BYTES <= MAX_TEXT_BYTES
 
     /** The protocol accepts exactly these eight (Protocol.hs mrEmojiChar); the heart is U+2764 alone. */
     fun reactionAllowed(emoji: String): Boolean = emoji in SECURED_REACTIONS

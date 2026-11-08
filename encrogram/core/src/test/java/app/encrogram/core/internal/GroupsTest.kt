@@ -1119,7 +1119,7 @@ class GroupsTest {
         assertEquals(burst10, i.sharedMsgId)
         // A group quote names its author and the message's shared id (1:1 quotes have neither: ItemEventsTest).
         val reply = parse(quoting(gItem(41, "groupRcv", msg("seen"), from = hostAlice), historyAuthor(12, "Bob", oldMe), burst10, "burst 10"), chat9)
-        assertEquals(CoreQuote(40, "burst 10", false, oldMe, burst10), reply.quote)
+        assertEquals(CoreQuote(40, "burst 10", false, oldMe, burst10, "text"), reply.quote)
     }
 
     @Test

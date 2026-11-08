@@ -10,6 +10,9 @@ import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SECURED_REACTIONS
 import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.backup.RestoreRepair
+import app.encrogram.core.internal.media.CoreFile
+import app.encrogram.core.internal.media.FileStatusMapper
+import app.encrogram.core.internal.media.MediaJson
 import org.json.JSONException
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -125,7 +128,7 @@ internal data class CoreItem(
      */
     val sharedMsgId: String? = null,
     /** The item's file (CIFile), for image, video, voice and file content; null otherwise and when deleted (media phase 1). */
-    val file: app.encrogram.core.internal.media.CoreFile? = null,
+    val file: CoreFile? = null,
     /** msgContent.image: the preview data URL that travelled in the message (image and video), untrusted. Never logged. */
     val preview: String? = null,
     /** msgContent.duration in whole seconds (video and voice). */
@@ -550,7 +553,12 @@ internal object CoreJson {
         val msgText = msgContent?.str("text").orEmpty()
         // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
         // A service row carries no text at all: the UI words it from [event].
-        val text = if (deleted || !isMessage) "" else msgText.ifEmpty { meta.str("itemText").orEmpty() }
+        // Media content takes its caption from msgContent.text alone: meta.itemText holds names such as
+        // "voice message 0:12" that would otherwise show up as a caption (Protocol.hs:787-790).
+        val msgType = tagOf(msgContent)
+        val mediaMsg = !deleted && isMessage && MediaJson.isMediaType(msgType)
+        val text = if (deleted || !isMessage) "" else if (mediaMsg) msgText else msgText.ifEmpty { meta.str("itemText").orEmpty() }
+        val file = if (mediaMsg) MediaJson.parseFile(item.optJSONObject("file"), msgContent) else null
         val status = meta.optJSONObject("itemStatus")
         val statusTag = tagOf(status)
         val timed = meta.optJSONObject("itemTimed")
@@ -563,7 +571,8 @@ internal object CoreJson {
             text = text,
             timeMs = timeMs(meta.str("itemTs")),
             statusTag = statusTag,
-            status = if (local) MessageStatus.DELIVERED else StatusMapper.map(statusTag, outgoing, status?.str("sndProgress"), group),
+            status = if (local) MessageStatus.DELIVERED else
+                FileStatusMapper.cappedStatus(StatusMapper.map(statusTag, outgoing, status?.str("sndProgress"), group), file, outgoing),
             unread = !local && !outgoing && statusTag == "rcvNew",
             msgContentType = tagOf(msgContent),
             quote = if (deleted) null else parseQuote(item.optJSONObject("quotedItem")),
@@ -581,6 +590,9 @@ internal object CoreJson {
             linkJoinOf = linkJoinOf,
             connectedOf = connectedOf,
             sharedMsgId = meta.str("itemSharedMsgId")?.ifEmpty { null },
+            file = file,
+            preview = if (mediaMsg && (msgType == "image" || msgType == "video")) MediaJson.preview(msgContent) else null,
+            durationSeconds = if (mediaMsg && (msgType == "video" || msgType == "voice")) MediaJson.duration(msgContent) else null,
         )
     }
 
@@ -962,7 +974,8 @@ internal object CoreJson {
         val group = dir == "groupRcv"
         val author = if (group) q.optJSONObject("chatDir")?.optJSONObject("groupMember")?.str("memberId")?.ifEmpty { null } else null
         val shared = if (group) q.str("sharedMsgId")?.ifEmpty { null } else null
-        return CoreQuote(itemId, q.optJSONObject("content")?.str("text").orEmpty(), outgoing, author, shared)
+        val content = q.optJSONObject("content")
+        return CoreQuote(itemId, content?.str("text").orEmpty(), outgoing, author, shared, tagOf(content))
     }
 
     /** reactions: [{reaction: {type: "emoji", emoji}, userReacted, totalReacted}]; only the known eight. */

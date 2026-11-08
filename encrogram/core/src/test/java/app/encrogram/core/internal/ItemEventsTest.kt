@@ -30,14 +30,14 @@ class ItemEventsTest {
     @Test
     fun replyCarriesItsQuote() {
         val i = item(Samples.item(45, "directSnd", "sndMsgContent", "me too", "sndSent", quote = Samples.quote(40, "first")))
-        assertEquals(CoreQuote(40, "first", false), i.quote)
+        assertEquals(CoreQuote(40, "first", false, msgContentType = "text"), i.quote)
         val m = MessageMapper.toMessage(i)
         assertEquals(40L, m.replyTo?.messageId)
         assertEquals("first", m.replyTo?.text)
         assertFalse(m.replyTo!!.outgoing)
         // A quote of a message this device never received has no id; a quote of our own message is outgoing.
         val q = item(Samples.item(46, "directRcv", "rcvMsgContent", "yes", "rcvNew", quote = Samples.quote(null, "mine", "directSnd")))
-        assertEquals(CoreQuote(null, "mine", true), q.quote)
+        assertEquals(CoreQuote(null, "mine", true, msgContentType = "text"), q.quote)
     }
 
     @Test

@@ -3,12 +3,14 @@ package app.encrogram.core.internal
 import app.encrogram.core.api.ChatKind
 import app.encrogram.core.api.ChatSummary
 import app.encrogram.core.api.GroupEvent
+import app.encrogram.core.api.MediaKind
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MessageSender
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.QuotePreview
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SecuredMessage
+import app.encrogram.core.internal.media.MediaMapper
 
 /**
  * Turns parsed engine items and chats into the contract's [SecuredMessage] and [ChatSummary]. Pure logic.
@@ -34,7 +36,9 @@ internal object MessageMapper {
             text = if (deleted || service) "" else i.text,
             timeMs = i.timeMs,
             status = i.status,
-            replyTo = if (deleted || service) null else i.quote?.let { QuotePreview(it.itemId, InputRules.preview(it.text), it.outgoing) },
+            replyTo = if (deleted || service) null else i.quote?.let {
+                QuotePreview(it.itemId, InputRules.preview(MediaMapper.quoteText(it.text)), it.outgoing, MediaMapper.kindOfContentType(it.msgContentType))
+            },
             edited = i.edited,
             deleted = deleted,
             // Notes have no shared message id (never sent); the core edits them locally with no time limit
@@ -46,8 +50,25 @@ internal object MessageMapper {
             expiresAtMs = i.expiresAtMs,
             sender = sender?.let { MessageSender(it.memberId, it.displayName, it.role) },
             event = event,
+            media = if (deleted || service) null else MediaMapper.map(i),
         )
     }
+
+    /**
+     * The chat-list preview text of an item: its text (a media caption may be empty), except a file without a caption,
+     * which shows its name. Null for a deleted item.
+     */
+    private fun previewText(item: CoreItem): String? {
+        if (item.deleted) return null
+        val file = item.file
+        if (item.text.isEmpty() && file != null && MediaMapper.kindOf(item) == MediaKind.FILE) {
+            return MediaMapper.displayName(file.name)
+        }
+        return item.text
+    }
+
+    /** The media kind of an item shown as a row's last message; null for text, deleted items and a null item. */
+    private fun mediaOf(item: CoreItem?) = item?.takeUnless { it.deleted }?.let { MediaMapper.kindOf(it) }
 
     /**
      * One chat-list row. [archived] is our local flag ([ArchiveStore]); everything else comes from the engine. A
@@ -60,7 +81,7 @@ internal object MessageMapper {
         return ChatSummary(
             chatId = c.contactId,
             displayName = c.displayName,
-            lastMessageText = last?.takeUnless { it.deleted }?.text,
+            lastMessageText = last?.let { previewText(it) },
             lastMessageTimeMs = time,
             unreadCount = chat.unreadCount,
             verified = c.verified,
@@ -72,6 +93,7 @@ internal object MessageMapper {
             archived = archived,
             disappearingTtlSeconds = c.timedTtlSeconds,
             lastEvent = lastEventOf(chat.lastItem),
+            lastMessageMedia = mediaOf(last),
         )
     }
 
@@ -90,7 +112,7 @@ internal object MessageMapper {
         return ChatSummary(
             chatId = g.chatId,
             displayName = g.displayName,
-            lastMessageText = if (g.invited) null else last?.takeUnless { it.deleted }?.text,
+            lastMessageText = if (g.invited) null else last?.let { previewText(it) },
             lastMessageTimeMs = time,
             unreadCount = chat.unreadCount,
             verified = false,
@@ -109,6 +131,7 @@ internal object MessageMapper {
             invited = g.invited,
             lastEvent = if (g.invited) null else lastEventOf(chat.lastItem),
             gone = g.gone,
+            lastMessageMedia = if (g.invited) null else mediaOf(last),
         )
     }
 
@@ -122,7 +145,7 @@ internal object MessageMapper {
         return ChatSummary(
             chatId = SAVED_MESSAGES_CHAT_ID,
             displayName = "",
-            lastMessageText = last?.takeUnless { it.deleted }?.text,
+            lastMessageText = last?.let { previewText(it) },
             lastMessageTimeMs = time,
             unreadCount = 0,
             verified = false,
@@ -130,6 +153,7 @@ internal object MessageMapper {
             lastMessageOutgoing = last != null,
             lastMessageStatus = last?.let { MessageStatus.DELIVERED },
             pinned = chat.folder.favorite,
+            lastMessageMedia = mediaOf(last),
         )
     }
 
@@ -140,13 +164,14 @@ internal object MessageMapper {
     fun withNewItem(row: ChatSummary, item: CoreItem): ChatSummary {
         val event = item.takeIf { !it.isMessage }?.event
         return row.copy(
-            lastMessageText = if (row.invited || event != null) null else item.takeUnless { it.deleted }?.text,
+            lastMessageText = if (row.invited || event != null) null else previewText(item),
             lastMessageTimeMs = if (item.timeMs > 0) item.timeMs else row.lastMessageTimeMs,
             unreadCount = row.unreadCount + if (item.unread) 1 else 0,
             lastMessageOutgoing = event == null && item.outgoing,
             lastMessageStatus = if (event == null && item.outgoing) item.status else null,
             lastMessageSender = item.takeIf { event == null && it.group && !it.outgoing && !it.deleted }?.sender?.displayName,
             lastEvent = if (row.invited) null else event,
+            lastMessageMedia = if (row.invited || event != null) null else mediaOf(item),
         )
     }
 
