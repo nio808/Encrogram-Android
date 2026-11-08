@@ -30,6 +30,11 @@ internal object SecuredLog {
         PROFILE_UPDATED, PROFILE_PREFS_MERGED, PROFILE_PREFS_FAILED,
         TASK_CRASHED, STOPPED,
         BG_START_REFUSED, BG_SERVICE_STARTED, BG_NOTIFY_FAILED,
+        // 12-word backup. Tags are fixed words; the count is at most an HTTP status or a number of items.
+        // Never the words, the backup id or key, the URL, the database key or the archive.
+        BACKUP_ENABLED, BACKUP_DISABLED, BACKUP_STARTED, BACKUP_EXPORTED, BACKUP_UPLOADED, BACKUP_FAILED,
+        BACKUP_LOOKUP, BACKUP_LOOKUP_FAILED, BACKUP_IO_FAILED, VAULT_FAILED, PHRASE_SHOWN, PHRASE_REFUSED,
+        RESTORE_STARTED, RESTORE_DONE, RESTORE_FAILED, RESTORE_WIPED, RATCHET_SYNC, QUEUE_SWITCH, RESTORE_REPAIR,
     }
 
     fun i(ev: Ev, tag: String? = null, count: Int? = null) = write(Log.INFO, ev, tag, count)

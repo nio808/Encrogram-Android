@@ -29,7 +29,8 @@ def localProps = loadProps(rootProject.file('encrogram/local.properties'))
 
 def encVersionCode = Integer.parseInt(encProps.getProperty('ENC_VERSION_CODE', '1'))
 def encVersionName = encProps.getProperty('ENC_VERSION_NAME', '0.1.0-mvp')
-def smpHost = (loadProps(rootProject.file('encrogram/secured.properties')).getProperty('SECURED_SMP_HOST') ?: '').trim()
+def securedProps = loadProps(rootProject.file('encrogram/secured.properties'))
+def smpHost = (securedProps.getProperty('SECURED_SMP_HOST') ?: '').trim()
 def q = { String s -> '"' + (s ?: '').replace('\\', '\\\\').replace('"', '\\"') + '"' }
 
 dependencies {
@@ -126,6 +127,8 @@ android {
         buildConfigField 'String', 'SECURED_LINK_HOST', q(smpHost)
         buildConfigField 'String', 'SECURED_SMP_SERVER', q((localProps.getProperty('SECURED_SMP_SERVER') ?: '').trim())
         buildConfigField 'String', 'SECURED_XFTP_SERVER', q((localProps.getProperty('SECURED_XFTP_SERVER') ?: '').trim())
+        // Where encrypted 12-word backups go (public, from encrogram/secured.properties).
+        buildConfigField 'String', 'SECURED_BACKUP_URL', q((securedProps.getProperty('SECURED_BACKUP_BASE_URL') ?: '').trim())
     }
 
     buildTypes {

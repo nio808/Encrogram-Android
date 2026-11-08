@@ -4,6 +4,7 @@ import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.ReactionCount
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SECURED_REACTIONS
+import app.encrogram.core.backup.RestoreRepair
 import org.json.JSONException
 import org.json.JSONObject
 import java.time.Instant
@@ -523,6 +524,55 @@ internal object CoreJson {
             else -> null
         }
         return if (inner != null) "$type.$inner" else type
+    }
+
+    // ---- 12-word backup ------------------------------------------------------------------------------------------
+
+    /** `archiveExported` / `archiveImported` body {archiveErrors: [ArchiveError]}: how many files failed (never their names). */
+    fun archiveErrorCount(body: JSONObject): Int = body.optJSONArray("archiveErrors")?.length() ?: 0
+
+    /**
+     * ConnectionStats (simplexmq Agent/Protocol.hs:709-716) {connAgentVersion, rcvQueuesInfo: [{rcvServer, status,
+     * rcvSwitchStatus?, canAbortSwitch, subStatus}], sndQueuesInfo, ratchetSyncState: ok|allowed|required|started|
+     * agreed, ratchetSyncSupported}. A receive queue with a rcvSwitchStatus (switch_started, sending_qadd, ...) means
+     * a queue switch is running. Null when absent or without a sync state.
+     */
+    fun connectionStats(o: JSONObject?): RestoreRepair.ConnStats? {
+        if (o == null) return null
+        val state = o.str("ratchetSyncState")?.ifEmpty { null } ?: return null
+        var switching = false
+        o.optJSONArray("rcvQueuesInfo").forEachObject { q ->
+            if (q.has("rcvSwitchStatus") && !q.isNull("rcvSwitchStatus")) switching = true
+        }
+        return RestoreRepair.ConnStats(state, o.optBoolean("ratchetSyncSupported", false), switching)
+    }
+
+    /**
+     * `contactInfo` body {contact, connectionStats_?, customUserProfile?} (Controller.hs:788; the JSON field keeps the
+     * trailing underscore, as upstream's ContactInfo shows). Stats are absent for a contact without an active connection.
+     */
+    fun contactInfoStats(body: JSONObject): Pair<CoreContact?, RestoreRepair.ConnStats?> {
+        val stats = body.optJSONObject("connectionStats_") ?: body.optJSONObject("connectionStats")
+        return parseContact(body.optJSONObject("contact")) to connectionStats(stats)
+    }
+
+    /** `contactRatchetSync` event {contact, ratchetSyncProgress: {ratchetSyncStatus, connectionStats}} -> (contactId, status). */
+    fun ratchetSyncEvent(body: JSONObject): Pair<Long, String>? {
+        val contactId = parseContact(body.optJSONObject("contact"))?.contactId ?: return null
+        val status = body.optJSONObject("ratchetSyncProgress")?.str("ratchetSyncStatus")?.ifEmpty { null } ?: return null
+        return contactId to status
+    }
+
+    /**
+     * `contactSwitch` event {contact, switchProgress: {queueDirection: rcv|snd, switchPhase: started|confirmed|secured|
+     * completed, connectionStats}} (Controller.hs:925, 1348-1353) -> (contactId, "rcv.completed").
+     */
+    fun switchEvent(body: JSONObject): Pair<Long, String>? {
+        val contactId = parseContact(body.optJSONObject("contact"))?.contactId ?: return null
+        val p = body.optJSONObject("switchProgress") ?: return null
+        val dir = p.str("queueDirection") ?: return null
+        val phase = p.str("switchPhase") ?: return null
+        return contactId to "$dir.$phase"
     }
 
     /** UTCTime ("2026-11-07T10:20:30.123456Z") -> epoch millis; 0 if absent or unparseable. */

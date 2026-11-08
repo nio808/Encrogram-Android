@@ -134,7 +134,7 @@ final class SecuredSheets {
     }
 
     /** Android's own share sheet. Encrogram's Telegram share target is excluded so the link cannot slip into Telegram by accident. */
-    private static void share(Context context, String link) {
+    static void share(Context context, String link) {
         final Intent send = new Intent(Intent.ACTION_SEND);
         send.setType("text/plain");
         send.putExtra(Intent.EXTRA_TEXT, link);

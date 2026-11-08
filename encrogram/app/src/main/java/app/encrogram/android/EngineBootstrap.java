@@ -14,7 +14,8 @@ import app.encrogram.core.api.SecuredEngines;
 
 /**
  * The one place where the app builds the Secured engine. Reads our relay addresses from BuildConfig
- * (written from encrogram/local.properties) and derives the allowed relay hosts from them.
+ * (written from encrogram/local.properties) and derives the allowed relay hosts from them. The backup base URL
+ * comes from encrogram/secured.properties (SECURED_BACKUP_BASE_URL).
  * If the factory in :encrogram-core changes shape, only this class needs adjusting.
  */
 final class EngineBootstrap {
@@ -27,7 +28,8 @@ final class EngineBootstrap {
         final Set<String> hosts = new LinkedHashSet<>();
         for (String s : smp) addHost(hosts, s);
         for (String s : xftp) addHost(hosts, s);
-        return SecuredEngines.create(context.getApplicationContext(), new RelayConfig(smp, xftp, new ArrayList<>(hosts)));
+        final String backupUrl = BuildConfig.SECURED_BACKUP_URL.isEmpty() ? null : BuildConfig.SECURED_BACKUP_URL;
+        return SecuredEngines.create(context.getApplicationContext(), new RelayConfig(smp, xftp, new ArrayList<>(hosts), backupUrl));
     }
 
     /** Servers may be separated by commas, semicolons, spaces or newlines. */

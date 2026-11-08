@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings for Secured groups and channels (docs/groups-plan.md): service rows, invitation and can't-post bars,
+     header subtitle, delete dialog, list previews, and the group facts the info screen (G4) will show.
+     Honest wording only: no "unhackable" and no claims the SimpleX core does not keep. -->
+<resources>
+    <!-- Service rows (ChatActionCell). %1$s is a member's Secured display name. -->
+    <string name="secgroup_event_created_group">Group created</string>
+    <string name="secgroup_event_created_channel">Channel created</string>
+    <string name="secgroup_event_invited">%1$s was invited</string>
+    <string name="secgroup_event_invited_you">You were invited</string>
+    <string name="secgroup_event_joined">%1$s joined</string>
+    <string name="secgroup_event_joined_you">You joined</string>
+    <string name="secgroup_event_left">%1$s left</string>
+    <string name="secgroup_event_left_you">You left</string>
+    <string name="secgroup_event_removed">%1$s was removed</string>
+    <string name="secgroup_event_removed_unknown">A member was removed</string>
+    <string name="secgroup_event_you_removed_group">You were removed from the group</string>
+    <string name="secgroup_event_you_removed_channel">You were removed from the channel</string>
+    <string name="secgroup_event_role">%1$s is now %2$s</string>
+    <string name="secgroup_event_role_you">You are now %1$s</string>
+    <string name="secgroup_event_deleted_group">The group was deleted</string>
+    <string name="secgroup_event_deleted_channel">The channel was deleted</string>
+    <string name="secgroup_event_updated_group">The group was updated</string>
+    <string name="secgroup_event_updated_channel">The channel was updated</string>
+    <string name="secgroup_event_deleted_by_admin">Message deleted by admin</string>
+
+    <!-- Roles, with the article ("X is now an admin") and bare ("Admin"). -->
+    <string name="secgroup_role_owner_a">an owner</string>
+    <string name="secgroup_role_admin_a">an admin</string>
+    <string name="secgroup_role_moderator_a">a moderator</string>
+    <string name="secgroup_role_member_a">a member</string>
+    <string name="secgroup_role_observer_a">an observer</string>
+    <string name="secgroup_role_owner">Owner</string>
+    <string name="secgroup_role_admin">Admin</string>
+    <string name="secgroup_role_moderator">Moderator</string>
+    <string name="secgroup_role_member">Member</string>
+    <string name="secgroup_role_observer">Observer</string>
+
+    <!-- Header subtitle -->
+    <plurals name="secgroup_members_count">
+        <item quantity="one">%1$d member</item>
+        <item quantity="other">%1$d members</item>
+    </plurals>
+    <plurals name="secgroup_subscribers_count">
+        <item quantity="one">%1$d subscriber</item>
+        <item quantity="other">%1$d subscribers</item>
+    </plurals>
+    <string name="secgroup_subtitle_group">Group</string>
+    <string name="secgroup_subtitle_channel">Channel</string>
+
+    <!-- Bars that replace the composer -->
+    <string name="secgroup_invited_bar">You’re invited to this group</string>
+    <string name="secgroup_invited_bar_channel">You’re invited to this channel</string>
+    <string name="secgroup_join">Join</string>
+    <string name="secgroup_decline">Decline</string>
+    <string name="secgroup_cant_post_channel">Only admins can post in this channel.</string>
+    <string name="secgroup_cant_post_group">You can’t send messages in this group.</string>
+    <string name="secgroup_join_failed">Could not join: %1$s</string>
+
+    <!-- Delete / leave -->
+    <string name="secgroup_delete_title">Delete group</string>
+    <string name="secgroup_delete_title_channel">Delete channel</string>
+    <string name="secgroup_delete_everyone">Delete for everyone</string>
+    <string name="secgroup_delete_owner_text">As the owner you can delete this group for all members. Or remove it from this phone only; the group continues without you.</string>
+    <string name="secgroup_delete_owner_text_channel">As the owner you can delete this channel for all subscribers. Or remove it from this phone only; the channel continues without you.</string>
+    <string name="secgroup_delete_phone_only">Delete on this phone only</string>
+    <string name="secgroup_leave_title">Leave group</string>
+    <string name="secgroup_leave_title_channel">Leave channel</string>
+    <string name="secgroup_leave_text">You leave the group and its messages are removed from this phone. Members see that you left.</string>
+    <string name="secgroup_leave_text_channel">You leave the channel and its posts are removed from this phone. Others see that you left.</string>
+    <string name="secgroup_leave_confirm">Leave and delete</string>
+    <string name="secgroup_delete_mixed_note">Groups in your selection are left, or removed from this phone only if you own them.</string>
+
+    <!-- Chat list -->
+    <string name="secgroup_row_invited">Invitation to join</string>
+    <string name="secgroup_row_sender_message">%1$s: %2$s</string>
+
+    <!-- Group facts for the info screen (G4). Keep these true to what the core does. -->
+    <string name="secgroup_fact_sent_each">Each message is sent from your phone to every member.</string>
+    <string name="secgroup_fact_ticks">✓✓ means every member received it (groups of 20 or fewer).</string>
+    <string name="secgroup_fact_admins_add">Only admins add people, from their own Secured contacts.</string>
+    <string name="secgroup_fact_history">New members see up to 100 earlier messages.</string>
+    <string name="secgroup_fact_names_visible">Members see each other’s names.</string>
+    <string name="secgroup_fact_channel_size">Good for up to about 50 subscribers. Posts are sent from your phone to each subscriber. Subscribers can see who else is in the channel and can react. No view counts.</string>
+
+    <!-- G4: new group / channel, group info, members, link sheet -->
+    <string name="secgroup_new_group">New group</string>
+    <string name="secgroup_new_channel">New channel</string>
+    <string name="secgroup_name_hint_group">Group name</string>
+    <string name="secgroup_name_hint_channel">Channel name</string>
+    <string name="secgroup_create">Create</string>
+    <string name="secgroup_create_channel_confirm">Create channel</string>
+    <string name="secgroup_pick_header_group">Add members</string>
+    <string name="secgroup_pick_header_channel">Add subscribers</string>
+    <string name="secgroup_pick_hint">Only your Secured contacts can be added. You can add more people later.</string>
+    <string name="secgroup_pick_none">You have no Secured contacts yet. Create an invite and connect first, or create the group now and share its link later.</string>
+    <string name="secgroup_pick_selected">%1$d selected</string>
+    <string name="secgroup_create_failed">Could not create: %1$s</string>
+    <string name="secgroup_add_partial_failed">Created, but adding people failed: %1$s</string>
+    <string name="secgroup_add_members">Add members</string>
+    <string name="secgroup_add_subscribers">Add subscribers</string>
+    <string name="secgroup_add_done">Invitations sent</string>
+    <string name="secgroup_action_failed">Could not do that: %1$s</string>
+    <string name="secgroup_name_empty">Type a name first.</string>
+
+    <string name="secgroup_info_group">Group info</string>
+    <string name="secgroup_info_channel">Channel info</string>
+    <string name="secgroup_facts_header">How it works</string>
+    <string name="secgroup_members_header_group">Members</string>
+    <string name="secgroup_members_header_channel">Subscribers</string>
+    <string name="secgroup_member_you">You</string>
+    <string name="secgroup_member_invited">invited</string>
+    <string name="secgroup_member_connecting">connecting</string>
+    <string name="secgroup_member_sub">%1$s · %2$s</string>
+    <string name="secgroup_make_admin">Make admin</string>
+    <string name="secgroup_remove_admin">Remove admin</string>
+    <string name="secgroup_make_member">Make member</string>
+    <string name="secgroup_make_observer">Make observer</string>
+    <string name="secgroup_remove_member">Remove from group</string>
+    <string name="secgroup_remove_member_channel">Remove from channel</string>
+    <string name="secgroup_remove_title">Remove %1$s?</string>
+    <string name="secgroup_remove_text">They are removed from the group and can no longer send or receive messages in it.</string>
+    <string name="secgroup_remove_text_channel">They are removed from the channel and no longer receive its posts.</string>
+    <string name="secgroup_remove_confirm">Remove</string>
+    <string name="secgroup_leave_row_group">Leave group</string>
+    <string name="secgroup_leave_row_channel">Leave channel</string>
+    <string name="secgroup_delete_row_group">Delete group for everyone</string>
+    <string name="secgroup_delete_row_channel">Delete channel for everyone</string>
+
+    <string name="secgroup_invite_link">Invite link</string>
+    <string name="secgroup_link_creating">Getting the link…</string>
+    <string name="secgroup_link_explain_group">Anyone who has this link can join the group as a member. Share it only with people you trust.</string>
+    <string name="secgroup_link_explain_channel">Anyone who has this link can join the channel as a subscriber (observer). Share it only with people you trust.</string>
+    <string name="secgroup_link_failed">Could not get the link: %1$s</string>
+    <string name="secgroup_link_delete">Delete link</string>
+    <string name="secgroup_link_delete_title">Delete the invite link?</string>
+    <string name="secgroup_link_delete_text">People who already joined stay. Nobody can join with this link any more; you can make a new one later.</string>
+    <string name="secgroup_link_deleted">Link deleted</string>
+</resources>

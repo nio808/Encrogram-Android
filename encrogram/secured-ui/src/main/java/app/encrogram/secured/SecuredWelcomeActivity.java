@@ -68,6 +68,10 @@ final class SecuredWelcomeActivity extends BaseFragment {
         });
         column.addView(without, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
 
+        final TextView restore = Kit.button(context, context.getString(R.string.sec_bk_restore_link), false);
+        restore.setOnClickListener(v -> presentFragment(new SecuredRestoreActivity(true)));   // the welcome stays below until a restore succeeds
+        column.addView(restore, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
+
         final TextView note = Kit.text(context, context.getString(R.string.sec_welcome_unofficial), 12, Kit.color(Theme.key_windowBackgroundWhiteGrayText), false);
         note.setGravity(Gravity.CENTER);
         column.addView(note, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 20, 0, 0));

@@ -5,6 +5,7 @@ import org.telegram.ui.Cells.DialogCell;
 import java.util.ArrayList;
 import java.util.List;
 
+import app.encrogram.core.api.ChatKind;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.MessageStatus;
 
@@ -32,6 +33,17 @@ final class ChatRowMapper {
         final String noMessages;
         /** Telegram's own localized "Saved Messages": the engine gives that chat no name. */
         final String savedMessages;
+        /** Groups: row text of a chat you are invited to but have not joined. */
+        String invitation = "Invitation to join";
+        /** Groups: "Name: message" with %1$s = sender and %2$s = text. */
+        String senderFormat = "%1$s: %2$s";
+
+        /** Group wording (secured_group_strings.xml); the contact labels above are unchanged. */
+        Labels withGroup(String invitation, String senderFormat) {
+            this.invitation = invitation;
+            this.senderFormat = senderFormat;
+            return this;
+        }
 
         Labels(String connecting, String noMessages, String savedMessages) {
             this.connecting = connecting;
@@ -59,12 +71,17 @@ final class ChatRowMapper {
         boolean archived;
         /** Saved Messages: Telegram's saved-messages avatar, no lock badge, no unread count, no "You:" and no tick. */
         boolean saved;
+        /** Group or channel: avatar from the name, no verified badge, "Name: message" preview. */
+        boolean group;
+        boolean invited;
     }
 
     static Row map(ChatSummary c, Labels labels, long nowMs) {
         final Row r = new Row();
         r.chatId = c.getChatId();
         r.saved = r.chatId == SAVED_MESSAGES_CHAT_ID;
+        r.group = c.getKind() != ChatKind.DIRECT || app.encrogram.core.api.SecuredEngineKt.isGroupChatId(r.chatId);
+        r.invited = r.group && c.getInvited();
         r.name = r.saved ? labels.savedMessages : c.getDisplayName() != null ? c.getDisplayName() : "";
         r.pinned = c.getPinned();
         r.muted = c.getMuted();
@@ -74,7 +91,9 @@ final class ChatRowMapper {
         r.dateSeconds = (int) (t / 1000L);
 
         final String text = c.getLastMessageText();
-        if (!c.getReady() && !r.saved) {
+        if (r.invited) {
+            r.message = labels.invitation;   // no preview of anything before you join
+        } else if (!c.getReady() && !r.saved) {
             r.message = labels.connecting;
         } else if (text == null) {
             r.message = labels.noMessages;
@@ -83,6 +102,9 @@ final class ChatRowMapper {
             r.outgoing = c.getLastMessageOutgoing() && !r.saved;
             if (r.outgoing) {
                 r.tick = tickFor(c.getLastMessageStatus());
+            } else if (r.group && c.getLastMessageSender() != null && !c.getLastMessageSender().isEmpty()) {
+                // Plain text, all grey: DialogCell's coloured sender name would need an upstream hook.
+                r.message = String.format(labels.senderFormat, c.getLastMessageSender(), text);
             }
         }
         return r;
@@ -109,7 +131,7 @@ final class ChatRowMapper {
         final DialogCell.CustomDialog d = new DialogCell.CustomDialog();
         d.name = r.name;
         d.message = r.message != null ? r.message : "";
-        d.id = colorId(r.chatId);
+        d.id = colorId(r.chatId);   // groups: mixed in, so they never share a hash with a contact
         d.unread_count = r.unread;
         d.pinned = r.pinned;
         d.muted = r.muted;
@@ -134,9 +156,13 @@ final class ChatRowMapper {
         return d;
     }
 
-    /** Folds the 64-bit chat id into an int so different chats rarely share an avatar colour. */
+    /**
+     * Folds the 64-bit chat id into an int so different chats rarely share an avatar colour. Group ids are
+     * GROUP_CHAT_ID_BASE + g, so the plain fold (g ^ 256) would land on contact id g ^ 256: groups mix that in.
+     */
     static int colorId(long chatId) {
-        return (int) (chatId ^ (chatId >>> 32));
+        final int h = (int) (chatId ^ (chatId >>> 32));
+        return app.encrogram.core.api.SecuredEngineKt.isGroupChatId(chatId) ? (h ^ 0x5bd1e995) * 31 + 7 : h;
     }
 
     // ---- self check (the module has no unit-test setup; the lead can call this from a debug hook) -----------------
@@ -177,6 +203,18 @@ final class ChatRowMapper {
             check(bad, "never media, type 0 or 1: " + t, !d.isMedia && (d.type == 0 || d.type == 1) && !d.verified);
         }
         check(bad, "colour id differs for ids that share low bits", colorId(1L) != colorId(1L + (1L << 32)));
+        final long gBase = app.encrogram.core.api.SecuredEngineKt.GROUP_CHAT_ID_BASE;
+        check(bad, "group colour id differs from the contact it used to fold onto", colorId(gBase + 5) != colorId(5) && colorId(gBase + 5) != colorId(5 ^ 256));
+
+        ChatSummary g = new ChatSummary(gBase + 1, "Team", "hello", 1000, 0, false, true, false, null, false, false, false, null,
+                ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, true, "Ann", false);
+        r = map(g, labels, now);
+        check(bad, "group preview is Name: message", "Ann: hello".equals(r.message) && r.group && !r.outgoing);
+        check(bad, "group row never verified", !toCustomDialog(r).verified);
+        g = new ChatSummary(gBase + 2, "Club", "secret", 1000, 1, false, true, false, null, false, false, false, null,
+                ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, false, "Ann", true);
+        r = map(g, labels, now);
+        check(bad, "invited row: invitation text, no preview", "Invitation to join".equals(r.message) && r.invited);
         return bad;
     }
 

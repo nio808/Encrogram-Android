@@ -3,12 +3,15 @@ package app.encrogram.core.internal
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import app.encrogram.core.api.BackupInfo
+import app.encrogram.core.api.BackupState
 import app.encrogram.core.api.ChatAction
 import app.encrogram.core.api.ChatSummary
 import app.encrogram.core.api.EngineState
 import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
 import app.encrogram.core.api.MessagePage
+import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.RelayConfig
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SecuredCallback
@@ -19,6 +22,14 @@ import app.encrogram.core.api.SecuredListener
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredProfile
 import app.encrogram.core.api.SecuredResult
+import app.encrogram.core.backup.BackupClient
+import app.encrogram.core.backup.BackupSecrets
+import app.encrogram.core.backup.BackupStore
+import app.encrogram.core.backup.Bip39
+import app.encrogram.core.backup.Envelope
+import app.encrogram.core.backup.KeyVault
+import app.encrogram.core.backup.Kdf
+import app.encrogram.core.backup.RestoreRepair
 import app.encrogram.core.internal.ErrorMapper.Op
 import app.encrogram.core.internal.InputRules.MAX_PAGE
 import app.encrogram.core.internal.SecuredLog.Ev
@@ -28,9 +39,13 @@ import chat.simplex.common.platform.chatRecvMsgWait
 import chat.simplex.common.platform.chatSendCmdRetry
 import org.json.JSONObject
 import java.io.File
+import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * [SecuredEngine] over the embedded SimpleX chat core.
@@ -95,6 +110,48 @@ internal class SimplexSecuredEngine(
     /** Present from profile creation until our servers have been verified once: start with the network locked. */
     private val lockdownMarker: File get() = File(dataDir, LOCKDOWN_MARKER)
 
+    // ---- 12-word backup (docs/recovery-phrase-plan.md) ----
+    private val backupDir: File get() = File(dataDir, BACKUP_DIR)
+    private val vault: KeyVault by lazy { KeyVault(appContext, backupDir) }
+    private val backupStore: BackupStore by lazy { BackupStore(backupDir, vault.metaBox()) }
+    private val backupClient: BackupClient? = BackupClient.create(config.backupBaseUrl)
+
+    /** Network and sealing work: never on the engine thread, so receiving doesn't wait for an upload. */
+    private val worker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "encrogram-secured-backup").apply { isDaemon = true }
+    }
+    /** Keystore and phrase work ("Show 12 words", new words, storing them): never waits behind an upload (finding 6). */
+    private val phraseExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "encrogram-secured-phrase").apply { isDaemon = true }
+    }
+    private val backupLock = Any()
+    @Volatile private var backupStatus: BackupState? = null
+    // ---- guarded by backupLock ----
+    /** The one timer for the next automatic upload ([scheduleAuto]). */
+    private var autoTimer: ScheduledFuture<*>? = null
+    private var autoTimerAtMs = 0L
+    /** Bumped for each new timer, so a stale timer that fired anyway doesn't forget the current one. */
+    private var autoTimerGen = 0L
+    /** First request of the current burst of urgent requests (coalescing cap), 0 when none. */
+    private var firstUrgentMs = 0L
+    /** An upload is under way (probe, export or upload); only one at a time. */
+    private var attemptRunning = false
+    /** "Back up now" / "turn on" requests that arrived during an attempt: one upload for them right after it. */
+    private val waitingManual = ArrayList<SecuredCallback<Unit>>()
+    /** Counts urgent requests, so an upload that started before one doesn't clear [BackupStore.Meta.urgent]. */
+    private var urgentSeq = 0L
+
+    /** Exists from the start of a restore until its databases, repair list and keys are final (finding 8). */
+    private val restoreMarker: File get() = File(dataDir, RESTORE_MARKER)
+
+    // engine thread only
+    /** Contacts still being repaired after a restore (mirror of BackupStore.pending()). */
+    private var pendingCache: MutableMap<Long, BackupStore.Pending>? = null
+    /** Item id the restore started from (BackupStore.repairSince), loaded with [pendingCache]. */
+    private var repairSinceCache = Long.MAX_VALUE
+    /** When each contact's ratchet was last re-synced automatically (loop guard). */
+    private val lastAutoSync = HashMap<Long, Long>()
+
     // =============================================================================================================
     // SecuredEngine
     // =============================================================================================================
@@ -137,6 +194,7 @@ internal class SimplexSecuredEngine(
                     val profile = SecuredProfile(name)
                     currentProfile = profile
                     ok(callback, profile)
+                    markChanged()
                 }
                 else -> err(callback, unexpected(r))
             }
@@ -378,6 +436,1166 @@ internal class SimplexSecuredEngine(
     }
 
     // =============================================================================================================
+    // 12-word backup (docs/recovery-phrase-plan.md). Network and sealing on the backup thread; Keystore and phrase
+    // work on the phrase thread, so it never waits behind an upload; export, import and the per-contact repair on the
+    // engine thread. Nothing here logs words, ids, keys, URLs, server tags or archives.
+    // =============================================================================================================
+
+    override fun backupState(): BackupState = backupStatus ?: synchronized(backupLock) {
+        backupStatus ?: loadBackupState().also { backupStatus = it }
+    }
+
+    override fun newPhrase(callback: SecuredCallback<List<String>>) = onPhrase(callback) {
+        val entropy = Bip39.newEntropy()
+        try {
+            ok(callback, Bip39.toWords(entropy))
+        } finally {
+            entropy.fill(0)
+        }
+    }
+
+    override fun enableBackup(words: List<String>, callback: SecuredCallback<Unit>) = onPhrase(callback) { enableOnPhraseThread(words, callback) }
+
+    /** On the phrase thread: the 30-second unlock window must not run out behind a 20 MB upload or a restore. */
+    override fun showPhrase(callback: SecuredCallback<List<String>>) = onPhrase(callback) {
+        val entropy = try {
+            vault.loadEntropy()
+        } catch (e: KeyVault.NeedsUnlock) {
+            SecuredLog.i(Ev.PHRASE_REFUSED, "needs_unlock")
+            return@onPhrase err(callback, ErrorMapper.needsUnlock())
+        } catch (e: KeyVault.Invalidated) {
+            SecuredLog.w(Ev.PHRASE_REFUSED, "invalidated")
+            return@onPhrase err(callback, ErrorMapper.notAllowed(ErrorMapper.PHRASE_INVALIDATED))
+        } catch (e: KeyVault.Missing) {
+            return@onPhrase err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF))
+        } catch (e: KeyVault.Unavailable) {
+            SecuredLog.w(Ev.PHRASE_REFUSED, e.reason)
+            return@onPhrase err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE))
+        }
+        try {
+            SecuredLog.i(Ev.PHRASE_SHOWN)
+            ok(callback, Bip39.toWords(entropy))
+        } finally {
+            entropy.fill(0)
+        }
+    }
+
+    /** Skips the server-tag check, and on success makes this phone the backup phone again (clears otherPhone). */
+    override fun backupNow(callback: SecuredCallback<Unit>) {
+        if (backupClient == null) return err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
+        if (!backupState().enabled) return err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF))
+        if (state != EngineState.RUNNING) return err(callback, ErrorMapper.notRunning(state))
+        onWorker(callback) { beginAttemptOnWorker("now", manual = true, callback = callback) }
+    }
+
+    /**
+     * Turns backup off. The server copy's id is queued for deletion before the DELETE, so a failed delete is retried
+     * later ([retryPendingDeletes]); the words and keys on this phone go either way. When the server copy is still
+     * there, the result says so instead of claiming it was deleted (finding 7).
+     */
+    override fun disableBackup(callback: SecuredCallback<Unit>) = onWorker(callback) {
+        var unreadable = false
+        val secrets = try {
+            vault.loadSecrets()
+        } catch (e: KeyVault.Unavailable) {
+            unreadable = true
+            null
+        }
+        var notDeleted: SecuredError? = null
+        if (secrets != null) {
+            val id = secrets.id
+            secrets.wipe()
+            val client = backupClient ?: return@onWorker err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
+            val queued = backupStore.addPendingDelete(id)
+            try {
+                client.delete(id)
+                if (!backupStore.removePendingDelete(id)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete_queue")
+            } catch (e: BackupClient.HttpFailure) {
+                SecuredLog.w(Ev.BACKUP_FAILED, "delete_" + e.failure.name.lowercase(), e.code)
+                // Nothing could remember the id for a later try: change nothing, so the user can try again.
+                if (!queued) return@onWorker err(callback, SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_KEEP_ON))
+                notDeleted = SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_NOT_DELETED)
+            }
+        } else if (unreadable) {
+            // The id that names the server copy is gone with the key: it can't be deleted from here.
+            SecuredLog.w(Ev.BACKUP_FAILED, "delete_unreadable")
+            notDeleted = SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.SERVER_COPY_UNREACHABLE)
+        }
+        if (!vault.deleteAll()) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete")
+        backupStore.reset()
+        cancelAutoTimer()
+        SecuredLog.i(Ev.BACKUP_DISABLED, if (notDeleted != null) "server_copy_kept" else null)
+        publishBackupState { BackupState(lastError = notDeleted?.message) }
+        if (notDeleted != null) err(callback, notDeleted) else ok(callback, Unit)
+        if (notDeleted == null) retryPendingDeletes()
+    }
+
+    override fun findBackup(words: List<String>, callback: SecuredCallback<BackupInfo>) = onWorker(callback) {
+        val client = backupClient ?: return@onWorker err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
+        val secrets = Kdf.secretsFromWords(words) ?: return@onWorker err(callback, ErrorMapper.wrongPhrase())
+        try {
+            when (val f = fetchBackup(client, secrets)) {
+                is Fetched.Ok -> {
+                    f.payload.archive.fill(0)
+                    ok(callback, BackupInfo(f.payload.createdAtMs))
+                }
+                is Fetched.Failed -> err(callback, f.error)
+            }
+        } finally {
+            secrets.wipe()
+        }
+    }
+
+    override fun restore(words: List<String>, callback: SecuredCallback<Unit>) = onWorker(callback) { restoreOnWorker(words, callback) }
+
+    override fun phraseSuggestions(prefix: String, limit: Int): List<String> = try {
+        Bip39.suggestions(prefix, limit.coerceAtMost(Bip39.words.size))
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun loadBackupState(): BackupState {
+        val meta = backupStore.meta()
+        return BackupState(
+            enabled = vault.hasSecrets(),
+            lastBackupMs = meta.lastBackupMs,
+            lastError = ErrorMapper.backupErrorText(meta.error),
+            running = false,
+            otherPhone = meta.otherPhone,
+        )
+    }
+
+    private fun publishBackupState(change: (BackupState) -> BackupState) {
+        synchronized(backupLock) { backupStatus = change(backupState()) }
+        main.post { for (l in listeners) l.onBackupStateChanged() }
+    }
+
+    /**
+     * Phrase thread. Stores the words (screen-lock key) and the id+key (no-auth key), then asks the backup thread for
+     * the first upload. A changed phrase queues the old server copy for deletion first: it must not stay restorable
+     * with the old words, even when the first upload fails (finding 7).
+     */
+    private fun enableOnPhraseThread(words: List<String>, callback: SecuredCallback<Unit>) {
+        if (backupClient == null) return err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
+        if (state != EngineState.RUNNING) return err(callback, ErrorMapper.notRunning(state))
+        val entropy = Bip39.toEntropy(words) ?: return err(callback, ErrorMapper.wrongPhrase())
+        val secrets = Kdf.secretsFromWords(words)
+        try {
+            if (secrets == null) return err(callback, ErrorMapper.wrongPhrase())
+            if (!vault.deviceSecure()) return err(callback, ErrorMapper.notAllowed(ErrorMapper.NO_SCREEN_LOCK))
+            val previous = try {
+                vault.loadSecrets()
+            } catch (e: KeyVault.Unavailable) {
+                null
+            }
+            val previousId = previous?.id
+            previous?.wipe()
+            val sameBackup = previousId == secrets.id
+            val obsoleteId = previousId?.takeIf { !sameBackup }
+            val queued = obsoleteId == null || backupStore.addPendingDelete(obsoleteId)
+            // These words may have been turned off on this phone before: their copy is wanted again.
+            backupStore.removePendingDelete(secrets.id)
+            try {
+                vault.storeEntropy(entropy)
+                vault.storeSecrets(secrets)
+            } catch (e: KeyVault.Unavailable) {
+                // Never leave words of one phrase next to the keys of another: start again from nothing.
+                vault.deleteAll()
+                backupStore.reset()
+                publishBackupState { BackupState(lastError = ErrorMapper.KEYSTORE) }
+                SecuredLog.e(Ev.VAULT_FAILED, e.reason)
+                return err(
+                    callback,
+                    if (e.reason == "no_screen_lock") ErrorMapper.notAllowed(ErrorMapper.NO_SCREEN_LOCK)
+                    else SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE),
+                )
+            }
+            if (!sameBackup) {
+                // A new backup: nothing uploaded yet, no tag, no pause, no backoff.
+                backupStore.update { BackupStore.Meta(counter = it.counter, dirty = true) }
+                backupStore.setServerTag(secrets.id, null)
+            }
+            publishBackupState {
+                BackupState(
+                    enabled = true,
+                    lastBackupMs = if (sameBackup) it.lastBackupMs else null,
+                    otherPhone = sameBackup && it.otherPhone,
+                )
+            }
+            SecuredLog.i(Ev.BACKUP_ENABLED)
+            if (obsoleteId != null && !queued) worker.execute { deleteOldCopyOnWorker(obsoleteId) }
+            onWorker(callback) { beginAttemptOnWorker("enable", manual = true, callback = callback) }
+        } finally {
+            entropy.fill(0)
+            secrets?.wipe()
+        }
+    }
+
+    /**
+     * Backup thread. One upload at a time:
+     *  1. HEAD the server copy while the chat still runs: no answer means no pause and a later try (finding 5);
+     *  2. automatic uploads compare its tag with this phone's last one, so a copy that another phone made with the
+     *     same words is never overwritten (finding 4); [manual] ("Back up now", turning backup on) and the first
+     *     upload after a restore skip that check;
+     *  3. the export on the engine thread ([startBackupOnEngine]), then the upload back here ([uploadOnWorker]).
+     * Every path ends in [failAttempt], [pauseForOtherPhone] or the success branch of [uploadOnWorker].
+     */
+    private fun beginAttemptOnWorker(reason: String, manual: Boolean, callback: SecuredCallback<Unit>?) {
+        val client = backupClient ?: run {
+            callback?.let { err(it, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED)) }
+            return
+        }
+        synchronized(backupLock) {
+            if (attemptRunning) {
+                // Manual requests get their own upload right after the running one ([endAttempt]).
+                if (manual && callback != null) waitingManual.add(callback)
+                return
+            }
+            attemptRunning = true
+            firstUrgentMs = 0L
+            autoTimer?.cancel(false)
+            autoTimer = null
+        }
+        try {
+            if (state != EngineState.RUNNING) return failAttempt(callback, ErrorMapper.notRunning(state), null, manual)
+            val meta = backupStore.meta()
+            if (!manual && BackupStore.autoPaused(meta)) return endAttempt()
+            val secrets = try {
+                vault.loadSecrets()
+            } catch (e: KeyVault.Unavailable) {
+                SecuredLog.e(Ev.VAULT_FAILED, e.reason)
+                return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), "keystore", manual)
+            } ?: return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF), null, manual)
+            val id = secrets.id
+            secrets.wipe()
+            if (!manual) backupStore.update { it.copy(lastAttemptMs = System.currentTimeMillis()) }
+            SecuredLog.i(Ev.BACKUP_STARTED, reason)
+            publishBackupState { it.copy(running = true) }
+            val probe = client.head(id)
+            when (BackupClient.tagDecision(probe, backupStore.serverTag(id), skipCheck = manual || meta.unconditional)) {
+                BackupClient.Check.UPLOAD -> post {
+                    try {
+                        startBackupOnEngine(manual, callback)
+                    } catch (t: Throwable) {
+                        SecuredLog.crash(Ev.BACKUP_FAILED, t)
+                        failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_FAILED), "internal", manual)
+                    }
+                }
+                BackupClient.Check.OTHER_PHONE -> pauseForOtherPhone()
+                BackupClient.Check.CANT_CHECK -> {
+                    SecuredLog.w(Ev.BACKUP_FAILED, "no_tag")
+                    failAttempt(callback, SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.BACKUP_SERVER_ODD), "no_tag", manual)
+                }
+                BackupClient.Check.UNREACHABLE -> {
+                    val f = probe as? BackupClient.Probe.Failed ?: BackupClient.Probe.Failed(BackupClient.Failure.NETWORK, 0)
+                    SecuredLog.w(Ev.BACKUP_FAILED, "probe_" + f.failure.name.lowercase(), f.code)
+                    failAttempt(callback, ErrorMapper.backupHttp(f.failure.name, f.code), failureCode(f.failure, f.code), manual)
+                }
+            }
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.BACKUP_FAILED, t)
+            failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_FAILED), "internal", manual)
+        }
+    }
+
+    private class Exported(val archive: ByteArray, val dbKey: String, val createdAtMs: Long)
+
+    /**
+     * Engine thread. One backup: stop the chat, point the files folder at an empty folder (text-only backup), export,
+     * put the folders back, start the chat again, then hand the archive to the backup thread for sealing and upload.
+     * Any failure to resume stops Secured (fail closed) rather than leave it half configured.
+     */
+    private fun startBackupOnEngine(manual: Boolean, callback: SecuredCallback<Unit>?) {
+        if (state != EngineState.RUNNING || ctrl == 0L || !chatStarted) {
+            return failAttempt(callback, ErrorMapper.notRunning(state), null, manual)
+        }
+        if (!vault.hasSecrets()) return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF), null, manual)
+        val dbKey = try {
+            DbKeyStore(appContext).obtain(databaseExists = true)
+        } catch (f: DbKeyStore.KeyFailure) {
+            return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), "keystore", manual)
+        }
+        // Everything up to now is in this export; later changes set the flag (and count as new urgent requests) again.
+        backupStore.update { it.copy(dirty = false) }
+        val seq = synchronized(backupLock) { urgentSeq }
+        val createdAt = System.currentTimeMillis()
+        val dir = dataDir
+        val temp = File(dir, "tmp")
+        val work = File(temp, "backup-" + randomTag())
+        val emptyFiles = File(work, "files")
+        val emptyAssets = File(work, "assets")
+        val zip = File(temp, "backup-" + randomTag() + ".zip")
+        var archive: ByteArray? = null
+        var failure: SecuredError? = null
+        var failTag: String? = null
+
+        // 1. Export needs a stopped chat (Commands.hs:610 checkChatStopped).
+        send(Commands.STOP_CHAT)
+        chatStarted = false
+        try {
+            // /_stop cancels the agent's threads in a forked thread (Commands.hs:353): let them finish first.
+            Thread.sleep(STOP_SETTLE_MS)
+            // 2. exportArchive copies the files folder and assets/wallpapers (Archive.hs:61-65, listDirectory fails
+            //    on a missing folder): point both at empty folders that exist.
+            if (!File(emptyAssets, "wallpapers").mkdirs() || !emptyFiles.mkdirs()) throw IllegalStateException("mkdir")
+            if (!isResult(send(filePathsCommand(emptyFiles, temp, emptyAssets)), "cmdOk")) {
+                failTag = "file_paths"
+            } else {
+                // 3. The zip of both SQLCipher databases (Archive.hs:55-70).
+                val r = send(Commands.exportArchive(zip.absolutePath, temp.absolutePath))
+                if (r is CoreReply.Result && r.type == "archiveExported") {
+                    val errors = CoreJson.archiveErrorCount(r.body)
+                    if (errors > 0) SecuredLog.w(Ev.BACKUP_EXPORTED, "file_errors", errors)
+                    val size = zip.length()
+                    if (!zip.isFile || size <= 0) {
+                        failTag = "export_empty"
+                    } else if (size > Envelope.MAX_ARCHIVE_BYTES) {
+                        failTag = BackupStore.TOO_LARGE
+                        failure = SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_TOO_LARGE)
+                    } else {
+                        archive = zip.readBytes()
+                        SecuredLog.i(Ev.BACKUP_EXPORTED)
+                    }
+                } else {
+                    failTag = "export_" + replyTag(r)
+                }
+            }
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.BACKUP_FAILED, t)
+            failTag = failTag ?: "export_internal"
+        } finally {
+            // 4. Normal folders back, plaintext gone, chat running again.
+            val pathsBack = isResult(send(filePathsCommand(File(dir, "files"), temp, File(dir, "assets"))), "cmdOk")
+            zip.delete()
+            work.deleteRecursively()
+            if (!pathsBack || !resumeAfterPause()) {
+                archive?.fill(0)
+                archive = null
+                if (pathsBack) SecuredLog.e(Ev.BACKUP_FAILED, "resume") else SecuredLog.e(Ev.BACKUP_FAILED, "file_paths_back")
+                abortAfterPause(if (pathsBack) "resume" else "file_paths_back")
+            }
+        }
+        val bytes = archive
+        if (bytes == null) {
+            SecuredLog.e(Ev.BACKUP_FAILED, failTag ?: "export")
+            val code = if (failTag == BackupStore.TOO_LARGE) BackupStore.TOO_LARGE else "export"
+            return failAttempt(callback, failure ?: SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_FAILED), code, manual)
+        }
+        val exported = Exported(bytes, dbKey, createdAt)
+        worker.execute {
+            try {
+                uploadOnWorker(exported, manual, callback, seq)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.BACKUP_FAILED, t)
+                exported.archive.fill(0)
+                failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_FAILED), "internal", manual)
+            }
+        }
+    }
+
+    /**
+     * Backup thread: seal with the backup key, PUT, then HEAD for the new copy's tag (PUT replies may carry none) and
+     * keep it as this phone's last tag. The plaintext archive is wiped from memory afterwards. [seq]: the urgent
+     * request count when the export ran; a newer request keeps the next upload owed.
+     */
+    private fun uploadOnWorker(ex: Exported, manual: Boolean, callback: SecuredCallback<Unit>?, seq: Long) {
+        val client = backupClient
+        var unreadable = false
+        val secrets = try {
+            vault.loadSecrets()
+        } catch (e: KeyVault.Unavailable) {
+            SecuredLog.e(Ev.VAULT_FAILED, e.reason)
+            unreadable = true
+            null
+        }
+        try {
+            if (client == null) return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED), null, manual)
+            if (unreadable) return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), "keystore", manual)
+            // Turned off while exporting: nothing to upload.
+            if (secrets == null) return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF), null, manual)
+            val counter = maxOf(backupStore.meta().counter, backupStore.highestSeen(secrets.id) ?: 0L) + 1
+            if (!backupStore.update { it.copy(counter = counter) }) {
+                return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE), "storage", manual)
+            }
+            val sealed = Envelope.seal(secrets.key, Envelope.Payload(ex.createdAtMs, counter, ex.dbKey, ex.archive))
+            ex.archive.fill(0)
+            try {
+                client.put(secrets.id, sealed)
+            } catch (e: BackupClient.HttpFailure) {
+                SecuredLog.w(Ev.BACKUP_FAILED, "upload_" + e.failure.name.lowercase(), e.code)
+                return failAttempt(callback, ErrorMapper.backupHttp(e.failure.name, e.code), failureCode(e.failure, e.code), manual)
+            }
+            backupStore.noteSeen(secrets.id, counter)
+            val tag = tagAfterUpload(client, secrets.id)
+            // Without a tag the next automatic upload can't prove the copy is ours and pauses (fail safe).
+            if (tag == null) SecuredLog.w(Ev.BACKUP_FAILED, "tag_unread")
+            if (!backupStore.setServerTag(secrets.id, tag)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "tag")
+            val stillOwed = synchronized(backupLock) { urgentSeq != seq }
+            backupStore.update {
+                it.copy(
+                    lastBackupMs = ex.createdAtMs, error = null, failures = 0, otherPhone = false, unconditional = false,
+                    urgent = it.urgent && stillOwed,
+                )
+            }
+            SecuredLog.i(Ev.BACKUP_UPLOADED, count = sealed.size / 1024)
+            publishBackupState { it.copy(running = false, lastBackupMs = ex.createdAtMs, lastError = null, otherPhone = false) }
+            callback?.let { ok(it, Unit) }
+            endAttempt()
+        } finally {
+            ex.archive.fill(0)
+            secrets?.wipe()
+        }
+    }
+
+    /**
+     * The tag of the copy just uploaded. Retried twice: after a short wait, or after the server's rate limit refills
+     * (6 requests a minute) when it answered 429/503. Null when all three HEADs failed.
+     */
+    private fun tagAfterUpload(client: BackupClient, id: String): String? {
+        for (attempt in 0 until 3) {
+            when (val p = client.head(id)) {
+                is BackupClient.Probe.Found -> return p.etag
+                BackupClient.Probe.Missing -> return null
+                is BackupClient.Probe.Failed -> if (attempt < 2) {
+                    try {
+                        Thread.sleep(if (p.failure == BackupClient.Failure.BUSY) TAG_BUSY_RETRY_MS else TAG_RETRY_MS)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return null
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /** Our error code for a failed request (ErrorMapper.backupErrorText). */
+    private fun failureCode(f: BackupClient.Failure, code: Int): String = when (f) {
+        BackupClient.Failure.NETWORK -> "network"
+        BackupClient.Failure.BUSY -> "busy"
+        BackupClient.Failure.TOO_LARGE -> BackupStore.TOO_LARGE
+        else -> if (code in 100..999) "server:$code" else "server"
+    }
+
+    /**
+     * A failed attempt: still owed, the error for the settings screen and, for automatic ones, one more failure for
+     * the backoff (BackupStore.backoffMs). [code] null: nothing to record (not running, turned off).
+     */
+    private fun failAttempt(callback: SecuredCallback<Unit>?, error: SecuredError, code: String?, manual: Boolean) {
+        if (code != null) backupStore.update { it.copy(dirty = true, error = code, failures = if (manual) it.failures else it.failures + 1) }
+        publishBackupState { it.copy(running = false, lastError = if (code != null) ErrorMapper.backupErrorText(code) else it.lastError) }
+        callback?.let { err(it, error) }
+        endAttempt()
+    }
+
+    /** Another phone uploaded with these words after this phone's last upload: pause automatic uploads (finding 4). */
+    private fun pauseForOtherPhone() {
+        SecuredLog.w(Ev.BACKUP_FAILED, BackupStore.OTHER_PHONE)
+        backupStore.update { it.copy(otherPhone = true, error = BackupStore.OTHER_PHONE) }
+        publishBackupState { it.copy(running = false, otherPhone = true, lastError = ErrorMapper.OTHER_PHONE) }
+        endAttempt()
+    }
+
+    /** Any thread. The attempt is over: waiting manual requests go next; otherwise the queued deletes and the next timer. */
+    private fun endAttempt() {
+        val waiting: List<SecuredCallback<Unit>>
+        synchronized(backupLock) {
+            attemptRunning = false
+            waiting = ArrayList(waitingManual)
+            waitingManual.clear()
+        }
+        worker.execute {
+            try {
+                if (waiting.isNotEmpty()) {
+                    val all = SecuredCallback<Unit> { result -> for (c in waiting) c.onResult(result) }
+                    beginAttemptOnWorker("now", manual = true, callback = all)
+                } else {
+                    retryPendingDeletes()
+                    scheduleAuto(0L)
+                }
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.BACKUP_FAILED, t)
+            }
+        }
+    }
+
+    /** The chat couldn't be resumed after a backup: close everything so the next start() opens it from scratch. */
+    private fun abortAfterPause(tag: String) {
+        stopReceiver()
+        stopChatQuietly()
+        closeCtrlQuietly()
+        userId = 0L
+        chatCache.clear()
+        lastItemIds.clear()
+        timedChats.clear()
+        noteFolderId = null
+        publishChats()
+        notifyChatsChanged()
+        failClosed(StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured stopped for safety after a backup. Open it again to restart."), tag))
+    }
+
+    /** After an export: the network settings checked again, then the chat started. False when either failed. */
+    private fun resumeAfterPause(): Boolean = try {
+        val net = expectResult(send(Commands.NETWORK_CONFIG), "network_resume", "networkConfig")
+        if (!ServerConfigPlanner.networkConfigOk(net.body)) throw configFailure("network_resume_verify", net)
+        chatStarted = true
+        expectResult(send(Commands.START_CHAT), "start_resume", "chatStarted", "chatRunning")
+        true
+    } catch (t: Throwable) {
+        if (t !is StartFailure) SecuredLog.crash(Ev.BACKUP_FAILED, t)
+        false
+    }
+
+    /** Engine thread, after any change that is part of the backup: due for the daily backup. */
+    private fun markChanged() {
+        if (!backupState().enabled) return
+        if (!backupStore.meta().dirty) backupStore.update { it.copy(dirty = true) }
+        scheduleAuto(0L)
+    }
+
+    /**
+     * Any thread. An automatic upload is owed soon: a new contact, a finished queue switch or a completed repair sync
+     * (item 1). Coalesced: each request in a burst moves the timer to [delayMs] from now, but never later than
+     * [MAX_COALESCE_MS] after the burst's first request, so several switches in a row give one upload.
+     */
+    private fun requestUrgentBackup(reason: String, delayMs: Long) {
+        if (backupClient == null || !backupState().enabled) return
+        synchronized(backupLock) { urgentSeq++ }
+        val m = backupStore.meta()
+        if (!m.urgent || !m.dirty) backupStore.update { it.copy(urgent = true, dirty = true) }
+        SecuredLog.i(Ev.BACKUP_STARTED, "queued_$reason")
+        scheduleAuto(delayMs)
+    }
+
+    /**
+     * Any thread. The one timer for the next automatic upload, from BackupStore.autoDueMs (urgent now, daily when
+     * changed, backoff after failures, none while paused). [debounceMs] > 0: an urgent request that pushes the timer
+     * (see [requestUrgentBackup]); otherwise an earlier timer is kept.
+     */
+    private fun scheduleAuto(debounceMs: Long) {
+        synchronized(backupLock) {
+            if (backupClient == null || !backupState().enabled) return cancelAutoTimerLocked()
+            if (attemptRunning) return   // endAttempt schedules again
+            val now = System.currentTimeMillis()
+            val meta = backupStore.meta()
+            val due = BackupStore.autoDueMs(meta, now) ?: return cancelAutoTimerLocked()
+            var at = maxOf(due, now + if (meta.urgent) AUTO_MIN_DELAY_MS else MIN_TIMER_MS)
+            if (debounceMs > 0L) {
+                if (firstUrgentMs == 0L) firstUrgentMs = now
+                at = maxOf(at, minOf(now + debounceMs, firstUrgentMs + MAX_COALESCE_MS))
+            } else if (autoTimer?.isDone == false && autoTimerAtMs <= at) {
+                return
+            }
+            autoTimer?.cancel(false)
+            autoTimerAtMs = at
+            val gen = ++autoTimerGen
+            autoTimer = worker.schedule({ autoTimerFired(gen) }, at - now, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /** Backup thread: the timer fired. Re-checks that an upload is still due, then starts it. */
+    private fun autoTimerFired(gen: Long) {
+        try {
+            synchronized(backupLock) {
+                if (gen != autoTimerGen) return   // replaced by a newer timer
+                autoTimer = null
+                firstUrgentMs = 0L                // this burst's timer has fired
+            }
+            // Not running: afterRunning() schedules again at the next start.
+            if (state != EngineState.RUNNING || !backupState().enabled) return
+            val meta = backupStore.meta()
+            val now = System.currentTimeMillis()
+            val due = BackupStore.autoDueMs(meta, now) ?: return
+            if (due > now + TIMER_SLACK_MS) return scheduleAuto(0L)
+            beginAttemptOnWorker(if (meta.urgent) "urgent" else "daily", manual = false, callback = null)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.BACKUP_FAILED, t)
+        }
+    }
+
+    private fun cancelAutoTimer() = synchronized(backupLock) { cancelAutoTimerLocked() }
+
+    private fun cancelAutoTimerLocked() {
+        autoTimer?.cancel(false)
+        autoTimer = null
+        firstUrgentMs = 0L
+    }
+
+    /**
+     * Backup thread. Deletes server copies queued by a failed "turn off" or left by a phrase change (finding 7). The
+     * current backup's id is never deleted. Stops at the first network failure; the next attempt tries again.
+     */
+    private fun retryPendingDeletes() {
+        val client = backupClient ?: return
+        val ids = backupStore.pendingDeletes()
+        if (ids.isEmpty()) return
+        val current = try {
+            vault.loadSecrets()
+        } catch (e: KeyVault.Unavailable) {
+            null
+        }
+        val currentId = current?.id
+        current?.wipe()
+        for (id in ids) {
+            if (id == currentId) {
+                backupStore.removePendingDelete(id)
+                continue
+            }
+            try {
+                client.delete(id)
+                backupStore.removePendingDelete(id)
+                SecuredLog.i(Ev.BACKUP_DISABLED, "old_copy_deleted")
+            } catch (e: BackupClient.HttpFailure) {
+                SecuredLog.w(Ev.BACKUP_FAILED, "delete_queued_" + e.failure.name.lowercase(), e.code)
+                if (e.failure == BackupClient.Failure.NETWORK || e.failure == BackupClient.Failure.BUSY) return
+            }
+        }
+    }
+
+    /** Backup thread: best effort for an old copy that couldn't be queued. */
+    private fun deleteOldCopyOnWorker(id: String) {
+        try {
+            backupClient?.delete(id)
+        } catch (e: BackupClient.HttpFailure) {
+            SecuredLog.w(Ev.BACKUP_FAILED, "delete_old", e.code)
+        }
+    }
+
+    private sealed class Fetched {
+        class Ok(val payload: Envelope.Payload, val etag: String?) : Fetched()
+        class Failed(val error: SecuredError) : Fetched()
+    }
+
+    /** Backup thread: download, open and check the counter (a copy older than one already seen is refused). */
+    private fun fetchBackup(client: BackupClient, secrets: BackupSecrets): Fetched {
+        val download = try {
+            client.get(secrets.id)
+        } catch (e: BackupClient.HttpFailure) {
+            SecuredLog.w(Ev.BACKUP_LOOKUP_FAILED, e.failure.name.lowercase(), e.code)
+            return Fetched.Failed(ErrorMapper.backupHttp(e.failure.name, e.code))
+        }
+        return when (val o = Envelope.open(secrets.key, download.body)) {
+            is Envelope.Opened.Ok -> {
+                val p = o.payload
+                if (Envelope.isRollback(p.counter, backupStore.highestSeen(secrets.id))) {
+                    p.archive.fill(0)
+                    SecuredLog.w(Ev.BACKUP_LOOKUP_FAILED, "rollback")
+                    Fetched.Failed(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_ROLLBACK))
+                } else {
+                    backupStore.noteSeen(secrets.id, p.counter)
+                    SecuredLog.i(Ev.BACKUP_LOOKUP)
+                    Fetched.Ok(p, download.etag)
+                }
+            }
+            Envelope.Opened.BadKey, Envelope.Opened.BadFormat -> {
+                SecuredLog.w(Ev.BACKUP_LOOKUP_FAILED, "damaged")
+                Fetched.Failed(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_DAMAGED))
+            }
+        }
+    }
+
+    /** Backup thread: checks, download and decryption; the database work then runs on the engine thread. */
+    private fun restoreOnWorker(words: List<String>, callback: SecuredCallback<Unit>) {
+        val client = backupClient ?: return err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
+        when (state) {
+            EngineState.NEEDS_PROFILE -> Unit
+            EngineState.RUNNING -> return err(callback, ErrorMapper.notAllowed(ErrorMapper.PROFILE_EXISTS))
+            else -> return err(callback, ErrorMapper.notRunning(state))
+        }
+        val entropy = Bip39.toEntropy(words) ?: return err(callback, ErrorMapper.wrongPhrase())
+        val secrets = Kdf.secretsFromWords(words)
+        var handedOver = false
+        try {
+            if (secrets == null) return err(callback, ErrorMapper.wrongPhrase())
+            // Checked first: the restored words must be stored behind the screen lock so backup stays on.
+            if (!vault.deviceSecure()) return err(callback, ErrorMapper.notAllowed(ErrorMapper.NO_SCREEN_LOCK))
+            val fetched = when (val f = fetchBackup(client, secrets)) {
+                is Fetched.Ok -> f
+                is Fetched.Failed -> return err(callback, f.error)
+            }
+            handedOver = true
+            post(callback) { restoreOnEngine(fetched.payload, fetched.etag, secrets, entropy, callback) }
+        } finally {
+            if (!handedOver) {
+                entropy.fill(0)
+                secrets?.wipe()
+            }
+        }
+    }
+
+    private class RestoreFailure(val error: SecuredError, val tag: String) : Exception(tag)
+
+    /**
+     * Engine thread. The import sequence (research/v2-plan-review.md §5.3 and the Fable review in
+     * docs/recovery-phrase-plan.md):
+     *  1. `/_db import` with the chat stopped: it closes both stores, keeps `.bak` copies and copies the backup's
+     *     databases in (Archive.hs:72-85), then marks the store changed, so this controller is finished;
+     *  2. close it (chatCloseStore is safe on closed stores, simplexmq Agent/Store/SQLite.hs:151-156), store the
+     *     backup's passphrase (DbKeyStore.replace, commit() before init), chatMigrateInit with it;
+     *  3. `/_db encryption` to a fresh random passphrase, so the words no longer open this phone's live files
+     *     (Archive.hs:149-175), store it, close that controller too;
+     *  4. delete the `.bak`/`.exported` copies and the zip, open a new controller with the fresh key;
+     *  5. list the contacts to repair, store the words, keys and server tag (backup stays on, one upload owed at once),
+     *     and only then clear the restore marker ([RestoreRepair.commitRestore], finding 8): before that, a crash or a
+     *     failed step is wiped at the next start, see [restoreMarker]; after it, nothing wipes the restore;
+     *  6. lock the network until our servers are verified, and start like any other start ([configureAndRun]).
+     */
+    private fun restoreOnEngine(payload: Envelope.Payload, etag: String?, secrets: BackupSecrets, entropy: ByteArray, callback: SecuredCallback<Unit>) {
+        try {
+            when (state) {
+                EngineState.NEEDS_PROFILE -> Unit
+                EngineState.RUNNING -> return err(callback, ErrorMapper.notAllowed(ErrorMapper.PROFILE_EXISTS))
+                else -> return err(callback, ErrorMapper.notRunning(state))
+            }
+            if (ctrl == 0L) return err(callback, ErrorMapper.notRunning(state))
+            SecuredLog.i(Ev.RESTORE_STARTED)
+            setState(EngineState.STARTING)
+            try {
+                importBackupOnEngine(payload)
+            } catch (t: Throwable) {
+                val f = t as? RestoreFailure ?: run {
+                    SecuredLog.crash(Ev.RESTORE_FAILED, t)
+                    RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.RESTORE_FAILED), "internal")
+                }
+                SecuredLog.e(Ev.RESTORE_FAILED, f.tag)
+                backToEmptyProfile()
+                return err(callback, f.error)
+            }
+
+            // The databases are final and open with the fresh key; the marker still stands.
+            try {
+                startReceiver()
+                val user = activeUser()
+                if (user == null) {
+                    // A backup without a profile: nothing was restored, so offer a fresh start again.
+                    SecuredLog.e(Ev.RESTORE_FAILED, "no_user")
+                    backToEmptyProfile()
+                    return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_DAMAGED))
+                }
+                userId = user.userId
+                val r = send(Commands.getChats(user.userId))
+                if (r !is CoreReply.Result || r.type != "apiChats") {
+                    // Without the list no contact would be repaired: fail rather than leave them on old ratchets.
+                    SecuredLog.e(Ev.RESTORE_FAILED, "chats_" + replyTag(r))
+                    backToEmptyProfile()
+                    return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.RESTORE_FAILED))
+                }
+                val chats = CoreJson.parseChats(r.body)
+                val contacts = chats.filter { !it.contact.isContactCard && !it.contact.removed }.map { it.contact.contactId }
+                // G1: when groups exist, every group member connection must join this repair list too, keyed apart from
+                // contact ids: `/_info #<groupId> <memberId>` stats, `/_sync #<groupId> <memberId> force=on` once
+                // (APISyncGroupMemberRatchet, Commands.hs:5572), `/_switch #<groupId> <memberId>` after proof, and the
+                // groupMemberRatchetSync / groupMemberSwitch events; their completed switches also trigger an upload.
+                // Our messages with a higher item id than every restored one were sent after the restore (receipt proof).
+                val since = chats.mapNotNull { it.lastItem?.itemId }.maxOrNull() ?: 0L
+                // The restored databases carry the old phone's server list: lock the network until ours are verified.
+                if (!markFirstRunLockdown()) SecuredLog.w(Ev.CONFIG_STEP_FAILED, "lockdown_mark")
+                val failed = RestoreRepair.commitRestore(
+                    saveRepairList = { saveRepairList(contacts, since) },
+                    storeKeys = { storeRestoredSecrets(payload, etag, secrets, entropy) },
+                    clearMarker = { clearRestoreMarker() },
+                )
+                if (failed != null) {
+                    SecuredLog.e(Ev.RESTORE_FAILED, failed)
+                    backToEmptyProfile()
+                    val msg = if (failed == "keys") ErrorMapper.KEYSTORE else ErrorMapper.STORAGE
+                    return err(callback, SecuredError(SecuredError.Kind.ENGINE, msg))
+                }
+                SecuredLog.i(Ev.RESTORE_DONE, "contacts", contacts.size)
+                configureAndRun(user)
+            } catch (f: StartFailure) {
+                failClosed(f)
+                return err(callback, f.error)
+            }
+            ok(callback, Unit)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.RESTORE_FAILED, t)
+            val f = StartFailure(ErrorMapper.engine("internal"), "internal")
+            failClosed(f)
+            err(callback, f.error)
+        } finally {
+            payload.archive.fill(0)
+            entropy.fill(0)
+            secrets.wipe()
+        }
+    }
+
+    /** Steps 1-4 of [restoreOnEngine]. Throws [RestoreFailure]; the caller wipes (the marker is still there). */
+    private fun importBackupOnEngine(payload: Envelope.Payload) {
+        val dir = dataDir
+        if (!markRestoreInProgress()) throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE), "marker")
+        val temp = File(dir, "tmp").apply { mkdirs() }
+        val zip = File(temp, "restore-" + randomTag() + ".zip")
+        try {
+            try {
+                zip.writeBytes(payload.archive)
+            } catch (e: Exception) {
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE), "zip_write")
+            }
+            payload.archive.fill(0)
+            // A profile-less engine never started its chat; stop it anyway if it did (import needs it stopped).
+            stopChatQuietly()
+            val r = send(Commands.importArchive(zip.absolutePath, temp.absolutePath))
+            if (r !is CoreReply.Result || r.type != "archiveImported") {
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_DAMAGED), "import_" + replyTag(r))
+            }
+            val errors = CoreJson.archiveErrorCount(r.body)
+            if (errors > 0) SecuredLog.w(Ev.RESTORE_STARTED, "file_errors", errors)
+            zip.delete()
+
+            stopReceiver()
+            closeCtrlQuietly()
+            val keys = DbKeyStore(appContext)
+            try {
+                keys.replace(payload.dbKey)
+            } catch (f: DbKeyStore.KeyFailure) {
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), f.reason)
+            }
+            val prefix = File(dir, DB_PREFIX).absolutePath
+            val (tag, c) = migrateInit(prefix, payload.dbKey)
+            if (tag != "ok" || c == 0L) {
+                if (c != 0L) closeQuietly(c)
+                val msg = if (tag == "errorMigration") ErrorMapper.BACKUP_NEWER_APP else ErrorMapper.BACKUP_DAMAGED
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, msg), "open_$tag")
+            }
+            ctrl = c
+            val fresh = keys.freshPassphrase()
+            val enc = send(Commands.storageEncryption(payload.dbKey, fresh))
+            if (enc !is CoreReply.Result || enc.type != "cmdOk") {
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_FAILED), "rekey_" + replyTag(enc))
+            }
+            try {
+                keys.replace(fresh)
+            } catch (f: DbKeyStore.KeyFailure) {
+                throw RestoreFailure(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), f.reason)
+            }
+            closeCtrlQuietly()
+            deleteDatabaseCopies(dir)
+            try {
+                openDatabase()
+            } catch (f: StartFailure) {
+                throw RestoreFailure(f.error, "reopen_" + f.logTag)
+            }
+            // Not committed yet: restoreOnEngine clears the marker after the repair list and keys (finding 8).
+        } finally {
+            zip.delete()
+        }
+    }
+
+    /** After a restore failed before its commit point: drop the partial databases and offer a fresh start again. */
+    private fun backToEmptyProfile() {
+        try {
+            userId = 0L
+            wipePartialRestore()
+            openDatabase()
+            startReceiver()
+            currentProfile = null
+            setState(EngineState.NEEDS_PROFILE)
+        } catch (f: StartFailure) {
+            failClosed(f)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.RESTORE_FAILED, t)
+            failClosed(StartFailure(ErrorMapper.engine("internal"), "internal"))
+        }
+    }
+
+    /**
+     * Deletes the databases of an unfinished restore and its leftovers: repair list, and the words and keys it may
+     * have stored (a restore runs only without a profile, so they are its own). The passphrase in DbKeyStore stays
+     * (a new database takes any). The delete queue and rollback counters stay.
+     */
+    private fun wipePartialRestore() {
+        stopReceiver()
+        closeCtrlQuietly()
+        val dir = dataDir
+        for (db in listOf("_chat.db", "_agent.db")) {
+            for (suffix in listOf("", ".bak", ".exported", "-journal")) File(dir, DB_PREFIX + db + suffix).delete()
+        }
+        File(dir, "tmp").deleteRecursively()
+        savePending(LinkedHashMap())
+        if (vault.hasSecrets() || vault.hasPhrase()) {
+            if (!vault.deleteAll()) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete")
+            backupStore.reset()
+            cancelAutoTimer()
+            publishBackupState { BackupState() }
+        }
+        if (!clearRestoreMarker()) SecuredLog.w(Ev.RESTORE_FAILED, "marker_clear")
+        SecuredLog.w(Ev.RESTORE_WIPED)
+    }
+
+    /** The `.bak` copies left by import and re-keying (old keys!) and any `.exported` leftover. */
+    private fun deleteDatabaseCopies(dir: File) {
+        for (db in listOf("_chat.db", "_agent.db")) {
+            for (suffix in listOf(".bak", ".exported")) {
+                val f = File(dir, DB_PREFIX + db + suffix)
+                if (f.exists() && !f.delete()) SecuredLog.w(Ev.RESTORE_FAILED, "bak_delete")
+            }
+        }
+    }
+
+    /**
+     * The restored words, keys and server tag (from the GET that fetched the copy), so backup stays on with the same
+     * phrase. The restored phone becomes the backup phone: one upload is owed right after the start and skips the tag
+     * check (item 1). False when they couldn't be stored; the restore then fails and is wiped.
+     */
+    private fun storeRestoredSecrets(payload: Envelope.Payload, etag: String?, secrets: BackupSecrets, entropy: ByteArray): Boolean {
+        try {
+            vault.storeEntropy(entropy)
+            vault.storeSecrets(secrets)
+        } catch (e: KeyVault.Unavailable) {
+            SecuredLog.e(Ev.VAULT_FAILED, e.reason)
+            vault.deleteAll()
+            return false
+        }
+        backupStore.removePendingDelete(secrets.id)
+        if (!backupStore.setServerTag(secrets.id, etag)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "tag")
+        val stored = backupStore.update {
+            BackupStore.Meta(
+                counter = maxOf(it.counter, payload.counter), lastBackupMs = payload.createdAtMs,
+                dirty = true, urgent = true, unconditional = true,
+            )
+        }
+        if (!stored) {
+            vault.deleteAll()
+            return false
+        }
+        publishBackupState { BackupState(enabled = true, lastBackupMs = payload.createdAtMs) }
+        return true
+    }
+
+    // ---- per-contact repair after a restore (RestoreRepair) ----
+
+    private fun pendingMap(): MutableMap<Long, BackupStore.Pending> =
+        pendingCache ?: LinkedHashMap(backupStore.pending()).also {
+            pendingCache = it
+            repairSinceCache = backupStore.repairSince()
+        }
+
+    private fun repairSince(): Long {
+        pendingMap()
+        return repairSinceCache
+    }
+
+    private fun savePending(map: MutableMap<Long, BackupStore.Pending>) {
+        pendingCache = map
+        if (map.isEmpty()) repairSinceCache = Long.MAX_VALUE
+        if (!backupStore.setPending(map)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "pending")
+    }
+
+    /** A fresh repair list after a restore. False when it couldn't be written (the restore then fails). */
+    private fun saveRepairList(contacts: List<Long>, sinceItemId: Long): Boolean {
+        val map = contacts.associateWithTo(LinkedHashMap()) { BackupStore.Pending() }
+        pendingCache = map
+        repairSinceCache = if (map.isEmpty()) Long.MAX_VALUE else sinceItemId
+        return backupStore.startRepair(map, sinceItemId)
+    }
+
+    private fun updatePending(contactId: Long, change: (BackupStore.Pending) -> BackupStore.Pending?) {
+        val map = pendingMap()
+        val old = map[contactId] ?: return
+        val next = change(old)
+        if (next == old) return
+        if (next == null) map.remove(contactId) else map[contactId] = next
+        savePending(map)
+    }
+
+    private fun checkAllPending() {
+        if (state != EngineState.RUNNING) return
+        for (id in pendingMap().keys.toList()) checkPending(id)
+    }
+
+    /**
+     * One step for one restored contact: `/_info @id`, fold the sync state into its entry, then sync (plain, or the
+     * one forced sync), switch, wait or drop (RestoreRepair.decide).
+     */
+    private fun checkPending(contactId: Long) {
+        if (state != EngineState.RUNNING || ctrl == 0L) return
+        if (pendingMap()[contactId] == null) return
+        val (contact, stats) = when (val r = send(Commands.contactInfo(contactId))) {
+            is CoreReply.Result -> if (r.type == "contactInfo") CoreJson.contactInfoStats(r.body) else return
+            is CoreReply.Error -> {
+                if (r.error.detail == "contactNotFound" || r.error.detail == "contactNotActive") {
+                    SecuredLog.i(Ev.RESTORE_REPAIR, "drop")
+                    updatePending(contactId) { null }
+                }
+                return
+            }
+            CoreReply.Invalid -> return
+        }
+        if (stats != null) observeSync(contactId, stats.ratchetSyncState)
+        val entry = pendingMap()[contactId] ?: return
+        when (RestoreRepair.decide(stats, contact?.ready == true, entry)) {
+            RestoreRepair.Action.SYNC -> syncRatchet(contactId, "restore")
+            RestoreRepair.Action.FORCE_SYNC -> syncRatchet(contactId, "restore_force", force = true)
+            RestoreRepair.Action.SWITCH -> {
+                val s = send(Commands.switchContact(contactId))
+                if (s is CoreReply.Result && s.type == "contactSwitchStarted") {
+                    SecuredLog.i(Ev.QUEUE_SWITCH, "started")
+                    updatePending(contactId) { it.copy(switched = true) }
+                } else {
+                    SecuredLog.w(Ev.QUEUE_SWITCH, replyTag(s))
+                }
+            }
+            RestoreRepair.Action.WAIT -> Unit
+            RestoreRepair.Action.DONE -> {
+                SecuredLog.i(Ev.RESTORE_REPAIR, "done")
+                updatePending(contactId) { null }
+            }
+            RestoreRepair.Action.DROP -> {
+                SecuredLog.i(Ev.RESTORE_REPAIR, "drop")
+                updatePending(contactId) { null }
+            }
+        }
+    }
+
+    /** A sync state seen for a restored contact. A completed sync proves the ratchet and refreshes the server copy. */
+    private fun observeSync(contactId: Long, status: String) {
+        val old = pendingMap()[contactId] ?: return
+        val next = RestoreRepair.observe(old, status)
+        if (next == old) return
+        updatePending(contactId) { next }
+        if (next.proven && !old.proven) {
+            SecuredLog.i(Ev.RESTORE_REPAIR, "sync_done")
+            requestUrgentBackup("repair_sync", SWITCH_BACKUP_DELAY_MS)
+        }
+    }
+
+    /**
+     * `/_sync @id`; [force] only from the restore repair (once per restored contact, RestoreRepair.Action.FORCE_SYNC).
+     * At most once per contact per [AUTO_SYNC_GAP_MS] (a peer can't make us loop).
+     */
+    private fun syncRatchet(contactId: Long, tag: String, force: Boolean = false): Boolean {
+        val now = System.currentTimeMillis()
+        val last = lastAutoSync[contactId]
+        if (last != null && now - last < AUTO_SYNC_GAP_MS) return false
+        lastAutoSync[contactId] = now
+        val r = send(Commands.syncRatchet(contactId, force))
+        return if (r is CoreReply.Result && r.type == "contactRatchetSyncStarted") {
+            SecuredLog.i(Ev.RATCHET_SYNC, tag)
+            updatePending(contactId) { RestoreRepair.syncAccepted(it, force) }
+            true
+        } else {
+            SecuredLog.w(Ev.RATCHET_SYNC, replyTag(r))
+            false
+        }
+    }
+
+    /** Events that matter for the backup and for repairing restored contacts. Engine thread, RUNNING only. */
+    private fun backupOnEvent(reply: CoreReply.Result) {
+        when (reply.type) {
+            "contactRatchetSync" -> {
+                val (contactId, status) = CoreJson.ratchetSyncEvent(reply.body) ?: return
+                val restored = contactId in pendingMap()
+                if (restored) observeSync(contactId, status)
+                val synced = RestoreRepair.syncOnEvent(status, restored) && syncRatchet(contactId, "event_$status")
+                if (restored && !synced) checkPending(contactId)
+            }
+            "contactSwitch" -> {
+                val (contactId, progress) = CoreJson.switchEvent(reply.body) ?: return
+                if (progress.endsWith(".completed")) {
+                    SecuredLog.i(Ev.QUEUE_SWITCH, progress)
+                    // The old queue is deleted on the server: a copy from before this switch would restore a dead
+                    // address (8 Nov device test), so the server copy is refreshed. Coalesced with other switches.
+                    requestUrgentBackup("switch", SWITCH_BACKUP_DELAY_MS)
+                    if (progress == "rcv.completed" && contactId in pendingMap()) updatePending(contactId) { null }
+                }
+            }
+            "contactConnected" -> {
+                markChanged()
+                requestUrgentBackup("contact", CONTACT_BACKUP_DELAY_MS)
+            }
+            "contactSndReady" -> CoreJson.parseContact(reply.body.optJSONObject("contact"))?.contactId?.let { checkPending(it) }
+            "newChatItems" -> {
+                val pending = pendingMap()
+                if (pending.isEmpty()) return
+                // A message from the contact proves only their direction (finding 1): look again, but it is no proof.
+                val heard = CoreJson.parseChatItems(reply.body).filter { it.isMessage && !it.outgoing && it.chatId in pending }.map { it.chatId }.toSet()
+                for (id in heard) {
+                    updatePending(id) { RestoreRepair.received(it) }
+                    checkPending(id)
+                }
+            }
+            "chatItemsStatusesUpdated" -> {
+                val pending = pendingMap()
+                if (pending.isEmpty()) return
+                val since = repairSince()
+                val delivered = CoreJson.parseChatItems(reply.body)
+                    .filter { it.outgoing && it.status == MessageStatus.DELIVERED && it.chatId in pending }
+                for (item in delivered) updatePending(item.chatId) { RestoreRepair.delivered(it, item.itemId, since) }
+                for (id in delivered.map { it.chatId }.toSet()) checkPending(id)
+            }
+            // A decryption error merged into the last item arrives as an update, not as contactRatchetSync (Subscriber.hs:686-692).
+            "chatItemUpdated" -> {
+                val pending = pendingMap()
+                if (pending.isEmpty()) return
+                val item = CoreJson.parseAChatItem(reply.body.optJSONObject("chatItem")) ?: return
+                if (item.chatId in pending && !item.isMessage) checkPending(item.chatId)
+            }
+        }
+    }
+
+    private fun markRestoreInProgress(): Boolean = try {
+        val m = restoreMarker
+        m.exists() || m.createNewFile() || m.exists()
+    } catch (e: Exception) {
+        false
+    }
+
+    /** True when the restore marker is gone afterwards. */
+    private fun clearRestoreMarker(): Boolean = try {
+        val m = restoreMarker
+        !m.exists() || m.delete() || !m.exists()
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun closeCtrlQuietly() {
+        val c = ctrl
+        if (c == 0L) return
+        closeQuietly(c)
+        ctrl = 0L
+        chatStarted = false
+    }
+
+    private fun closeQuietly(c: Long) {
+        try {
+            chatCloseStore(c)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.STOPPED, t)
+        }
+    }
+
+    private fun isResult(r: CoreReply, type: String) = r is CoreReply.Result && r.type == type
+
+    private fun replyTag(r: CoreReply): String = when (r) {
+        is CoreReply.Result -> r.type
+        is CoreReply.Error -> r.error.tag
+        CoreReply.Invalid -> "invalid"
+    }
+
+    private fun randomTag(): String = Bip39.hex(ByteArray(8).also { SecureRandom().nextBytes(it) })
+
+    /** Runs [task] on the backup thread; a crash becomes a readable error for [callback]. */
+    private fun <T> onWorker(callback: SecuredCallback<T>, task: () -> Unit) = runGuarded(worker, callback, task)
+
+    /** Runs [task] on the phrase thread (Keystore and words; never behind an upload). */
+    private fun <T> onPhrase(callback: SecuredCallback<T>, task: () -> Unit) = runGuarded(phraseExecutor, callback, task)
+
+    private fun <T> runGuarded(exec: ExecutorService, callback: SecuredCallback<T>, task: () -> Unit) {
+        exec.execute {
+            try {
+                task()
+            } catch (e: Bip39.WordListError) {
+                SecuredLog.e(Ev.TASK_CRASHED, "wordlist")
+                err(callback, SecuredError(SecuredError.Kind.ENGINE, "This app's recovery word list is damaged. Reinstall Encrogram."))
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.TASK_CRASHED, t)
+                err(callback, ErrorMapper.engine("internal"))
+            }
+        }
+    }
+
+    // =============================================================================================================
     // Item and chat actions (engine thread)
     // =============================================================================================================
 
@@ -595,7 +1813,11 @@ internal class SimplexSecuredEngine(
                 throw StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured's servers aren't set up correctly in this build ($it)."), it)
             }
             loadNative()
-            if (ctrl == 0L) openDatabase()
+            if (ctrl == 0L) {
+                // A restore that stopped before its databases were final: drop it and offer a fresh start.
+                if (restoreMarker.exists()) wipePartialRestore()
+                openDatabase()
+            }
             startReceiver()
             val user = activeUser()
             if (user == null) {
@@ -619,6 +1841,11 @@ internal class SimplexSecuredEngine(
             else -> return err(callback, ErrorMapper.notRunning(state))
         }
         val displayName = validName(name) ?: return err(callback, nameError())
+        // A restore marker that couldn't be cleared would wipe this new profile at the next start.
+        if (!clearRestoreMarker()) {
+            SecuredLog.e(Ev.RESTORE_FAILED, "marker_clear")
+            return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.STORAGE))
+        }
         // Before the user exists: from here until our servers are verified, every start locks the network first.
         if (!markFirstRunLockdown()) {
             SecuredLog.e(Ev.CONFIG_STEP_FAILED, "lockdown_mark")
@@ -727,11 +1954,8 @@ internal class SimplexSecuredEngine(
         }
         ctrl = c
         try {
-            val files = File(dir, "files")
             val temp = File(dir, "tmp").also { it.deleteRecursively() }
-            val assets = File(dir, "assets")
-            val remoteHosts = File(dir, "remote_hosts")
-            expectResult(send(Commands.setFilePaths(files.absolutePath, temp.absolutePath, assets.absolutePath, remoteHosts.absolutePath)), "file_paths", "cmdOk")
+            expectResult(send(filePathsCommand(File(dir, "files"), temp, File(dir, "assets"))), "file_paths", "cmdOk")
             expectResult(send(Commands.ENCRYPT_LOCAL_FILES), "encrypt_files", "cmdOk")
         } catch (t: Throwable) {
             // Never keep a half-open store (no file paths, or no local file encryption): close it so the next
@@ -747,6 +1971,10 @@ internal class SimplexSecuredEngine(
             throw StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured storage couldn't be opened (setup)."), "db_setup")
         }
     }
+
+    /** `/set file paths` with our remote-hosts folder; the backup points [files] and [assets] elsewhere for a moment. */
+    private fun filePathsCommand(files: File, temp: File, assets: File): String =
+        Commands.setFilePaths(files.absolutePath, temp.absolutePath, assets.absolutePath, File(dataDir, "remote_hosts").absolutePath)
 
     private fun migrateInit(prefix: String, key: String): Pair<String, Long> {
         val out = chatMigrateInit(prefix, key, MIGRATION_CONFIRM)
@@ -836,6 +2064,26 @@ internal class SimplexSecuredEngine(
             throw f
         }
         setState(EngineState.RUNNING)
+        afterRunning()
+    }
+
+    /** Backup timer (an upload owed after a restore starts here), queued server deletes, and the repair of restored contacts. Never throws. */
+    private fun afterRunning() {
+        try {
+            if (backupState().enabled) scheduleAuto(0L)
+            if (backupClient != null) {
+                worker.execute {
+                    try {
+                        retryPendingDeletes()
+                    } catch (t: Throwable) {
+                        SecuredLog.crash(Ev.BACKUP_FAILED, t)
+                    }
+                }
+            }
+            checkAllPending()
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.RESTORE_REPAIR, t)
+        }
     }
 
     /** After a failed start: put the unreachable proxy back if it was lifted, then stop the chat. Never throws. */
@@ -983,6 +2231,13 @@ internal class SimplexSecuredEngine(
 
     private fun handleEvent(reply: CoreReply) {
         if (state != EngineState.RUNNING) return
+        if (reply is CoreReply.Result) {
+            try {
+                backupOnEvent(reply)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.RESTORE_REPAIR, t)
+            }
+        }
         when (reply) {
             is CoreReply.Error -> SecuredLog.w(Ev.EVENT_ERROR, reply.error.tag)
             is CoreReply.Result -> when (reply.type) {
@@ -1049,11 +2304,15 @@ internal class SimplexSecuredEngine(
         }
         SecuredLog.i(Ev.CHATS_LOADED, count = chatCache.size)
         publishChats()
-        if (notify) notifyChatsChanged()
+        if (notify) {
+            notifyChatsChanged()
+            markChanged()
+        }
     }
 
     /** Updates the cached rows for new items; reloads the list when an item belongs to a chat we don't know. */
     private fun applyNewItems(items: List<CoreItem>) {
+        if (items.isNotEmpty()) markChanged()
         var changed = false
         var unknownChat = false
         for (item in items) {
@@ -1101,6 +2360,7 @@ internal class SimplexSecuredEngine(
     /** Fully deleted -> onMessagesRemoved; only marked deleted -> onMessageChanged (deleted=true, text ""). */
     private fun applyDeletions(deletions: List<CoreDeletion>) {
         if (deletions.isEmpty()) return
+        markChanged()
         val removed = LinkedHashMap<Long, MutableList<Long>>()
         val marked = ArrayList<CoreItem>()
         for (d in deletions) {
@@ -1118,6 +2378,7 @@ internal class SimplexSecuredEngine(
     private fun emitChanged(items: List<CoreItem>) {
         val messages = items.filter { it.isMessage }.map { MessageMapper.toMessage(it) }
         if (messages.isEmpty()) return
+        markChanged()
         main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
     }
 
@@ -1236,6 +2497,29 @@ internal class SimplexSecuredEngine(
         const val MAX_NAME_CHARS = 50
         /** Local-only archive flags ([ArchiveStore]), next to the databases. */
         const val ARCHIVE_FILE = "archived_chats"
+
+        /** Backup files ([BackupStore], [KeyVault]), next to the databases. */
+        const val BACKUP_DIR = "backup"
+        const val RESTORE_MARKER = "restore_in_progress"
+        /** `/_stop` cancels the agent's threads asynchronously (Commands.hs:353); wait before copying the databases. */
+        const val STOP_SETTLE_MS = 500L
+        /** The daily backup's timer never fires sooner than this (the app settles first). */
+        const val MIN_TIMER_MS = 60_000L
+        /** An owed (urgent) upload, e.g. right after a restore, waits at least this long. */
+        const val AUTO_MIN_DELAY_MS = 5_000L
+        /** A timer that fires this early still counts as due. */
+        const val TIMER_SLACK_MS = 2_000L
+        /** A new contact: back up after a short pause, so several connections share one backup. */
+        const val CONTACT_BACKUP_DELAY_MS = 10_000L
+        /** A finished queue switch or repair sync: upload after this pause; each further one in a burst pushes it again... */
+        const val SWITCH_BACKUP_DELAY_MS = 30_000L
+        /** ...but never later than this after the first request of the burst. */
+        const val MAX_COALESCE_MS = 5L * 60 * 1000
+        /** Wait before another HEAD for the tag of a fresh upload; longer after a 429 (nginx refills one request per 10 s). */
+        const val TAG_RETRY_MS = 2_000L
+        const val TAG_BUSY_RETRY_MS = 11_000L
+        /** Automatic ratchet re-sync at most this often per contact. */
+        const val AUTO_SYNC_GAP_MS = 10L * 60 * 1000
 
         /** The unreachable SOCKS proxy for the first-run lock (port 9 is privileged: no app can listen on it). */
         const val LOCK_SOCKS_ADDR = "127.0.0.1:9"

@@ -56,10 +56,32 @@ internal class DbKeyStore(context: Context) {
         return passphrase
     }
 
+    /**
+     * Replaces the stored passphrase (restore: first the backup's key, then the fresh one after `/_db encryption`).
+     * Written with `commit()` before the caller opens the databases with it. Throws [KeyFailure] when it can't be
+     * stored; the old value then stays.
+     */
+    fun replace(passphrase: String) {
+        val (ct, iv) = try {
+            encrypt(passphrase)
+        } catch (e: Exception) {
+            throw KeyFailure("keystore_unavailable")
+        }
+        if (!prefs.edit().putString(KEY_CIPHERTEXT, ct).putString(KEY_IV, iv).commit()) throw KeyFailure("key_not_saved")
+        SecuredLog.i(SecuredLog.Ev.DB_KEY_CREATED, "replaced")
+    }
+
+    /** A new random passphrase in the same form as [obtain] makes (32 random bytes, base64). */
+    fun freshPassphrase(): String = newPassphrase()
+
     private fun newPassphrase(): String {
         val bytes = ByteArray(32)
         SecureRandom().nextBytes(bytes)
-        return Base64.getEncoder().encodeToString(bytes)
+        return try {
+            Base64.getEncoder().encodeToString(bytes)
+        } finally {
+            bytes.fill(0)
+        }
     }
 
     private fun encrypt(plain: String): Pair<String, String> {

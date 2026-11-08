@@ -253,6 +253,57 @@ internal object Commands {
     /** APIDeleteChat for a pending connection (e.g. an invite we refuse to hand out). */
     fun deletePendingConnection(connId: Long): String = "/_delete :$connId full notify=off"
 
+    // ---- 12-word backup (docs/recovery-phrase-plan.md). Sources: reference/simplex-chat at 7.0.0.12. ----------------
+
+    /**
+     * APIExportArchive (`/_db export <ArchiveConfig json>`, Commands.hs:5426; handler :610 `checkChatStopped`, so the
+     * chat must be stopped) -> `archiveExported {archiveErrors}`. ArchiveConfig {archivePath, disableCompression?,
+     * parentTempDirectory?} (Controller.hs:1216): no disableCompression means Deflate (Archive.hs:66). The zip holds
+     * both databases, the files folder and assets/wallpapers (Archive.hs:55-70).
+     */
+    fun exportArchive(archivePath: String, tempDir: String): String =
+        "/_db export " + asciiJson(JSONObject().put("archivePath", archivePath).put("parentTempDirectory", tempDir).toString())
+
+    /**
+     * APIImportArchive (`/_db import <ArchiveConfig json>`, Commands.hs:5428; handler :615-618, chat stopped) ->
+     * `archiveImported {archiveErrors}`. It closes both stores, keeps the old databases as `.bak` and copies the
+     * archive's in (Archive.hs:72-85), and marks the store changed: the controller can't be started again, so the
+     * engine opens a new one with chatMigrateInit.
+     */
+    fun importArchive(archivePath: String, tempDir: String): String =
+        "/_db import " + asciiJson(JSONObject().put("archivePath", archivePath).put("parentTempDirectory", tempDir).toString())
+
+    /**
+     * APIStorageEncryption (`/_db encryption <DBEncryptionConfig json>`, Commands.hs:5430; handler :620
+     * `withStoreChanged` = chat stopped, then `cmdOk`, :3671-3672). Re-keys both SQLCipher databases from
+     * [currentKey] to [newKey] (Archive.hs:149-175 `sqlCipherExport`: `.bak` copies, export, close the stores).
+     * Keys are DBEncryptionKey strings: printable ASCII without spaces (Controller.hs:1222-1232).
+     */
+    fun storageEncryption(currentKey: String, newKey: String): String {
+        require(dbKeyOk(currentKey) && dbKeyOk(newKey)) { "database keys must be printable ASCII" }
+        return "/_db encryption " + asciiJson(JSONObject().put("currentKey", currentKey).put("newKey", newKey).toString())
+    }
+
+    /** APIContactInfo (`/_info @<id>`, Commands.hs:5560; handler :1886-1894) -> `contactInfo {contact, connectionStats_?}`. */
+    fun contactInfo(contactId: Long): String = "/_info @$contactId"
+
+    /**
+     * APISyncContactRatchet (`/_sync @<id>[ force=on]`, Commands.hs:5573; handler :1953-1960) ->
+     * `contactRatchetSyncStarted {contact, connectionStats}`. Without force the agent accepts it only in the
+     * `allowed` and `required` states (simplexmq Agent.hs:2472, Agent/Store.hs:473-475). [force] only for the
+     * restore repair (RestoreRepair.Action.FORCE_SYNC): once per restored contact whose state is `ok`.
+     */
+    fun syncRatchet(contactId: Long, force: Boolean = false): String =
+        if (force) "/_sync @$contactId force=on" else "/_sync @$contactId"
+
+    /**
+     * APISwitchContact (`/_switch @<id>`, Commands.hs:5569; handler :1925-1931) -> `contactSwitchStarted
+     * {contact, connectionStats}`. Moves our receive queue; progress arrives as `contactSwitch` events.
+     */
+    fun switchContact(contactId: Long): String = "/_switch @$contactId"
+
+    private fun dbKeyOk(k: String) = k.isNotEmpty() && k.all { it.code in 0x21..0x7E }
+
     /** Escapes every non-ASCII char of a JSON text as \uXXXX (surrogate pairs stay as two escapes). */
     fun asciiJson(json: String): String {
         var firstNonAscii = -1

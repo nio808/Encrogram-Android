@@ -22,7 +22,8 @@ codes, honest delivery ticks.
 | `internal/MessageMapper.kt` | Parsed items and chats -> `SecuredMessage` / `ChatSummary`; chat-list order. |
 | `internal/InputRules.kt` | Input limits and checks: text and reply size, reaction set, search sanitising (G1), security codes, page windows. |
 | `internal/ArchiveStore.kt` | The local-only archive flags (a small file in the no-backup folder). |
-| `internal/DbKeyStore.kt` | Database passphrase, wrapped by an Android Keystore key. |
+| `internal/DbKeyStore.kt` | Database passphrase, wrapped by an Android Keystore key; `replace()` for restores. |
+| `backup/` | The 12-word backup (see "Backup with 12 words"). |
 | `internal/NativeCore.kt` | Loads the native libraries once per process. |
 | `internal/SecuredLog.kt` | The only logger. |
 
@@ -186,6 +187,31 @@ Package `app.encrogram.core.background`. No Telegram imports; the app passes the
 - **Channels:** group `encrogram_secured`; `encrogram_secured_messages` (high) and `encrogram_secured_service` (low, no badge). Posted with tag `encrogram_secured`, id = the local chat id's hash, so Telegram's untagged ids cannot touch them.
 - **What a notification shows:** hidden mode only. Title "Encrogram", text "New Secured message" ("3 new Secured messages" for several), no sender, no text, no actions, private on the lock screen. The tap intent carries only the local chat id.
 - **Known limits:** force-stop stops it until the app is opened again. No reply or mark-read actions yet. Prompt delivery while the phone is idle (Doze) needs the battery exemption. After the user swipes the app away, the restart alarm may be refused by Android 12+ and then the service returns only at the next app launch or boot. Battery cost is not measured yet.
+
+## Backup with 12 words
+
+Package `app.encrogram.core.backup` plus the backup section of `SimplexSecuredEngine`. Design: `docs/recovery-phrase-plan.md` (including the Fable review). No new dependency.
+
+| File | What |
+|---|---|
+| `Bip39.kt` | 12 English words <-> 16 bytes of entropy with the 4-bit checksum; NFKD/lower-case input; suggestions. Word list: `src/main/resources/app/encrogram/core/backup/bip39-english.txt` (official `bip-0039/english.txt`, MIT notice next to it), SHA-256 checked on load. |
+| `Kdf.kt` | BIP39 seed (platform `PBKDF2WithHmacSHA512` for ASCII, hand-written PBKDF2 otherwise); HKDF-SHA256 by hand; `backupId = hex(HKDF(seed, info "encrogram/backup/id/v1", 32))`, `backupKey = HKDF(seed, "encrogram/backup/key/v1", 32)`, salt none. A storage format: iOS must match (known answers in `KdfTest`). |
+| `Envelope.kt` | `"ENCB" \| 0x01 \| nonce(12) \| AES-256-GCM(key, createdAt u64 \| counter u64 \| dbKeyLen u16 \| dbKey \| zip, aad "ENCB"\|0x01)`, 20 MiB cap, rollback check. |
+| `BackupClient.kt` | `PUT/GET/HEAD/DELETE <base><id>` with `HttpsURLConnection` only; HTTPS, no redirects or caches, 15 s connect / 60 s read (HEAD 15 s), bodies capped, 404 = no backup. GET and HEAD return the server's `ETag`; `tagDecision` is the check before an upload (same tag or 404: upload; different tag: another phone; no answer: don't pause the chat). |
+| `KeyVault.kt` | `backup/keys.bin`: id + key under AES-GCM Keystore key `encrogram_secured_backup_ids` (no user auth). `backup/phrase.bin`: entropy under RSA-OAEP key pair `encrogram_secured_backup_phrase` (user auth, 30 s, unlocked device on API 28+, StrongBox with fallback; encrypting needs only the public key). `metaBox()`: AES-GCM key `encrogram_secured_backup_meta` (no user auth) for BackupStore's sealed files; "turn off" keeps it. |
+| `BackupStore.kt` | `backup/state` (counter, last backup, changed flag, error code, upload owed, skip-check-once, paused for another phone, failures in a row, last attempt, newest counter seen per backup id hash), `backup/restore_pending` (contacts to repair with their flags, and the item id the restore started from), and two sealed files: `server_tag.bin` (ETag of this phone's last upload, bound to the id) and `delete_queue.bin` (ids whose server copy must still be deleted). Pure rules: `backoffMs`, `autoDueMs`, `autoPaused`. |
+| `RestoreRepair.kt` | Pure rules per restored contact: sync, forced sync (once), switch, wait, done or drop; what counts as proof; the restore's commit order. |
+
+All files under `noBackupFilesDir/encrogram-secured/backup/`. Config: `RelayConfig.backupBaseUrl` (app: `SECURED_BACKUP_BASE_URL` in `encrogram/secured.properties`); null or not `https://.../` means backup calls fail with NOT_ALLOWED.
+
+- **Threads:** network and sealing on `encrogram-secured-backup`; Keystore and words (`newPhrase`, `showPhrase`, `enableBackup`'s storing) on `encrogram-secured-phrase`, so "Show 12 words" never waits behind a 20 MB upload; export, import and the repair on the engine thread.
+- **One upload** (one at a time; "Back up now" during another waits for it): HEAD the server copy while the chat still runs (no answer: no pause, retry later) -> for automatic uploads compare the ETag with this phone's last one (different: `otherPhone`, automatic uploads paused until "Back up now") -> engine thread: `/_stop` -> wait 0.5 s -> `/set file paths` with empty files and assets folders (text only) -> `/_db export` -> folders back -> `/network` checked -> `/_start` -> backup thread: seal, PUT, HEAD for the new ETag (kept sealed). Any failure to resume closes the store and goes to FAILED.
+- **Triggers:** `enableBackup` and `backupNow` (both skip the tag check); owed uploads: right after a restore (skips the tag check once), 10 s after `contactConnected`, 30 s after a finished queue switch (`contactSwitch` `rcv`/`snd` `completed`) or a completed repair sync, coalesced (each request in a burst pushes the timer, at most 5 min after the first); and once a day when something changed. Failed automatic uploads back off 30 min, 1 h, 2 h ... 24 h (reset on success); `too_large` is never retried automatically.
+- **Turn off:** the id is queued (sealed) before the DELETE; words and keys on the phone go either way. A failed delete is retried at each start and after each upload attempt; the result then says the server copy is still there. A phrase change queues the old id the same way.
+- **Restore** (only in NEEDS_PROFILE; the phone needs a screen lock): download (keeps the ETag), open, counter check -> zip in `tmp/` -> `/_db import` -> close -> `DbKeyStore.replace(backup key)` -> `chatMigrateInit` -> `/_db encryption` to a fresh key -> `replace(fresh)` -> delete `.bak`/`.exported` -> reopen -> contact list -> repair list saved -> words, keys and ETag stored -> `restore_in_progress` marker cleared (commit point: any failure before it, including a marker that won't delete, fails the restore and wipes; a crash before it is wiped at the next start) -> first-run network lock -> normal start -> the owed upload.
+- **After a restore, per contact:** once, `/_sync @id force=on` when the stats say `ok` and `ratchetSyncSupported`; plain `/_sync @id` when the core reports `allowed`/`required`. Proof that the ratchet works both ways is only a completed sync (`ok` after `started`/`agreed`) or a delivery receipt on one of our messages sent after the restore; a decrypted incoming message is not. Then `/_switch @id` once the contact is ready and no switch is running; the contact leaves the list when the switch is over. Any contact whose sync state becomes `required` is re-synced automatically (at most every 10 min, never forced). Groups: see the `G1:` note in `restoreOnEngine`.
+- **Logs:** fixed event names only (`BACKUP_*`, `RESTORE_*`, `RATCHET_SYNC`, `QUEUE_SWITCH`), HTTP status as the count. Never words, id, key, URL, ETag, database key or archive.
+- **Not verified without a device:** Keystore behaviour (auth window, StrongBox RSA-OAEP, invalidation), real export/import/re-key with the prebuilt core, nginx answers.
 
 ## Fetching the native libraries
 

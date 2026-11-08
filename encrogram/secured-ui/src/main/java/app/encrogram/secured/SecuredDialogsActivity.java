@@ -108,6 +108,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private static final int TEXT_BACK = 1, TEXT_NO_RESULTS = 2;
     private static final int ID_PIN = 1, ID_MUTE = 2, ID_ARCHIVE = 3, ID_DELETE = 4, ID_READ = 5;
     private static final String ACTION_MODE_TAG = "secured_list";
+    private static final int ID_BACKUP = 20;   // the ⋮ menu: Backup (12 words)
 
     /** One row of the list. */
     private static final class Item {
@@ -126,6 +127,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private FragmentSearchField searchField;
     private NumberTextView selectedCount;
     private ActionBarMenuItem pinItem, muteItem, archiveItem, otherItem;
+    private ActionBarMenuItem moreItem;     // the ⋮ menu of the list
+    private View backupBanner;               // "Back up Secured", while no backup is on
     private ImageView actionModeClose;
     private ChatRowMapper.Labels labels;
     private FlagSecureReason flagSecure;
@@ -259,6 +262,11 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         }
 
         @Override
+        public void onBackupStateChanged() {
+            AndroidUtilities.runOnUIThread(() -> refreshBackupBanner());
+        }
+
+        @Override
         public void onMessageReceived(SecuredMessage message) {
             refreshChats();
         }
@@ -340,6 +348,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         }
         applyInsets();
         updateMode();
+        refreshBackupBanner();
         if (mode == Mode.PROFILE) {
             AndroidUtilities.requestAdjustResize(getParentActivity(), classGuid);
         }
@@ -349,13 +358,20 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onPause() {
         super.onPause();
         resumed = false;
-        if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
+    }
+
+    // FLAG_SECURE stays through onPause (Home, Recents snapshot); dropped when covered, on the Telegram tab, or gone.
+    @Override
+    public void onBecomeFullyHidden() {
+        super.onBecomeFullyHidden();
+        if (flagSecure != null) flagSecure.detach();
     }
 
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        if (flagSecure != null) flagSecure.detach();
         if (host == null) {
             SecuredUi.clearLinkListener(pendingLinkListener);
             SecuredUi.clearOpenChatListener(pendingChatListener);
@@ -392,10 +408,18 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             @Override
             public void onItemClick(int id) {
                 if (id >= ID_PIN && id <= ID_READ) onSelectionAction(id);
+                else if (id == ID_BACKUP) presentFragment(new SecuredBackupSettingsActivity());
             }
         });
+        // The ⋮ menu (only on the list): Backup. Same construction as the chat screen's menu.
+        final ActionBarMenu menu = actionBar.createMenu();
+        moreItem = menu.addItem(0, org.telegram.messenger.R.drawable.ic_ab_other, SecuredResourcesProvider.get());
+        moreItem.setContentDescription(context.getString(R.string.sec_bk_menu_more));
+        moreItem.addSubItem(ID_BACKUP, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.sec_bk_menu), SecuredResourcesProvider.get());
+        moreItem.setVisibility(mode == Mode.LIST ? View.VISIBLE : View.GONE);
         labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet),
-                org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages));
+                org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages))
+                .withGroup(context.getString(R.string.secgroup_row_invited), context.getString(R.string.secgroup_row_sender_message));
         final ChatsSwitcherView switcher = new ChatsSwitcherView(context, owner);
         actionBar.addView(switcher, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 48, Gravity.LEFT | Gravity.BOTTOM, 22, 0, 0, 4));
 
@@ -410,7 +434,12 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         startingView = buildStarting(context);
         failedView = buildFailed(context);
         profileView = buildProfile(context);
-        listFrame = buildList(context);
+        final LinearLayout listColumn = new LinearLayout(context);
+        listColumn.setOrientation(LinearLayout.VERTICAL);
+        backupBanner = buildBackupBanner(context);
+        listColumn.addView(backupBanner, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        listColumn.addView(buildList(context), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0, 1f));
+        listFrame = listColumn;
         body.addView(startingView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
         body.addView(failedView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
         body.addView(profileView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
@@ -535,6 +564,10 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         profileButton = Kit.button(context, context.getString(R.string.sec_profile_continue), true);
         profileButton.setOnClickListener(v -> createProfile());
         l.addView(profileButton, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 16, 0, 0));
+        // Only shown while the engine is in NEEDS_PROFILE (this view is only visible then): bring a backup back instead.
+        final TextView restoreLink = Kit.button(context, context.getString(R.string.sec_bk_restore_link), false);
+        restoreLink.setOnClickListener(v -> presentFragment(new SecuredRestoreActivity(false)));
+        l.addView(restoreLink, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
         return scroll;
     }
 
@@ -557,6 +590,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                 } else {
                     AndroidUtilities.hideKeyboard(nameInput);
                     updateMode();
+                    offerBackup();
                 }
             });
         } catch (Throwable t) {
@@ -652,13 +686,68 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         if (context == null || engine == null) return;
         final BottomSheet.Builder b = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         b.setItems(
-                new CharSequence[]{context.getString(R.string.sec_create_invite), context.getString(R.string.sec_connect_link)},
-                new int[]{org.telegram.messenger.R.drawable.msg_link2, org.telegram.messenger.R.drawable.msg_add},
+                new CharSequence[]{context.getString(R.string.sec_create_invite), context.getString(R.string.sec_connect_link),
+                        context.getString(R.string.secgroup_new_group), context.getString(R.string.secgroup_new_channel)},
+                new int[]{org.telegram.messenger.R.drawable.msg_link2, org.telegram.messenger.R.drawable.msg_add,
+                        org.telegram.messenger.R.drawable.msg_groups, org.telegram.messenger.R.drawable.msg_channel},
                 (d, which) -> {
                     if (which == 0) SecuredSheets.showInvite(this, engine);
-                    else SecuredSheets.showConnect(this, engine, null);
+                    else if (which == 1) SecuredSheets.showConnect(this, engine, null);
+                    else presentFragment(new SecuredNewGroupActivity(which == 3, host != null));   // new group / new channel
                 });
         showDialog(b.create());
+    }
+
+    // ---- backup (12 words): offer, banner ----------------------------------------------------------------------
+
+    /** Right after a new profile exists: offer the backup once. "Not now" leaves the banner on the list. */
+    private void offerBackup() {
+        final Context c = getParentActivity();
+        if (c == null || destroyed || SecuredBackupUi.wasOffered(c)) return;
+        SecuredBackupUi.markOffered(c);
+        presentFragment(new SecuredBackupActivity());
+    }
+
+    private View buildBackupBanner(Context context) {
+        final LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(10), dp(4), dp(10));
+        row.setBackground(Kit.roundRect(androidx.core.graphics.ColorUtils.setAlphaComponent(SecuredResourcesProvider.accentFill(), 0x22), 12));
+        row.setClickable(true);
+        row.setOnClickListener(v -> presentFragment(new SecuredBackupActivity()));
+        final LinearLayout texts = new LinearLayout(context);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.addView(Kit.text(context, context.getString(R.string.sec_bk_banner_title), 15, SecuredResourcesProvider.accentText(), true));
+        final TextView sub = Kit.text(context, context.getString(R.string.sec_bk_banner_text), 13, Kit.color(Theme.key_windowBackgroundWhiteGrayText), false);
+        texts.addView(sub, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+        row.addView(texts, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
+        final ImageView close = new ImageView(context);
+        close.setScaleType(ImageView.ScaleType.CENTER);
+        close.setImageResource(org.telegram.messenger.R.drawable.msg_close);
+        close.setColorFilter(new android.graphics.PorterDuffColorFilter(Kit.color(Theme.key_windowBackgroundWhiteGrayText), android.graphics.PorterDuff.Mode.MULTIPLY));
+        close.setContentDescription(context.getString(R.string.sec_bk_banner_dismiss));
+        close.setOnClickListener(v -> {
+            SecuredBackupUi.dismissBanner(context);
+            refreshBackupBanner();
+        });
+        row.addView(close, LayoutHelper.createLinear(44, 44));
+        final FrameLayout holder = new FrameLayout(context);
+        holder.addView(row, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP, 12, 6, 12, 6));
+        holder.setVisibility(View.GONE);
+        return holder;
+    }
+
+    /** The banner shows on the list while no backup is on and it was not dismissed. */
+    private void refreshBackupBanner() {
+        if (destroyed || backupBanner == null || fragmentView == null) return;
+        boolean show = false;
+        try {
+            show = mode == Mode.LIST && engine != null && !engine.backupState().getEnabled()
+                    && !SecuredBackupUi.bannerDismissed(fragmentView.getContext());
+        } catch (Throwable ignored) {
+        }
+        backupBanner.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
     // ---- state -> UI -----------------------------------------------------------------------------------------
@@ -700,6 +789,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         profileView.setVisibility(m == Mode.PROFILE ? View.VISIBLE : View.GONE);
         listFrame.setVisibility(m == Mode.LIST ? View.VISIBLE : View.GONE);
         fab.setVisibility(m == Mode.LIST ? View.VISIBLE : View.GONE);
+        if (moreItem != null) moreItem.setVisibility(m == Mode.LIST ? View.VISIBLE : View.GONE);
+        refreshBackupBanner();
         if (m == Mode.FAILED) {
             String message = lastError;
             if (message == null && engine == null) {
@@ -1062,9 +1153,25 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         final Context context = getParentActivity();
         if (context == null || engine == null) return;
         final boolean one = ids.size() == 1;
+        boolean anyGroup = false;
+        for (long id : ids) anyGroup |= app.encrogram.core.api.SecuredEngineKt.isGroupChatId(id);
+        if (one && anyGroup) {
+            // A group or channel: the owner can delete for everyone, anyone else leaves (shared with the chat screen).
+            final long gid = ids.get(0);
+            final ChatSummary gs = find(gid);
+            SecuredGroupDialogs.confirmDelete(this, SecuredResourcesProvider.get(), gs != null ? gs.getDisplayName() : "",
+                    gs != null && gs.getMyRole() == app.encrogram.core.api.MemberRole.OWNER,
+                    gs != null && gs.getKind() == app.encrogram.core.api.ChatKind.CHANNEL,
+                    everyone -> {
+                        act(gid, new ChatAction.Delete(everyone), true);
+                        clearSelection();
+                    });
+            return;
+        }
         final AlertDialog.Builder b = new AlertDialog.Builder(context, SecuredResourcesProvider.get());
         b.setTitle(one ? context.getString(R.string.sec_list_delete_title) : context.getString(R.string.sec_list_delete_title_n, ids.size()));
-        b.setMessage(context.getString(one ? R.string.sec_list_delete_text : R.string.sec_list_delete_text_n));
+        b.setMessage(context.getString(one ? R.string.sec_list_delete_text : R.string.sec_list_delete_text_n)
+                + (anyGroup ? "\n\n" + context.getString(R.string.secgroup_delete_mixed_note) : ""));
         final CheckBoxCell also = new CheckBoxCell(context, CheckBoxCell.TYPE_CHECK_BOX_DEFAULT, SecuredResourcesProvider.get());
         also.setText(context.getString(R.string.sec_list_delete_also), "", false, false);
         also.setOnClickListener(v -> also.setChecked(!also.isChecked(), true));
@@ -1074,7 +1181,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         b.setNegativeButton(context.getString(R.string.sec_list_cancel), null);
         b.setPositiveButton(context.getString(R.string.sec_list_delete_confirm), (d, w) -> {
             final boolean notify = also.isChecked();
-            for (long id : ids) act(id, new ChatAction.Delete(notify), true);
+            // The "tell the contact" box is for contacts; a group in the selection is left (never deleted for everyone here).
+            for (long id : ids) act(id, new ChatAction.Delete(notify && !app.encrogram.core.api.SecuredEngineKt.isGroupChatId(id)), true);
             clearSelection();
         });
         final AlertDialog dialog = b.create();

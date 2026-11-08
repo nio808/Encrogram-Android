@@ -88,6 +88,9 @@ import java.util.Objects;
 
 import app.encrogram.core.background.SecuredBackground;
 import app.encrogram.core.api.ChatAction;
+import app.encrogram.core.api.ChatKind;
+import app.encrogram.core.api.MemberRole;
+import app.encrogram.core.api.MessageSender;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.ItemAction;
@@ -127,10 +130,12 @@ public class SecuredChatActivity extends BaseFragment {
     private static final int VIEW_MESSAGE = 0;
     private static final int VIEW_DATE = 1;
     private static final int VIEW_REACTIONS = 2;
+    private static final int VIEW_EVENT = 3;
 
     private static final int ROW_DATE = 0;
     private static final int ROW_MESSAGE = 1;
     private static final int ROW_REACTIONS = 2;
+    private static final int ROW_EVENT = 3;   // group service row ("X joined")
 
     private static final int PAGE_SIZE = 50;
     private static final int GROUP_SECONDS = 5 * 60;
@@ -149,6 +154,8 @@ public class SecuredChatActivity extends BaseFragment {
     private final long chatId;
     /** Saved Messages: the user's own notes (text only, on this phone). No ticks, replies, reactions or verification. */
     private final boolean notes;
+    /** Group or channel (chat id at or above GROUP_CHAT_ID_BASE). Contact-only features stay off for these. */
+    private final boolean groupChat;
     private FlagSecureReason flagSecure;
     private final SecuredChatResources chatResources = new SecuredChatResources();
     private SecuredEngine engine;
@@ -188,6 +195,14 @@ public class SecuredChatActivity extends BaseFragment {
     private ActionBarMenuItem searchItem;
     private ActionBarMenuSubItem muteSubItem;
     private View composerView;
+    private FrameLayout invitedBar;
+    private FrameLayout cantPostBar;
+    private TextView invitedTitle;
+    private TextView cantPostText;
+    private TextView joinButton;
+    private TextView declineButton;
+    private boolean joining;
+    private ChatKind shownKind;
     private TextView jumpCounter;
 
     private SizeNotifierFrameLayout root;
@@ -231,6 +246,7 @@ public class SecuredChatActivity extends BaseFragment {
         super();
         this.chatId = chatId;
         this.notes = chatId == SecuredEngineKt.SAVED_MESSAGES_CHAT_ID;
+        this.groupChat = SecuredEngineKt.isGroupChatId(chatId);
         chatResources.setHideTicks(notes);
     }
 
@@ -326,6 +342,7 @@ public class SecuredChatActivity extends BaseFragment {
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.cancelRunOnUIThread(hideFloatingDate);
         AndroidUtilities.cancelRunOnUIThread(runSearch);
         NotificationCenter.getGlobalInstance().removeObserver(emojiLoaded, NotificationCenter.emojiLoaded);
@@ -333,6 +350,13 @@ public class SecuredChatActivity extends BaseFragment {
             engine.removeListener(listener);
         }
         super.onFragmentDestroy();
+    }
+
+    // FLAG_SECURE stays through onPause (Home, Recents snapshot); dropped only when covered or gone, like ChatActivity.
+    @Override
+    public void onBecomeFullyHidden() {
+        super.onBecomeFullyHidden();
+        if (flagSecure != null) flagSecure.detach();
     }
 
     // ---- view ------------------------------------------------------------------------------------------------
@@ -347,6 +371,10 @@ public class SecuredChatActivity extends BaseFragment {
         selfNameShown = selfName();
         mapper = new SecuredMessageMapper(context, currentAccount);
         mapper.setNames(name, selfNameShown);
+        mapper.setAvatarResources(chatResources);
+        mapper.setSenderLookup(this::senderNameOf);
+        shownKind = summary != null ? summary.getKind() : groupChat ? ChatKind.GROUP : ChatKind.DIRECT;
+        mapper.setKind(shownKind);
 
         buildHeader(context);
 
@@ -395,6 +423,12 @@ public class SecuredChatActivity extends BaseFragment {
         column.addView(buildReplyStrip(context), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 8, 4, 8, 0));
         composerView = buildComposer(context);
         column.addView(composerView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        if (groupChat) {
+            invitedBar = buildInvitedBar(context);
+            cantPostBar = buildCantPostBar(context);
+            column.addView(invitedBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            column.addView(cantPostBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        }
 
         // shortcut: attachments and media cells (step 5) plug in next to the composer field.
         loadMessages();
@@ -450,7 +484,12 @@ public class SecuredChatActivity extends BaseFragment {
         // Right margin leaves room for the two header buttons (search, menu: 2 x 48dp), so taps on them reach them.
         actionBar.addView(avatarContainer, 0, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.TOP | Gravity.LEFT, 56, 0, 100, 0));
         avatarDrawable = new AvatarDrawable(chatResources);
-        if (!notes) {
+        if (groupChat) {
+            // A group has no single security code to compare: the header opens group info instead.
+            avatarContainer.setTitleIcons(new LockMarkDrawable(), null);
+            avatarContainer.setEnabled(true);
+            avatarContainer.setOnClickListener(v -> openGroupInfo());
+        } else if (!notes) {
             avatarContainer.setTitleIcons(new LockMarkDrawable(), null);
             // Tapping the header opens the security code sheet (a note folder has no contact to verify).
             avatarContainer.setEnabled(true);
@@ -488,12 +527,15 @@ public class SecuredChatActivity extends BaseFragment {
         more.setContentDescription(tg(org.telegram.messenger.R.string.AccDescrMoreOptions));
         if (!notes) {
             muteSubItem = more.addSubItem(MENU_MUTE, org.telegram.messenger.R.drawable.msg_mute, context.getString(R.string.sec_list_mute), chatResources);
-            more.addSubItem(MENU_DISAPPEAR, org.telegram.messenger.R.drawable.msg_autodelete, context.getString(R.string.secchat_disappear), chatResources);
-            more.addSubItem(MENU_VERIFY, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.secchat_verify_menu), chatResources);
+            if (!groupChat) {
+                // Contact-only for now (docs/groups-plan.md): groups have no single peer to verify or time out.
+                more.addSubItem(MENU_DISAPPEAR, org.telegram.messenger.R.drawable.msg_autodelete, context.getString(R.string.secchat_disappear), chatResources);
+                more.addSubItem(MENU_VERIFY, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.secchat_verify_menu), chatResources);
+            }
         }
         more.addSubItem(MENU_CLEAR, org.telegram.messenger.R.drawable.msg_clear, context.getString(R.string.secchat_clear_title), chatResources);
         if (!notes) {
-            final ActionBarMenuSubItem deleteChat = more.addSubItem(MENU_DELETE_CHAT, org.telegram.messenger.R.drawable.msg_delete, context.getString(R.string.sec_list_delete_title), chatResources);
+            final ActionBarMenuSubItem deleteChat = more.addSubItem(MENU_DELETE_CHAT, org.telegram.messenger.R.drawable.msg_delete, context.getString(groupChat ? deleteMenuTitle() : R.string.sec_list_delete_title), chatResources);
             final int red = chatResources.getColor(Theme.key_text_RedBold);
             deleteChat.setColors(red, red);
         }
@@ -509,6 +551,7 @@ public class SecuredChatActivity extends BaseFragment {
         actionMode.addItemWithWidth(MENU_DELETE, org.telegram.messenger.R.drawable.msg_delete, dp(54), tg(org.telegram.messenger.R.string.Delete));
 
         updateHeader();
+        updateBottomBars();
     }
 
     private void buildList(Context context, FrameLayout listFrame) {
@@ -631,6 +674,142 @@ public class SecuredChatActivity extends BaseFragment {
         }
     }
 
+    private int deleteMenuTitle() {
+        final boolean channel = isOwnerOrChannel(false);
+        if (isOwnerOrChannel(true)) return channel ? R.string.secgroup_delete_title_channel : R.string.secgroup_delete_title;
+        return channel ? R.string.secgroup_leave_title_channel : R.string.secgroup_leave_title;
+    }
+
+    private boolean isOwnerOrChannel(boolean owner) {
+        final ChatSummary s = summary();
+        if (owner) return s != null && s.getMyRole() == MemberRole.OWNER;
+        return s != null && s.getKind() == ChatKind.CHANNEL;
+    }
+
+    /** "N members" or "N subscribers"; the kind word while the count is unknown. No verification line for groups. */
+    private CharSequence groupSubtitle(Context c, ChatSummary s) {
+        final boolean channel = s != null && s.getKind() == ChatKind.CHANNEL;
+        if (s != null && s.getMemberCount() != null) {
+            final int n = s.getMemberCount();
+            return c.getResources().getQuantityString(channel ? R.plurals.secgroup_subscribers_count : R.plurals.secgroup_members_count, n, n);
+        }
+        return c.getString(channel ? R.string.secgroup_subtitle_channel : R.string.secgroup_subtitle_group);
+    }
+
+    private String senderNameOf(long messageId) {
+        final int i = indexOf(messageId);
+        if (i < 0) return null;
+        final MessageSender sender = messages.get(i).getSender();
+        return sender != null ? sender.getDisplayName() : null;
+    }
+
+    /** Header tap on a group or channel (not while an invitation is pending: you are not a member yet). */
+    private void openGroupInfo() {
+        if (destroyed || !groupChat || isInvited() || !selectedIds.isEmpty() || searching) return;
+        presentFragment(new SecuredGroupInfoActivity(chatId));
+    }
+
+    private boolean isInvited() {
+        final ChatSummary s = summary();
+        return groupChat && s != null && s.getInvited();
+    }
+
+    /** Observers (a channel's subscribers) and uninvited members cannot post; direct chats always can. */
+    private boolean canPostHere() {
+        if (!groupChat) return true;
+        final ChatSummary s = summary();
+        return s == null || (s.getCanPost() && !s.getInvited());
+    }
+
+    // ---- bars that replace the composer (groups) -------------------------------------------------------------
+
+    /** Copied in small from ChatActivity's bottom overlay (private there): panel colour, one text, 48dp. */
+    private FrameLayout buildBar(Context context) {
+        final FrameLayout bar = new FrameLayout(context);
+        bar.setBackgroundColor(Kit.color(Theme.key_chat_messagePanelBackground));
+        bar.setVisibility(View.GONE);
+        return bar;
+    }
+
+    private FrameLayout buildCantPostBar(Context context) {
+        final FrameLayout bar = buildBar(context);
+        cantPostText = Kit.text(context, "", 15, Kit.color(Theme.key_chat_fieldOverlayText), false);
+        cantPostText.setGravity(Gravity.CENTER);
+        bar.addView(cantPostText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.CENTER, 16, 0, 16, 0));
+        return bar;
+    }
+
+    private FrameLayout buildInvitedBar(Context context) {
+        final FrameLayout bar = buildBar(context);
+        final LinearLayout col = new LinearLayout(context);
+        col.setOrientation(LinearLayout.VERTICAL);
+        invitedTitle = Kit.text(context, "", 15, chatResources.getColor(Theme.key_chat_messagePanelText), true);
+        invitedTitle.setGravity(Gravity.CENTER);
+        col.addView(invitedTitle, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 16, 12, 16, 4));
+        final LinearLayout buttons = new LinearLayout(context);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        declineButton = Kit.text(context, context.getString(R.string.secgroup_decline), 15, SecuredResourcesProvider.accentText(), true);
+        declineButton.setGravity(Gravity.CENTER);
+        declineButton.setOnClickListener(v -> declineInvite());
+        joinButton = Kit.text(context, context.getString(R.string.secgroup_join), 15, 0xFFFFFFFF, true);
+        joinButton.setGravity(Gravity.CENTER);
+        joinButton.setBackground(Kit.roundRect(SecuredResourcesProvider.accentFill(), 20));
+        joinButton.setOnClickListener(v -> acceptInvite());
+        buttons.addView(declineButton, LayoutHelper.createLinear(0, 40, 1f, 0, 0, 8, 0));
+        buttons.addView(joinButton, LayoutHelper.createLinear(0, 40, 1f, 8, 0, 0, 0));
+        col.addView(buttons, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 16, 4, 16, 12));
+        bar.addView(col, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        return bar;
+    }
+
+    /** Shows exactly one of: the composer, the invitation bar, or the can't-post notice. Hidden during search. */
+    private void updateBottomBars() {
+        if (composerView == null || !groupChat) return;
+        final Context c = composerView.getContext();
+        final boolean invited = isInvited();
+        final boolean canPost = canPostHere();
+        final boolean channel = isOwnerOrChannel(false);
+        if (invitedTitle != null) {
+            invitedTitle.setText(c.getString(channel ? R.string.secgroup_invited_bar_channel : R.string.secgroup_invited_bar));
+        }
+        if (cantPostText != null) {
+            cantPostText.setText(c.getString(channel ? R.string.secgroup_cant_post_channel : R.string.secgroup_cant_post_group));
+        }
+        if (joinButton != null) joinButton.setAlpha(joining ? 0.5f : 1f);
+        composerView.setVisibility(!searching && canPost ? View.VISIBLE : View.GONE);
+        if (invitedBar != null) invitedBar.setVisibility(!searching && invited ? View.VISIBLE : View.GONE);
+        if (cantPostBar != null) cantPostBar.setVisibility(!searching && !canPost && !invited ? View.VISIBLE : View.GONE);
+        if (!canPost && replyStrip != null) cancelStrip();
+    }
+
+    private void acceptInvite() {
+        if (joining) return;
+        if (!engineRunning()) {
+            showNotRunning();
+            return;
+        }
+        joining = true;
+        updateBottomBars();
+        try {
+            engine.joinGroup(chatId, result -> {
+                joining = false;
+                if (destroyed) return;
+                if (result instanceof SecuredResult.Err) showError(((SecuredResult.Err) result).getError());
+                updateHeader();   // the chat list event also arrives; this covers a missed one
+            });
+        } catch (Throwable t) {
+            joining = false;
+            updateBottomBars();
+            showError(null);
+        }
+    }
+
+    /** Decline = leave and delete on this phone, then close the chat (the contract: chatAction Delete). */
+    private void declineInvite() {
+        if (joining) return;
+        chatAction(new ChatAction.Delete(false), this::finishFragment);
+    }
+
     private boolean chatReady() {
         final ChatSummary s = summary();
         return s == null || s.getReady();
@@ -674,6 +853,8 @@ public class SecuredChatActivity extends BaseFragment {
             sub = c.getString(R.string.sec_engine_failed_title);
         } else if (state != EngineState.RUNNING) {
             sub = c.getString(R.string.secchat_connecting);
+        } else if (groupChat) {
+            sub = groupSubtitle(c, s);
         } else if (s != null && !s.getReady()) {
             sub = c.getString(R.string.sec_chat_status_waiting, name);
         } else if (s != null && s.getVerified()) {
@@ -682,6 +863,15 @@ public class SecuredChatActivity extends BaseFragment {
             sub = c.getString(R.string.sec_chat_status_not_verified);
         }
         avatarContainer.setSubtitle(sub);
+        if (groupChat && s != null && s.getKind() != shownKind && mapper != null) {
+            // The kind arrives with the chat list: re-word service rows and re-measure names and avatars.
+            shownKind = s.getKind();
+            mapper.setKind(shownKind);
+            objects.clear();
+            objectSources.clear();
+            if (adapter != null) adapter.notifyItemRangeChanged(0, rows.size());
+        }
+        updateBottomBars();
         if (muteSubItem != null && s != null) {
             muteSubItem.setTextAndIcon(c.getString(s.getMuted() ? R.string.sec_list_unmute : R.string.sec_list_mute),
                     s.getMuted() ? org.telegram.messenger.R.drawable.msg_unmute : org.telegram.messenger.R.drawable.msg_mute);
@@ -819,7 +1009,7 @@ public class SecuredChatActivity extends BaseFragment {
             input.setText("");
         }
         replyingTo = m;
-        final String who = m.getOutgoing() ? mapper.selfName() : name;
+        final String who = m.getOutgoing() ? mapper.selfName() : m.getSender() != null ? m.getSender().getDisplayName() : name;
         showStrip(org.telegram.messenger.R.drawable.input_reply, input.getContext().getString(R.string.secchat_reply_to, who), m.getText());
         openKeyboard();
     }
@@ -1180,6 +1370,11 @@ public class SecuredChatActivity extends BaseFragment {
         }
 
         @Override
+        public void didPressInstantButton(ChatMessageCell cell, int type) {
+            // A group avatar tap falls through to here (the cell has no Telegram user for the sender). Nothing opens.
+        }
+
+        @Override
         public void didPressWebPage(ChatMessageCell cell, TLRPC.WebPage webpage, String url, boolean safe) {
             // Never Browser.openUrl. (The mapper never sets a webpage; this guards the default implementation.)
         }
@@ -1221,7 +1416,7 @@ public class SecuredChatActivity extends BaseFragment {
             options.addView(buildReactionPicker(m, options));
             options.addGap();
         }
-        options.addIf(!deleted && ready && !notes, org.telegram.messenger.R.drawable.menu_reply, tg(org.telegram.messenger.R.string.Reply), () -> startReply(m));
+        options.addIf(!deleted && ready && !notes && canPostHere(), org.telegram.messenger.R.drawable.menu_reply, tg(org.telegram.messenger.R.string.Reply), () -> startReply(m));
         options.addIf(!deleted, org.telegram.messenger.R.drawable.msg_copy, tg(org.telegram.messenger.R.string.Copy), () -> copyMessages(Collections.singletonList(m)));
         options.addIf(!deleted && m.getCanEdit(), org.telegram.messenger.R.drawable.msg_edit, tg(org.telegram.messenger.R.string.Edit), () -> startEdit(m));
         options.addIf(!deleted && ready, org.telegram.messenger.R.drawable.msg_forward, tg(org.telegram.messenger.R.string.Forward), () -> pickForwardTarget(Collections.singletonList(m)));
@@ -1542,6 +1737,11 @@ public class SecuredChatActivity extends BaseFragment {
     private void confirmDeleteChat() {
         final Activity activity = getParentActivity();
         if (activity == null) return;
+        if (groupChat) {
+            SecuredGroupDialogs.confirmDelete(this, chatResources, name, isOwnerOrChannel(true), isOwnerOrChannel(false),
+                    everyone -> chatAction(new ChatAction.Delete(everyone), this::finishFragment));
+            return;
+        }
         final AlertDialog.Builder b = new AlertDialog.Builder(activity, chatResources);
         b.setTitle(activity.getString(R.string.sec_list_delete_title));
         b.setMessage(activity.getString(R.string.sec_list_delete_text));
@@ -1570,6 +1770,7 @@ public class SecuredChatActivity extends BaseFragment {
         clearSelection();
         if (avatarContainer != null) avatarContainer.setVisibility(View.GONE);
         if (composerView != null) composerView.setVisibility(View.GONE);
+        if (groupChat) updateBottomBars();
         if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
         updateJumpButton(false);
@@ -1584,6 +1785,7 @@ public class SecuredChatActivity extends BaseFragment {
         searchResults.clear();
         if (avatarContainer != null) avatarContainer.setVisibility(View.VISIBLE);
         if (composerView != null) composerView.setVisibility(View.VISIBLE);
+        if (groupChat) updateBottomBars();
         if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
         final Long jump = pendingJump;
@@ -1842,7 +2044,7 @@ public class SecuredChatActivity extends BaseFragment {
     private static SecuredMessage withStatus(SecuredMessage m, MessageStatus status) {
         return new SecuredMessage(m.getChatId(), m.getMessageId(), m.getOutgoing(), m.getText(), m.getTimeMs(), status,
                 m.getReplyTo(), m.getEdited(), m.getDeleted(), m.getCanEdit(), m.getCanDeleteForEveryone(),
-                m.getForwarded(), m.getReactions(), m.getExpiresAtMs());
+                m.getForwarded(), m.getReactions(), m.getExpiresAtMs(), m.getSender(), m.getEvent());
     }
 
     private MessageObject objectFor(SecuredMessage m) {
@@ -1884,8 +2086,13 @@ public class SecuredChatActivity extends BaseFragment {
         return (int) (c.getTimeInMillis() / 1000L);
     }
 
+    private static long senderKey(SecuredMessage m) {
+        return m.getSender() != null ? m.getSender().getMemberId() : Long.MIN_VALUE;
+    }
+
     private static boolean sameGroup(SecuredMessage a, SecuredMessage b) {
-        return a.getOutgoing() == b.getOutgoing() && Math.abs(a.getTimeMs() - b.getTimeMs()) <= GROUP_SECONDS * 1000L;
+        return a.getOutgoing() == b.getOutgoing() && Math.abs(a.getTimeMs() - b.getTimeMs()) <= GROUP_SECONDS * 1000L
+                && senderKey(a) == senderKey(b);   // groups: the name shows once, the avatar sits on the last bubble
     }
 
     private void rebuildRows(boolean animated) {
@@ -1897,6 +2104,10 @@ public class SecuredChatActivity extends BaseFragment {
             if (day != lastDay) {
                 next.add(new Row(ROW_DATE, DATE_ID_BASE + day, null, day));
                 lastDay = day;
+            }
+            if (m.getEvent() != null) {
+                next.add(new Row(ROW_EVENT, m.getMessageId() * 4 + 3, m, sec));
+                continue;
             }
             next.add(new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec));
             if (!notes && !m.getDeleted() && !m.getReactions().isEmpty()) {
@@ -2096,7 +2307,6 @@ public class SecuredChatActivity extends BaseFragment {
     public void onPause() {
         super.onPause();
         isPaused = true;
-        if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
         SecuredBackground.setOpenChat(null);
     }
@@ -2142,7 +2352,7 @@ public class SecuredChatActivity extends BaseFragment {
         @Override
         public int getItemViewType(int position) {
             final int kind = rows.get(position).kind;
-            return kind == ROW_DATE ? VIEW_DATE : kind == ROW_REACTIONS ? VIEW_REACTIONS : VIEW_MESSAGE;
+            return kind == ROW_DATE ? VIEW_DATE : kind == ROW_EVENT ? VIEW_EVENT : kind == ROW_REACTIONS ? VIEW_REACTIONS : VIEW_MESSAGE;
         }
 
         @NonNull
@@ -2153,11 +2363,12 @@ public class SecuredChatActivity extends BaseFragment {
                 final ChatMessageCell cell = new SecuredMessageCell(context, currentAccount, sharedResources, chatResources);
                 cell.setDelegate(cellDelegate);
                 cell.setFullyDraw(true);
-                cell.isChat = false;
+                cell.isChat = groupChat;   // groups: Telegram's name and avatar column, fed by the mapper
                 // setAllowAssistant stays off: it would hand message text to the system assistant (onProvideStructure).
                 cell.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
                 view = cell;
-            } else if (viewType == VIEW_DATE) {
+            } else if (viewType == VIEW_DATE || viewType == VIEW_EVENT) {
+                // Separate view types: a recycled date cell never receives event text and the other way round.
                 view = new ChatActionCell(context, false, chatResources);
             } else {
                 view = new SecuredReactionsView(context, chatResources);
@@ -2183,7 +2394,11 @@ public class SecuredChatActivity extends BaseFragment {
                 cell.setChecked(sel, sel, false);
                 cell.setHighlighted(highlightId == r.message.getMessageId());
             } else if (view instanceof ChatActionCell) {
-                ((ChatActionCell) view).setCustomDate(r.dateSec, false, false);
+                if (r.kind == ROW_EVENT) {
+                    ((ChatActionCell) view).setCustomText(mapper.eventText(r.message.getEvent()));
+                } else {
+                    ((ChatActionCell) view).setCustomDate(r.dateSec, false, false);
+                }
             } else if (view instanceof SecuredReactionsView) {
                 ((SecuredReactionsView) view).bind(r.message, reactionListener);
             }
@@ -2207,7 +2422,7 @@ public class SecuredChatActivity extends BaseFragment {
         }
 
         private boolean canSwipe(ChatMessageCell cell) {
-            if (notes || searching || !selectedIds.isEmpty() || editing != null || !chatReady()) return false;
+            if (notes || searching || !selectedIds.isEmpty() || editing != null || !chatReady() || !canPostHere()) return false;
             final SecuredMessage m = messageFor(cell);
             return m != null && !m.getDeleted();
         }
