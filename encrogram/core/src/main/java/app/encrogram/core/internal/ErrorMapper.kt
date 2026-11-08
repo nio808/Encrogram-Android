@@ -1,5 +1,6 @@
 package app.encrogram.core.internal
 
+import app.encrogram.core.api.MediaFailure
 import app.encrogram.core.api.SecuredError
 import app.encrogram.core.api.SecuredError.Kind
 
@@ -113,11 +114,25 @@ internal object ErrorMapper {
                 "contactIncognitoCantInvite", "groupIncognitoCantInvite" -> return notAllowed(GROUP_ROLE)
                 // throwCmdError: "reaction already added/removed", "too many reactions", "no shared item ID".
                 "commandError" -> if (op == Op.REACT) return notAllowed(CANT_REACT)
+                // Files (ChatErrorType, Controller.hs:1479-1494). Tags only: CEFileNotApproved carries the unknown
+                // servers' addresses, CEFileWrite and CEFileSize a path. fileAlreadyReceiving and fileCancel are
+                // answers, not failures: the transport turns them into success before they get here.
+                "fileNotApproved" -> return mediaFailure(MediaFailure.FOREIGN_SERVER)
+                "fileNotFound" -> return messageGone()
+                "fileSize", "fileImageSize" -> return mediaFailure(MediaFailure.TOO_LARGE)
+                "fileWrite", "fileAlreadyExists" -> return SecuredError(Kind.STORAGE, STORAGE)
+                "fallbackToSMPProhibited", "inlineFileProhibited" -> return mediaFailure(MediaFailure.UNSUPPORTED)
+                "fileImageType" -> return SecuredError(Kind.UNSUPPORTED, MEDIA_UNSUPPORTED)
+                "fileCancelled" -> return mediaFailure(MediaFailure.CANCELLED)
+                "fileNotReceived" -> return notAllowed(MEDIA_NOT_READY)
             }
             "errorStore" -> when (e.detail) {
                 "duplicateName" -> return SecuredError(Kind.ENGINE, "This name can't be used. Try a different name.")
                 "contactNotFound", "contactNotReady" -> return chatGone()
                 "chatItemNotFound" -> return messageGone()
+                // A file's record is gone with its message (Store/Shared.hs:116-141).
+                "fileNotFound", "rcvFileNotFound", "sndFileNotFound", "rcvFileDescrNotFound", "chatItemNotFoundByFileId" ->
+                    return messageGone()
                 // StoreError, Store/Shared.hs:98-112.
                 "groupNotFound", "groupWithoutUser" -> return chatGone()
                 "groupMemberNotFound" -> return SecuredError(Kind.ENGINE, MEMBER_GONE)
@@ -242,6 +257,49 @@ internal object ErrorMapper {
             "storage" -> STORAGE
             else -> BACKUP_FAILED
         }
+    }
+
+    // ---- media (docs/media-plan.md §4.6) -------------------------------------------------------------------------
+
+    const val MEDIA_TOO_LARGE = "This file is too large. Secured files can be up to 100 MB."
+    const val MEDIA_UNSUPPORTED = "This can't be sent as a photo or video. Send it as a file instead."
+    const val MEDIA_FOREIGN = "This file is stored on a server outside Encrogram, so it wasn't downloaded."
+    const val MEDIA_CHECK_FAILED = "This file couldn't be checked, so it wasn't downloaded. Ask the sender to send it again."
+    const val MEDIA_EXPIRED = "This file is no longer on the server (files are kept 48 hours). Ask the sender to send it again."
+    const val MEDIA_SERVER_FULL = "The Secured file server is full right now. Try again later."
+    const val MEDIA_NOT_READY = "This file hasn't been downloaded yet."
+    const val MEDIA_NOT_ON_DEVICE = "This file isn't on this phone."
+    /** readMediaBytes over the 16 MB memory limit: the UI opens it with openMediaForPlayback instead. */
+    const val MEDIA_TOO_LARGE_TO_OPEN = "This file is too large to open this way."
+    const val MEDIA_STORAGE_FULL = "There isn't enough free space on this phone."
+    const val MEDIA_CAPTION_TOO_LONG = "Captions can be up to 1024 characters."
+    const val MEDIA_PREPARED_GONE = "This attachment is no longer available. Pick it again."
+    const val MEDIA_NOT_IN_SAVED = "Photos and files can't be added to Saved Messages in this version."
+    const val MEDIA_NONE = "This message has no file."
+    /** An incoming file offered outside our file server (smp, inline), or a core refusal of such a transfer. */
+    const val MEDIA_TRANSFER_REFUSED = "Encrogram moves files only through its own file server, so this transfer was refused."
+    const val MEDIA_CANCELLED = "This file transfer was cancelled."
+    const val MEDIA_SEND_FAILED = "This file couldn't be sent. Try sending it again."
+    const val MEDIA_RECEIVE_FAILED = "This file couldn't be downloaded."
+    const val MEDIA_DAMAGED = "This file arrived damaged. Ask the sender to send it again."
+    const val MEDIA_OPEN_FAILED = "This file couldn't be opened."
+    const val MEDIA_UNREADABLE = "This file couldn't be read. Pick it again."
+    const val MEDIA_TOO_LARGE_TO_PREPARE = "This file is too large for this phone to prepare. Try sending it as a file."
+    const val MEDIA_REPLY_TOO_LONG = "This caption is too long for a reply. Shorten it, or send it without the quote."
+
+    /** Why a file can't move or open, as a readable error. Fixed sentences only. */
+    fun mediaFailure(f: MediaFailure): SecuredError = when (f) {
+        MediaFailure.EXPIRED -> SecuredError(Kind.ENGINE, MEDIA_EXPIRED)
+        MediaFailure.SERVER_FULL -> SecuredError(Kind.NETWORK, MEDIA_SERVER_FULL)
+        MediaFailure.FOREIGN_SERVER -> SecuredError(Kind.UNAPPROVED_RELAY, MEDIA_FOREIGN)
+        MediaFailure.TOO_LARGE -> SecuredError(Kind.TOO_LARGE, MEDIA_TOO_LARGE)
+        MediaFailure.CHECK_FAILED -> notAllowed(MEDIA_CHECK_FAILED)
+        MediaFailure.CANCELLED -> notAllowed(MEDIA_CANCELLED)
+        MediaFailure.SEND_FAILED -> SecuredError(Kind.ENGINE, MEDIA_SEND_FAILED)
+        MediaFailure.RECEIVE_FAILED -> SecuredError(Kind.ENGINE, MEDIA_RECEIVE_FAILED)
+        MediaFailure.DAMAGED -> SecuredError(Kind.ENGINE, MEDIA_DAMAGED)
+        MediaFailure.UNSUPPORTED -> SecuredError(Kind.UNSUPPORTED, MEDIA_TRANSFER_REFUSED)
+        MediaFailure.NOT_ON_DEVICE -> SecuredError(Kind.ENGINE, MEDIA_NOT_ON_DEVICE)
     }
 
     /** A `connectionPlan` reply means the engine refused to proceed with this link. */
