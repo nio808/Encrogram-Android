@@ -262,22 +262,19 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     private void onMember(View row, int index) {
         if (index < 0 || index >= members.size() || busy) return;
         final GroupMember m = members.get(index);
-        final MemberRole mine = myRole();
         final MemberRole theirs = m.getRole();
+        // The core's rule (Commands.hs:2890): admin or owner, and at least the member's old and new role; owners only by owners.
         if (m.isMe() || !admin() || theirs == MemberRole.OWNER) return;
-        if (mine == MemberRole.ADMIN && theirs == MemberRole.ADMIN) return;   // admins cannot touch each other
         final Context c = row.getContext();
         final boolean connected = m.getStatus() == MemberStatus.CONNECTED;
         final boolean channel = channel();
         final ItemOptions o = ItemOptions.makeOptions(this, row);
         if (connected) {
-            if (mine == MemberRole.OWNER) {
-                if (theirs == MemberRole.ADMIN) {
-                    final MemberRole back = channel ? MemberRole.OBSERVER : MemberRole.MEMBER;
-                    o.add(org.telegram.messenger.R.drawable.msg_admins, c.getString(R.string.secgroup_remove_admin), false, () -> setRole(m, back));
-                } else {
-                    o.add(org.telegram.messenger.R.drawable.msg_admins, c.getString(R.string.secgroup_make_admin), false, () -> setRole(m, MemberRole.ADMIN));
-                }
+            if (theirs == MemberRole.ADMIN) {
+                final MemberRole back = channel ? MemberRole.OBSERVER : MemberRole.MEMBER;
+                o.add(org.telegram.messenger.R.drawable.msg_admins, c.getString(R.string.secgroup_remove_admin), false, () -> setRole(m, back));
+            } else {
+                o.add(org.telegram.messenger.R.drawable.msg_admins, c.getString(R.string.secgroup_make_admin), false, () -> setRole(m, MemberRole.ADMIN));
             }
             if (!channel && theirs != MemberRole.ADMIN) {
                 if (theirs != MemberRole.MEMBER) {

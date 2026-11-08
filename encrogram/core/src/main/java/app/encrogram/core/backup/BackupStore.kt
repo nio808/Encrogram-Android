@@ -12,13 +12,14 @@ import java.security.MessageDigest
  * - `state`: upload counter, last backup time, "changed since the last backup", last error code, the automatic-upload
  *   schedule (owed now, skip the tag check once, paused for another phone, failures in a row, last attempt) and the
  *   newest counter seen per backup (rollback check).
- * - `restore_pending`: contacts still being repaired after a restore and the item id the restore started from, so the
- *   work survives restarts.
+ * - `restore_pending`: contacts and group member connections still being repaired after a restore ([RepairKey]) and the
+ *   item id the restore started from, so the work survives restarts.
  *
  * Sealed files (through [Box], an Android Keystore key without user authentication, see [KeyVault.metaBox]):
  * - `server_tag.bin`: the server's ETag of this phone's last upload, bound to the backup id (review finding 4).
  * - `delete_queue.bin`: backup ids whose server copy must still be deleted (a failed "turn off", or the old id after a
- *   phrase change), retried later (finding 7). The ids are server permissions, hence sealed.
+ *   phrase change), retried later (finding 7), each with the tag of this phone's last upload under it: only that copy
+ *   is ever deleted (R6.3). The ids are server permissions, hence sealed.
  *
  * Thread-safe (every method is synchronized). Writes go to a temp file and are renamed into place.
  */
@@ -51,15 +52,18 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
     )
 
     /**
-     * One contact after a restore (RestoreRepair). [proven]: the ratchet is known to work both ways (a completed sync or
-     * a delivery receipt on a message sent after the restore); [switched]: `/_switch` was sent; [forced]: the one
-     * `/_sync force=on` was accepted; [syncing]: a sync is under way, so `ok` will mean it completed.
+     * One contact or member connection after a restore (RestoreRepair). [proven]: the ratchet is known to work both ways
+     * (a completed sync or a delivery receipt on a message sent after the restore); [switched]: `/_switch` was sent;
+     * [forced]: a restore `/_sync` was accepted; [syncing]: a sync we started is under way, so `ok` will mean it
+     * completed; [reforced]: the one late second force was used; [forcedAtMs]: when the last restore sync was accepted.
      */
     data class Pending(
         val proven: Boolean = false,
         val switched: Boolean = false,
         val forced: Boolean = false,
         val syncing: Boolean = false,
+        val reforced: Boolean = false,
+        val forcedAtMs: Long = 0L,
     )
 
     private val stateFile get() = File(dir, STATE_FILE)
@@ -135,30 +139,54 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
 
     // ---- ids still to delete on the server (sealed) ----
 
-    @Synchronized
-    fun pendingDeletes(): List<String> =
-        readSealed(DELETE_FILE)?.split('\n')?.filter { isBackupId(it) }?.distinct() ?: emptyList()
+    /** A backup id whose server copy is to be deleted, and the tag of this phone's last upload under it (or null). */
+    data class QueuedDelete(val id: String, val tag: String?) {
+        override fun toString(): String = "QueuedDelete(redacted)"
+    }
 
-    /** Queues [id] for deletion (newest last, at most [MAX_PENDING_DELETES]). False when it couldn't be stored. */
     @Synchronized
-    fun addPendingDelete(id: String): Boolean {
+    fun pendingDeletes(): List<String> = pendingDeleteEntries().map { it.id }
+
+    /** Lines are `<id>` or `<id> <tag>` (a tag never holds a line break, [BackupClient.cleanTag]). */
+    @Synchronized
+    fun pendingDeleteEntries(): List<QueuedDelete> {
+        val out = LinkedHashMap<String, QueuedDelete>()
+        readSealed(DELETE_FILE)?.split('\n')?.forEach { line ->
+            val id = line.take(64)
+            if (!isBackupId(id)) return@forEach
+            val tag = if (line.length > 65 && line[64] == ' ') BackupClient.cleanTag(line.substring(65)) else null
+            out.remove(id)
+            out[id] = QueuedDelete(id, tag)
+        }
+        return out.values.toList()
+    }
+
+    /**
+     * Queues [id] for deletion with [tag], the tag of this phone's last upload of it (newest last, at most
+     * [MAX_PENDING_DELETES]). False when it couldn't be stored.
+     */
+    @Synchronized
+    fun addPendingDelete(id: String, tag: String? = null): Boolean {
         if (!isBackupId(id)) return false
-        val list = (pendingDeletes() - id) + id
-        return writeSealed(DELETE_FILE, list.takeLast(MAX_PENDING_DELETES).joinToString("\n"))
+        val list = pendingDeleteEntries().filter { it.id != id } + QueuedDelete(id, BackupClient.cleanTag(tag))
+        return writeDeletes(list.takeLast(MAX_PENDING_DELETES))
     }
 
     @Synchronized
     fun removePendingDelete(id: String): Boolean {
-        val list = pendingDeletes()
-        if (id !in list) return true
-        val next = list - id
-        return if (next.isEmpty()) deleteFile(File(dir, DELETE_FILE)) else writeSealed(DELETE_FILE, next.joinToString("\n"))
+        val list = pendingDeleteEntries()
+        if (list.none { it.id == id }) return true
+        return writeDeletes(list.filter { it.id != id })
     }
+
+    private fun writeDeletes(list: List<QueuedDelete>): Boolean =
+        if (list.isEmpty()) deleteFile(File(dir, DELETE_FILE))
+        else writeSealed(DELETE_FILE, list.joinToString("\n") { if (it.tag != null) it.id + " " + it.tag else it.id })
 
     // ---- restore repair list ----
 
     @Synchronized
-    fun pending(): Map<Long, Pending> = readPending().second
+    fun pending(): Map<RepairKey, Pending> = readPending().second
 
     /**
      * Item id the last restore started from: our messages with a higher id were sent after the restore, so their
@@ -167,24 +195,24 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
     @Synchronized
     fun repairSince(): Long = readPending().first ?: Long.MAX_VALUE
 
-    /** A new repair list after a restore: [contacts] and the item id the restore started from. */
+    /** A new repair list after a restore: [connections] and the item id the restore started from. */
     @Synchronized
-    fun startRepair(contacts: Map<Long, Pending>, sinceItemId: Long): Boolean = writePending(sinceItemId, contacts)
+    fun startRepair(connections: Map<RepairKey, Pending>, sinceItemId: Long): Boolean = writePending(sinceItemId, connections)
 
     @Synchronized
-    fun setPending(map: Map<Long, Pending>): Boolean = writePending(readPending().first, map)
+    fun setPending(map: Map<RepairKey, Pending>): Boolean = writePending(readPending().first, map)
 
     /** Applies [change] to the pending list. */
     @Synchronized
-    fun updatePending(change: (MutableMap<Long, Pending>) -> Unit): Boolean {
+    fun updatePending(change: (MutableMap<RepairKey, Pending>) -> Unit): Boolean {
         val (since, current) = readPending()
         val map = LinkedHashMap(current)
         change(map)
         return if (map == current) true else writePending(since, map)
     }
 
-    private fun readPending(): Pair<Long?, Map<Long, Pending>> {
-        val out = LinkedHashMap<Long, Pending>()
+    private fun readPending(): Pair<Long?, Map<RepairKey, Pending>> {
+        val out = LinkedHashMap<RepairKey, Pending>()
         var since: Long? = null
         try {
             if (!pendingFile.isFile) return null to out
@@ -194,10 +222,14 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
                     since = parts.getOrNull(1)?.toLongOrNull()?.takeIf { it >= 0 }
                     continue
                 }
-                val id = parts.getOrNull(0)?.toLongOrNull() ?: continue
+                val key = parts.getOrNull(0)?.let { RepairKey.decode(it) } ?: continue
                 val flags = parts.getOrNull(1).orEmpty()
+                val forcedAt = parts.getOrNull(2)?.toLongOrNull()?.takeIf { it > 0 } ?: 0L
                 // 'h' (an incoming message decrypted) from older builds is not proof any more and is ignored.
-                out[id] = Pending(proven = 'p' in flags, switched = 's' in flags, forced = 'f' in flags, syncing = 'y' in flags)
+                out[key] = Pending(
+                    proven = 'p' in flags, switched = 's' in flags, forced = 'f' in flags, syncing = 'y' in flags,
+                    reforced = 'r' in flags, forcedAtMs = forcedAt,
+                )
             }
         } catch (e: Exception) {
             SecuredLog.crash(SecuredLog.Ev.BACKUP_IO_FAILED, e)
@@ -205,14 +237,16 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
         return since to out
     }
 
-    private fun writePending(since: Long?, map: Map<Long, Pending>): Boolean {
+    private fun writePending(since: Long?, map: Map<RepairKey, Pending>): Boolean {
         if (map.isEmpty()) return deleteFile(pendingFile)
         val sb = StringBuilder()
         if (since != null) sb.append(SINCE_KEY).append(' ').append(since).append('\n')
-        for ((id, p) in map) {
+        for ((key, p) in map) {
             val flags = (if (p.proven) "p" else "") + (if (p.switched) "s" else "") +
-                (if (p.forced) "f" else "") + (if (p.syncing) "y" else "")
-            sb.append(id).append(' ').append(flags.ifEmpty { "-" }).append('\n')
+                (if (p.forced) "f" else "") + (if (p.syncing) "y" else "") + (if (p.reforced) "r" else "")
+            sb.append(key.encode()).append(' ').append(flags.ifEmpty { "-" })
+            if (p.forcedAtMs > 0) sb.append(' ').append(p.forcedAtMs)
+            sb.append('\n')
         }
         return write(pendingFile, sb.toString().toByteArray(Charsets.UTF_8))
     }

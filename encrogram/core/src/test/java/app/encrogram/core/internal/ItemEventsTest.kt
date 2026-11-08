@@ -105,10 +105,14 @@ class ItemEventsTest {
         assertEquals(5L, i.chatId)
         assertEquals(41L, i.itemId)
         assertEquals(2, i.reactions.size)
-        // Not a direct chat: ignored.
+        // A group's reaction lands on the group's chat id; a support scope or a relay channel is ignored.
         val group = JSONObject(Samples.chatItemReaction(Samples.item(41, "groupRcv", "rcvMsgContent", "hi", "rcvRead")))
             .getJSONObject("result")
         group.getJSONObject("reaction").put("chatInfo", JSONObject("""{"type":"group","groupInfo":{"groupId":3}}"""))
+        assertEquals(app.encrogram.core.api.GROUP_CHAT_ID_BASE + 3, CoreJson.parseReactionItem(group)!!.chatId)
+        group.getJSONObject("reaction").put("chatInfo", JSONObject("""{"type":"group","groupInfo":{"groupId":3},"groupChatScope":{"type":"memberSupport"}}"""))
+        assertNull(CoreJson.parseReactionItem(group))
+        group.getJSONObject("reaction").put("chatInfo", JSONObject("""{"type":"group","groupInfo":{"groupId":3,"useRelays":true}}"""))
         assertNull(CoreJson.parseReactionItem(group))
     }
 

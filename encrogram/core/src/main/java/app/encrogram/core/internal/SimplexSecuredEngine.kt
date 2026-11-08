@@ -6,10 +6,13 @@ import android.os.Looper
 import app.encrogram.core.api.BackupInfo
 import app.encrogram.core.api.BackupState
 import app.encrogram.core.api.ChatAction
+import app.encrogram.core.api.ChatKind
 import app.encrogram.core.api.ChatSummary
 import app.encrogram.core.api.EngineState
+import app.encrogram.core.api.GroupMember
 import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
+import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MessagePage
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.RelayConfig
@@ -22,6 +25,7 @@ import app.encrogram.core.api.SecuredListener
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredProfile
 import app.encrogram.core.api.SecuredResult
+import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.backup.BackupClient
 import app.encrogram.core.backup.BackupSecrets
 import app.encrogram.core.backup.BackupStore
@@ -29,6 +33,7 @@ import app.encrogram.core.backup.Bip39
 import app.encrogram.core.backup.Envelope
 import app.encrogram.core.backup.KeyVault
 import app.encrogram.core.backup.Kdf
+import app.encrogram.core.backup.RepairKey
 import app.encrogram.core.backup.RestoreRepair
 import app.encrogram.core.internal.ErrorMapper.Op
 import app.encrogram.core.internal.InputRules.MAX_PAGE
@@ -100,6 +105,8 @@ internal class SimplexSecuredEngine(
     private val timedChats = HashSet<Long>()
     /** The local note folder behind Saved Messages ([SAVED_MESSAGES_CHAT_ID]), from the last chat list load. */
     private var noteFolderId: Long? = null
+    /** Each group row's GroupInfo as of the last chat list load, by our chat id (membership status, channel marker). */
+    private val groupCache = HashMap<Long, CoreGroup>()
     private var receiver: Receiver? = null
 
     private val dataDir: File get() = File(appContext.noBackupFilesDir, DATA_DIR)
@@ -145,12 +152,14 @@ internal class SimplexSecuredEngine(
     private val restoreMarker: File get() = File(dataDir, RESTORE_MARKER)
 
     // engine thread only
-    /** Contacts still being repaired after a restore (mirror of BackupStore.pending()). */
-    private var pendingCache: MutableMap<Long, BackupStore.Pending>? = null
+    /** Contacts and member connections still being repaired after a restore (mirror of BackupStore.pending()). */
+    private var pendingCache: MutableMap<RepairKey, BackupStore.Pending>? = null
     /** Item id the restore started from (BackupStore.repairSince), loaded with [pendingCache]. */
     private var repairSinceCache = Long.MAX_VALUE
-    /** When each contact's ratchet was last re-synced automatically (loop guard). */
-    private val lastAutoSync = HashMap<Long, Long>()
+    /** When each connection's ratchet was last re-synced automatically (loop guard). */
+    private val lastAutoSync = HashMap<RepairKey, Long>()
+    /** Connections with a re-check queued for when their sync guard ends (R6.6), so at most one each. */
+    private val syncRechecks = HashSet<RepairKey>()
 
     // =============================================================================================================
     // SecuredEngine
@@ -225,7 +234,8 @@ internal class SimplexSecuredEngine(
             is CoreReply.Result ->
                 if (r.type == "apiChat") {
                     val items = InputRules.pageWindow(CoreJson.parseChatItemsOfChat(r.body), page, want)
-                    ok(callback, items.map { MessageMapper.toMessage(it) })
+                    val role = roleIn(chatId)
+                    ok(callback, items.map { MessageMapper.toMessage(it, role) })
                 } else {
                     err(callback, unexpected(r))
                 }
@@ -320,6 +330,8 @@ internal class SimplexSecuredEngine(
         if (text.isBlank()) return@post err(callback, ErrorMapper.invalid("The message is empty."))
         if (!InputRules.textFits(text)) return@post err(callback, ErrorMapper.invalid(ErrorMapper.TOO_LONG))
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post createNoteOnEngine(text, replyToId, callback)
+        val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
+        postRefusal(chatId)?.let { return@post refuse(callback, "send_group", it) }
         if (replyToId != null) {
             val quoted = itemOrErr(chatId, replyToId, callback) ?: return@post
             if (quoted.deleted) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
@@ -329,11 +341,11 @@ internal class SimplexSecuredEngine(
                 return@post err(callback, ErrorMapper.invalid("This reply is too long. Shorten it, or send it without the quote."))
             }
         }
-        when (val r = send(Commands.sendText(chatId, text, replyToId))) {
+        when (val r = send(Commands.sendText(ref, text, replyToId))) {
             is CoreReply.Result -> {
                 val item = if (r.type == "newChatItems") CoreJson.parseChatItems(r.body).firstOrNull { it.chatId == chatId } else null
                 if (item == null) return@post err(callback, unexpected(r))
-                ok(callback, MessageMapper.toMessage(item))
+                ok(callback, MessageMapper.toMessage(item, roleIn(chatId)))
                 applyNewItems(listOf(item))
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.SEND))
@@ -353,8 +365,11 @@ internal class SimplexSecuredEngine(
             is ItemAction.Edit -> editOnEngine(chatId, ids, action.newText, callback)
             ItemAction.DeleteForMe -> deleteOnEngine(chatId, ids, Commands.DeleteMode.INTERNAL, callback)
             // A note exists only on this phone: deleting it "for everyone" is the same local delete.
-            ItemAction.DeleteForEveryone ->
-                deleteOnEngine(chatId, ids, if (notes) Commands.DeleteMode.INTERNAL else Commands.DeleteMode.BROADCAST, callback)
+            ItemAction.DeleteForEveryone -> when {
+                notes -> deleteOnEngine(chatId, ids, Commands.DeleteMode.INTERNAL, callback)
+                isGroupChatId(chatId) -> deleteInGroupOnEngine(chatId, ids, callback)
+                else -> deleteOnEngine(chatId, ids, Commands.DeleteMode.BROADCAST, callback)
+            }
             is ItemAction.React ->
                 if (notes) refuse(callback, "react_notes", ErrorMapper.NOT_IN_SAVED) else reactOnEngine(chatId, ids, action, callback)
             is ItemAction.ForwardTo -> forwardOnEngine(chatId, ids, action.toChatId, callback)
@@ -365,16 +380,23 @@ internal class SimplexSecuredEngine(
         if (!ensureRunning(callback)) return@post
         if (chatCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post notesChatAction(action, callback)
+        val group = isGroupChatId(chatId)
         when (action) {
             is ChatAction.SetPinned ->
                 updateChatSettings(chatId, "pin", callback) { it.put("favorite", action.pinned) }
             is ChatAction.SetMuted ->
                 updateChatSettings(chatId, "mute", callback) { it.put("enableNtfs", if (action.muted) "none" else "all") }
             is ChatAction.SetArchived -> setArchivedOnEngine(chatId, action.archived, callback)
-            ChatAction.ClearHistory -> chatCommand("clear", Commands.clearChat(chatId), "chatCleared", callback)
+            ChatAction.ClearHistory -> {
+                val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
+                chatCommand("clear", Commands.clearChat(ref), "chatCleared", callback)
+            }
             // The reload that follows drops the chat's archive flag (ArchiveStore.retainOnly).
-            is ChatAction.Delete -> chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback)
+            is ChatAction.Delete ->
+                if (group) deleteGroupOnEngine(chatId, action.notifyContact, callback)
+                else chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback)
             is ChatAction.SetDisappearing -> {
+                if (group) return@post refuse(callback, "disappearing_group", ErrorMapper.CONTACTS_ONLY)
                 val ttl = action.ttlSeconds
                 if (ttl != null && !InputRules.ttlAllowed(ttl)) {
                     return@post err(callback, ErrorMapper.invalid("Choose a timer between 1 second and 1 year."))
@@ -389,7 +411,8 @@ internal class SimplexSecuredEngine(
         if (state != EngineState.RUNNING || ctrl == 0L) return@post
         // Notes are never unread.
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post
-        val r = send(Commands.markRead(chatId))
+        val ref = refOf(chatId) ?: return@post
+        val r = send(Commands.markRead(ref))
         if (r is CoreReply.Result) {
             val s = chatCache[chatId] ?: return@post
             if (s.unreadCount != 0) {
@@ -405,6 +428,7 @@ internal class SimplexSecuredEngine(
     override fun securityCode(chatId: Long, callback: SecuredCallback<String>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post err(callback, ErrorMapper.notInSavedMessages())
+        if (isGroupChatId(chatId)) return@post refuse(callback, "code_group", ErrorMapper.CONTACTS_ONLY)
         when (val r = send(Commands.getCode(chatId))) {
             is CoreReply.Result -> {
                 val code = if (r.type == "contactCode") CoreJson.contactCode(r.body) else null
@@ -423,6 +447,7 @@ internal class SimplexSecuredEngine(
     override fun verifyContact(chatId: Long, code: String?, callback: SecuredCallback<Boolean>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post err(callback, ErrorMapper.notInSavedMessages())
+        if (isGroupChatId(chatId)) return@post refuse(callback, "verify_group", ErrorMapper.CONTACTS_ONLY)
         val checked = code?.let { InputRules.securityCode(it) ?: return@post err(callback, ErrorMapper.invalid("A security code has only digits and spaces.")) }
         when (val r = send(Commands.verifyCode(chatId, checked))) {
             is CoreReply.Result -> {
@@ -431,6 +456,123 @@ internal class SimplexSecuredEngine(
                 refreshChats(notify = true)
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.VERIFY))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    // =============================================================================================================
+    // Groups and channels (docs/groups-plan.md, first release). Engine thread, like every other command. Logs carry
+    // only fixed tags and counts: never group names, member names or text.
+    // =============================================================================================================
+
+    /** `/_group` with history and full delete on; a channel also carries our marker (CoreJson.CHANNEL_MARKER_PREF). */
+    override fun createGroup(name: String, channel: Boolean, callback: SecuredCallback<Long>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val groupName = validName(name) ?: return@post err(callback, nameError())
+        when (val r = send(Commands.newGroup(userId, CoreJson.newGroupProfile(groupName, channel)))) {
+            is CoreReply.Result -> {
+                val groupId = if (r.type == "groupCreated") CoreJson.createdGroupId(r.body) else null
+                if (groupId == null) return@post err(callback, unexpected(r))
+                SecuredLog.i(Ev.GROUP_ACTION, if (channel) "create_channel" else "create_group")
+                // The row first, so a caller reading chats() in the callback finds it.
+                refreshChats(notify = true)
+                ok(callback, CoreJson.groupChatId(groupId))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /**
+     * `/_add #g <contactId> member` (observer in a channel) for each contact. Only our own ready contacts, checked
+     * before anything is sent; the core then checks our role (admin). Failures don't stop the rest; the result says
+     * how many failed. Someone already in the group counts as added.
+     */
+    override fun addMembers(chatId: Long, contactChatIds: List<Long>, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        if (g.invited) return@post refuse(callback, "add_not_joined", ErrorMapper.NOT_JOINED)
+        if (g.myRole < MemberRole.ADMIN) return@post refuse(callback, "add_role", ErrorMapper.ONLY_ADMINS_ADD)
+        val ids = contactChatIds.distinct()
+        if (ids.isEmpty() || ids.size > InputRules.MAX_ITEM_IDS) {
+            return@post err(callback, ErrorMapper.invalid("Choose 1 to ${InputRules.MAX_ITEM_IDS} people."))
+        }
+        for (id in ids) {
+            val row = chatCache[id]
+            val contact = row != null && row.kind == ChatKind.DIRECT && id > 0 && !isGroupChatId(id) && row.ready
+            if (!contact) return@post refuse(callback, "add_not_contact", ErrorMapper.NOT_A_CONTACT)
+        }
+        val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
+        var failed = 0
+        for (id in ids) {
+            when (val r = send(Commands.addMember(g.groupId, id, role))) {
+                is CoreReply.Result -> if (r.type != "sentGroupInvitation") {
+                    SecuredLog.w(Ev.CMD_UNEXPECTED_REPLY, r.type)
+                    failed++
+                }
+                is CoreReply.Error -> if (r.error.detail != "groupDuplicateMember") failed++
+                CoreReply.Invalid -> failed++
+            }
+        }
+        SecuredLog.i(Ev.GROUP_ACTION, "add", ids.size)
+        if (failed > 0) SecuredLog.w(Ev.GROUP_ACTION, "add_failed", failed)
+        refreshChats(notify = true)
+        if (failed == 0) ok(callback, Unit) else err(callback, ErrorMapper.addFailed(failed, ids.size))
+    }
+
+    /** `/_join #g`: accepts an invitation ([ChatSummary.invited]). Declining is chatAction(Delete). */
+    override fun joinGroup(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        if (!g.invited) return@post refuse(callback, "join_not_invited", ErrorMapper.ALREADY_JOINED)
+        when (val r = send(Commands.joinGroup(g.groupId))) {
+            is CoreReply.Result -> {
+                if (r.type != "userAcceptedGroupSent") return@post err(callback, unexpected(r))
+                SecuredLog.i(Ev.GROUP_ACTION, "join")
+                refreshChats(notify = true)
+                ok(callback, Unit)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /**
+     * `/_members #g`, with us first. [GroupMember.contactChatId] is the member's 1:1 chat when the core links them to
+     * one of our contacts (memberContactId) that is in our chat list.
+     */
+    override fun members(chatId: Long, callback: SecuredCallback<List<GroupMember>>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val groupId = CoreJson.groupIdFromChatId(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
+        if (groupCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
+        when (val r = send(Commands.listMembers(groupId))) {
+            is CoreReply.Result -> {
+                if (r.type != "groupMembers") return@post err(callback, unexpected(r))
+                val list = CoreJson.parseMembers(r.body).map { m ->
+                    val contactChat = m.memberContactId?.takeIf { id -> chatCache[id]?.kind == ChatKind.DIRECT && !isGroupChatId(id) }
+                    GroupMember(m.groupMemberId, m.displayName, m.role, m.status, m.isMe, contactChat)
+                }
+                ok(callback, list)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.LOAD))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+    }
+
+    /** `/_leave #g`: the members are told, the chat stays (status left) until it is deleted. */
+    override fun leaveGroup(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        if (g.invited) return@post refuse(callback, "leave_invited", ErrorMapper.DECLINE_INSTEAD)
+        if (g.myStatus in GONE_STATUSES) return@post refuse(callback, "leave_gone", ErrorMapper.ALREADY_LEFT)
+        when (val r = send(Commands.leaveGroup(g.groupId))) {
+            is CoreReply.Result -> {
+                if (r.type != "leftMemberUser") return@post err(callback, unexpected(r))
+                SecuredLog.i(Ev.GROUP_ACTION, "leave")
+                refreshChats(notify = true)
+                ok(callback, Unit)
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
@@ -489,9 +631,11 @@ internal class SimplexSecuredEngine(
     }
 
     /**
-     * Turns backup off. The server copy's id is queued for deletion before the DELETE, so a failed delete is retried
-     * later ([retryPendingDeletes]); the words and keys on this phone go either way. When the server copy is still
-     * there, the result says so instead of claiming it was deleted (finding 7).
+     * Turns backup off. The server copy's id is queued for deletion (with the tag of this phone's last upload) before
+     * the DELETE, so a failed delete is retried later ([retryPendingDeletes]); the words and keys on this phone go
+     * either way. Only this phone's own last copy is deleted: a copy another phone made with the same words stays
+     * (R6.3, [deleteIfOurs]). When the server copy is still there, the result says so instead of claiming it was
+     * deleted (finding 7).
      */
     override fun disableBackup(callback: SecuredCallback<Unit>) = onWorker(callback) {
         var unreadable = false
@@ -506,15 +650,21 @@ internal class SimplexSecuredEngine(
             val id = secrets.id
             secrets.wipe()
             val client = backupClient ?: return@onWorker err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
-            val queued = backupStore.addPendingDelete(id)
-            try {
-                client.delete(id)
-                if (!backupStore.removePendingDelete(id)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete_queue")
-            } catch (e: BackupClient.HttpFailure) {
-                SecuredLog.w(Ev.BACKUP_FAILED, "delete_" + e.failure.name.lowercase(), e.code)
-                // Nothing could remember the id for a later try: change nothing, so the user can try again.
-                if (!queued) return@onWorker err(callback, SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_KEEP_ON))
-                notDeleted = SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_NOT_DELETED)
+            val tag = backupStore.serverTag(id)
+            val queued = backupStore.addPendingDelete(id, tag)
+            when (val outcome = deleteIfOurs(client, id, tag)) {
+                DeleteOutcome.Deleted, DeleteOutcome.Gone ->
+                    if (!backupStore.removePendingDelete(id)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete_queue")
+                DeleteOutcome.Kept -> {
+                    if (!backupStore.removePendingDelete(id)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "delete_queue")
+                    notDeleted = SecuredError(SecuredError.Kind.NOT_ALLOWED, ErrorMapper.SERVER_COPY_KEPT)
+                }
+                is DeleteOutcome.Failed -> {
+                    SecuredLog.w(Ev.BACKUP_FAILED, "delete_" + outcome.failure.name.lowercase(), outcome.code)
+                    // Nothing could remember the id for a later try: change nothing, so the user can try again.
+                    if (!queued) return@onWorker err(callback, SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_KEEP_ON))
+                    notDeleted = SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.SERVER_COPY_NOT_DELETED)
+                }
             }
         } else if (unreadable) {
             // The id that names the server copy is gone with the key: it can't be deleted from here.
@@ -530,11 +680,12 @@ internal class SimplexSecuredEngine(
         if (notDeleted == null) retryPendingDeletes()
     }
 
+    /** Keeps the downloaded (still sealed) copy for a short while, so a restore right after it skips a second GET (R6.7). */
     override fun findBackup(words: List<String>, callback: SecuredCallback<BackupInfo>) = onWorker(callback) {
         val client = backupClient ?: return@onWorker err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
         val secrets = Kdf.secretsFromWords(words) ?: return@onWorker err(callback, ErrorMapper.wrongPhrase())
         try {
-            when (val f = fetchBackup(client, secrets)) {
+            when (val f = fetchBackup(client, secrets, keep = true)) {
                 is Fetched.Ok -> {
                     f.payload.archive.fill(0)
                     ok(callback, BackupInfo(f.payload.createdAtMs))
@@ -572,8 +723,9 @@ internal class SimplexSecuredEngine(
 
     /**
      * Phrase thread. Stores the words (screen-lock key) and the id+key (no-auth key), then asks the backup thread for
-     * the first upload. A changed phrase queues the old server copy for deletion first: it must not stay restorable
-     * with the old words, even when the first upload fails (finding 7).
+     * the first upload. A changed phrase queues the old server copy for deletion once the new words are stored, before
+     * the first upload: it must not stay restorable with the old words, even when that upload fails (finding 7). When
+     * storing the new words fails, nothing is queued and the old copy stays (R6.8).
      */
     private fun enableOnPhraseThread(words: List<String>, callback: SecuredCallback<Unit>) {
         if (backupClient == null) return err(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_NOT_CONFIGURED))
@@ -592,7 +744,8 @@ internal class SimplexSecuredEngine(
             previous?.wipe()
             val sameBackup = previousId == secrets.id
             val obsoleteId = previousId?.takeIf { !sameBackup }
-            val queued = obsoleteId == null || backupStore.addPendingDelete(obsoleteId)
+            // The tag of this phone's last upload of the old copy, read before the new backup forgets it (R6.3).
+            val obsoleteTag = obsoleteId?.let { backupStore.serverTag(it) }
             // These words may have been turned off on this phone before: their copy is wanted again.
             backupStore.removePendingDelete(secrets.id)
             try {
@@ -610,6 +763,8 @@ internal class SimplexSecuredEngine(
                     else SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE),
                 )
             }
+            // Both stored: only now may the old copy go (R6.8).
+            val queued = obsoleteId == null || backupStore.addPendingDelete(obsoleteId, obsoleteTag)
             if (!sameBackup) {
                 // A new backup: nothing uploaded yet, no tag, no pause, no backoff.
                 backupStore.update { BackupStore.Meta(counter = it.counter, dirty = true) }
@@ -623,7 +778,7 @@ internal class SimplexSecuredEngine(
                 )
             }
             SecuredLog.i(Ev.BACKUP_ENABLED)
-            if (obsoleteId != null && !queued) worker.execute { deleteOldCopyOnWorker(obsoleteId) }
+            if (obsoleteId != null && !queued) worker.execute { deleteOldCopyOnWorker(obsoleteId, obsoleteTag) }
             onWorker(callback) { beginAttemptOnWorker("enable", manual = true, callback = callback) }
         } finally {
             entropy.fill(0)
@@ -633,10 +788,12 @@ internal class SimplexSecuredEngine(
 
     /**
      * Backup thread. One upload at a time:
-     *  1. HEAD the server copy while the chat still runs: no answer means no pause and a later try (finding 5);
-     *  2. automatic uploads compare its tag with this phone's last one, so a copy that another phone made with the
-     *     same words is never overwritten (finding 4); [manual] ("Back up now", turning backup on) and the first
-     *     upload after a restore skip that check;
+     *  1. HEAD the server copy while the chat still runs: no answer means no pause and a later try (finding 5); a busy
+     *     server (429/503) gets one more HEAD after [BUSY_RETRY_MS], not counted as a failure (R6.7);
+     *  2. automatic uploads compare its tag with this phone's last one; when the tag doesn't prove it, the copy is
+     *     downloaded and its counter decides ([verifyServerCopy], R6.2), so a copy that another phone made with the
+     *     same words is never overwritten (finding 4) and a lost tag never stops uploads; [manual] ("Back up now",
+     *     turning backup on) and the first upload after a restore skip that check;
      *  3. the export on the engine thread ([startBackupOnEngine]), then the upload back here ([uploadOnWorker]).
      * Every path ends in [failAttempt], [pauseForOtherPhone] or the success branch of [uploadOnWorker].
      */
@@ -667,12 +824,28 @@ internal class SimplexSecuredEngine(
                 return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), "keystore", manual)
             } ?: return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF), null, manual)
             val id = secrets.id
-            secrets.wipe()
             if (!manual) backupStore.update { it.copy(lastAttemptMs = System.currentTimeMillis()) }
             SecuredLog.i(Ev.BACKUP_STARTED, reason)
             publishBackupState { it.copy(running = true) }
-            val probe = client.head(id)
-            when (BackupClient.tagDecision(probe, backupStore.serverTag(id), skipCheck = manual || meta.unconditional)) {
+            var probe = client.head(id)
+            if (probe is BackupClient.Probe.Failed && probe.failure == BackupClient.Failure.BUSY) {
+                SecuredLog.w(Ev.BACKUP_FAILED, "probe_busy_retry", probe.code)
+                sleepQuietly(BUSY_RETRY_MS)
+                probe = client.head(id)
+            }
+            var check = BackupClient.tagDecision(probe, backupStore.serverTag(id), skipCheck = manual || meta.unconditional)
+            if (check == BackupClient.Check.VERIFY) {
+                val verified = try {
+                    verifyServerCopy(client, secrets)
+                } finally {
+                    secrets.wipe()
+                }
+                check = verified.first
+                verified.second?.let { probe = it }
+            } else {
+                secrets.wipe()
+            }
+            when (check) {
                 BackupClient.Check.UPLOAD -> post {
                     try {
                         startBackupOnEngine(manual, callback)
@@ -682,7 +855,8 @@ internal class SimplexSecuredEngine(
                     }
                 }
                 BackupClient.Check.OTHER_PHONE -> pauseForOtherPhone()
-                BackupClient.Check.CANT_CHECK -> {
+                // verifyServerCopy never returns VERIFY; kept for an exhaustive when.
+                BackupClient.Check.VERIFY -> {
                     SecuredLog.w(Ev.BACKUP_FAILED, "no_tag")
                     failAttempt(callback, SecuredError(SecuredError.Kind.NETWORK, ErrorMapper.BACKUP_SERVER_ODD), "no_tag", manual)
                 }
@@ -699,6 +873,82 @@ internal class SimplexSecuredEngine(
     }
 
     private class Exported(val archive: ByteArray, val dbKey: String, val createdAtMs: Long)
+
+    /**
+     * Backup thread, R6.2 part B: the stored copy's tag doesn't prove it is this phone's (another tag, none stored or
+     * none sent). Download it once, open it and compare its counter with this phone's ([BackupClient.counterDecision]).
+     * Ours: keep its tag and upload. Higher: another phone uploaded after us. A copy nobody can open (damaged or not
+     * ours to read) can't be restored by anyone, so it is replaced. Returns the check and, for UNREACHABLE, the failure.
+     */
+    private fun verifyServerCopy(client: BackupClient, secrets: BackupSecrets): Pair<BackupClient.Check, BackupClient.Probe.Failed?> {
+        val download = try {
+            client.get(secrets.id)
+        } catch (e: BackupClient.HttpFailure) {
+            // Gone since the HEAD: nothing to overwrite.
+            if (e.failure == BackupClient.Failure.NOT_FOUND) return BackupClient.Check.UPLOAD to null
+            SecuredLog.w(Ev.BACKUP_FAILED, "verify_" + e.failure.name.lowercase(), e.code)
+            return BackupClient.Check.UNREACHABLE to BackupClient.Probe.Failed(e.failure, e.code)
+        }
+        return when (val o = Envelope.open(secrets.key, download.body)) {
+            is Envelope.Opened.Ok -> {
+                val counter = o.payload.counter
+                o.payload.archive.fill(0)
+                backupStore.noteSeen(secrets.id, counter)
+                val decision = BackupClient.counterDecision(counter, backupStore.meta().counter)
+                if (decision == BackupClient.Check.UPLOAD) {
+                    if (!backupStore.setServerTag(secrets.id, download.etag)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "tag")
+                    SecuredLog.i(Ev.BACKUP_STARTED, "verify_ours")
+                } else {
+                    SecuredLog.w(Ev.BACKUP_FAILED, "verify_other")
+                }
+                decision to null
+            }
+            Envelope.Opened.BadKey, Envelope.Opened.BadFormat -> {
+                SecuredLog.w(Ev.BACKUP_FAILED, "verify_damaged")
+                BackupClient.Check.UPLOAD to null
+            }
+        }
+    }
+
+    private fun sleepQuietly(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /** What happened to a server copy we wanted gone ([deleteIfOurs]). */
+    private sealed class DeleteOutcome {
+        object Deleted : DeleteOutcome()
+        /** Nothing stored. */
+        object Gone : DeleteOutcome()
+        /** Another phone's copy, or one this phone can't prove is its own: left alone. */
+        object Kept : DeleteOutcome()
+        class Failed(val failure: BackupClient.Failure, val code: Int) : DeleteOutcome()
+    }
+
+    /**
+     * Backup thread, R6.3: HEAD first, DELETE only when the stored copy carries [tag], the tag of this phone's last
+     * upload of [id]. A copy another phone uploaded with the same words is never deleted from here.
+     */
+    private fun deleteIfOurs(client: BackupClient, id: String, tag: String?): DeleteOutcome {
+        val probe = client.head(id)
+        return when (BackupClient.deleteDecision(probe, tag)) {
+            BackupClient.Del.GONE -> DeleteOutcome.Gone
+            BackupClient.Del.KEEP -> DeleteOutcome.Kept
+            BackupClient.Del.RETRY -> {
+                val f = probe as? BackupClient.Probe.Failed ?: BackupClient.Probe.Failed(BackupClient.Failure.NETWORK, 0)
+                DeleteOutcome.Failed(f.failure, f.code)
+            }
+            BackupClient.Del.DELETE -> try {
+                client.delete(id)
+                DeleteOutcome.Deleted
+            } catch (e: BackupClient.HttpFailure) {
+                DeleteOutcome.Failed(e.failure, e.code)
+            }
+        }
+    }
 
     /**
      * Engine thread. One backup: stop the chat, point the files folder at an empty folder (text-only backup), export,
@@ -794,9 +1044,10 @@ internal class SimplexSecuredEngine(
     }
 
     /**
-     * Backup thread: seal with the backup key, PUT, then HEAD for the new copy's tag (PUT replies may carry none) and
-     * keep it as this phone's last tag. The plaintext archive is wiped from memory afterwards. [seq]: the urgent
-     * request count when the export ran; a newer request keeps the next upload owed.
+     * Backup thread: seal with the backup key, PUT with a `Date` header and keep the copy's tag that the PUT returns
+     * ([BackupClient.put], computed like nginx does: no HEAD that could fail and leave no tag, R6.2). A busy server gets
+     * one more PUT after [BUSY_RETRY_MS] (R6.7). The plaintext archive is wiped from memory afterwards. [seq]: the
+     * urgent request count when the export ran; a newer request keeps the next upload owed.
      */
     private fun uploadOnWorker(ex: Exported, manual: Boolean, callback: SecuredCallback<Unit>?, seq: Long) {
         val client = backupClient
@@ -819,55 +1070,44 @@ internal class SimplexSecuredEngine(
             }
             val sealed = Envelope.seal(secrets.key, Envelope.Payload(ex.createdAtMs, counter, ex.dbKey, ex.archive))
             ex.archive.fill(0)
-            try {
-                client.put(secrets.id, sealed)
+            val tag = try {
+                putOnce(client, secrets.id, sealed)
             } catch (e: BackupClient.HttpFailure) {
-                SecuredLog.w(Ev.BACKUP_FAILED, "upload_" + e.failure.name.lowercase(), e.code)
-                return failAttempt(callback, ErrorMapper.backupHttp(e.failure.name, e.code), failureCode(e.failure, e.code), manual)
+                if (e.failure != BackupClient.Failure.BUSY) throw e
+                SecuredLog.w(Ev.BACKUP_FAILED, "upload_busy_retry", e.code)
+                sleepQuietly(BUSY_RETRY_MS)
+                // A second failure is reported (and counted) as usual by the catch below.
+                putOnce(client, secrets.id, sealed)
             }
             backupStore.noteSeen(secrets.id, counter)
-            val tag = tagAfterUpload(client, secrets.id)
-            // Without a tag the next automatic upload can't prove the copy is ours and pauses (fail safe).
-            if (tag == null) SecuredLog.w(Ev.BACKUP_FAILED, "tag_unread")
             if (!backupStore.setServerTag(secrets.id, tag)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "tag")
-            val stillOwed = synchronized(backupLock) { urgentSeq != seq }
-            backupStore.update {
-                it.copy(
-                    lastBackupMs = ex.createdAtMs, error = null, failures = 0, otherPhone = false, unconditional = false,
-                    urgent = it.urgent && stillOwed,
-                )
+            // One block with requestUrgentBackup's: a request between reading the count and writing the flag would
+            // otherwise be lost (R6.4). Lock order backupLock -> store, as in scheduleAuto.
+            synchronized(backupLock) {
+                val stillOwed = urgentSeq != seq
+                backupStore.update {
+                    it.copy(
+                        lastBackupMs = ex.createdAtMs, error = null, failures = 0, otherPhone = false, unconditional = false,
+                        urgent = it.urgent && stillOwed,
+                    )
+                }
             }
             SecuredLog.i(Ev.BACKUP_UPLOADED, count = sealed.size / 1024)
             publishBackupState { it.copy(running = false, lastBackupMs = ex.createdAtMs, lastError = null, otherPhone = false) }
             callback?.let { ok(it, Unit) }
             endAttempt()
+        } catch (e: BackupClient.HttpFailure) {
+            SecuredLog.w(Ev.BACKUP_FAILED, "upload_" + e.failure.name.lowercase(), e.code)
+            failAttempt(callback, ErrorMapper.backupHttp(e.failure.name, e.code), failureCode(e.failure, e.code), manual)
         } finally {
             ex.archive.fill(0)
             secrets?.wipe()
         }
     }
 
-    /**
-     * The tag of the copy just uploaded. Retried twice: after a short wait, or after the server's rate limit refills
-     * (6 requests a minute) when it answered 429/503. Null when all three HEADs failed.
-     */
-    private fun tagAfterUpload(client: BackupClient, id: String): String? {
-        for (attempt in 0 until 3) {
-            when (val p = client.head(id)) {
-                is BackupClient.Probe.Found -> return p.etag
-                BackupClient.Probe.Missing -> return null
-                is BackupClient.Probe.Failed -> if (attempt < 2) {
-                    try {
-                        Thread.sleep(if (p.failure == BackupClient.Failure.BUSY) TAG_BUSY_RETRY_MS else TAG_RETRY_MS)
-                    } catch (e: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        return null
-                    }
-                }
-            }
-        }
-        return null
-    }
+    /** One PUT dated now (whole seconds); returns the stored copy's tag. */
+    private fun putOnce(client: BackupClient, id: String, sealed: ByteArray): String =
+        client.put(id, sealed, System.currentTimeMillis() / 1000L)
 
     /** Our error code for a failed request (ErrorMapper.backupErrorText). */
     private fun failureCode(f: BackupClient.Failure, code: Int): String = when (f) {
@@ -928,6 +1168,7 @@ internal class SimplexSecuredEngine(
         chatCache.clear()
         lastItemIds.clear()
         timedChats.clear()
+        groupCache.clear()
         noteFolderId = null
         publishChats()
         notifyChatsChanged()
@@ -960,9 +1201,12 @@ internal class SimplexSecuredEngine(
      */
     private fun requestUrgentBackup(reason: String, delayMs: Long) {
         if (backupClient == null || !backupState().enabled) return
-        synchronized(backupLock) { urgentSeq++ }
-        val m = backupStore.meta()
-        if (!m.urgent || !m.dirty) backupStore.update { it.copy(urgent = true, dirty = true) }
+        // The count and the flag together, like the upload's success block reads and clears them (R6.4).
+        synchronized(backupLock) {
+            urgentSeq++
+            val m = backupStore.meta()
+            if (!m.urgent || !m.dirty) backupStore.update { it.copy(urgent = true, dirty = true) }
+        }
         SecuredLog.i(Ev.BACKUP_STARTED, "queued_$reason")
         scheduleAuto(delayMs)
     }
@@ -1022,13 +1266,14 @@ internal class SimplexSecuredEngine(
     }
 
     /**
-     * Backup thread. Deletes server copies queued by a failed "turn off" or left by a phrase change (finding 7). The
-     * current backup's id is never deleted. Stops at the first network failure; the next attempt tries again.
+     * Backup thread. Deletes server copies queued by a failed "turn off" or left by a phrase change (finding 7), but
+     * only copies this phone uploaded last ([deleteIfOurs], R6.3); another phone's copy is dropped from the queue and
+     * kept. The current backup's id is never deleted. Stops at the first network failure; the next attempt tries again.
      */
     private fun retryPendingDeletes() {
         val client = backupClient ?: return
-        val ids = backupStore.pendingDeletes()
-        if (ids.isEmpty()) return
+        val entries = backupStore.pendingDeleteEntries()
+        if (entries.isEmpty()) return
         val current = try {
             vault.loadSecrets()
         } catch (e: KeyVault.Unavailable) {
@@ -1036,39 +1281,59 @@ internal class SimplexSecuredEngine(
         }
         val currentId = current?.id
         current?.wipe()
-        for (id in ids) {
+        for (entry in entries) {
+            val id = entry.id
             if (id == currentId) {
                 backupStore.removePendingDelete(id)
                 continue
             }
-            try {
-                client.delete(id)
-                backupStore.removePendingDelete(id)
-                SecuredLog.i(Ev.BACKUP_DISABLED, "old_copy_deleted")
-            } catch (e: BackupClient.HttpFailure) {
-                SecuredLog.w(Ev.BACKUP_FAILED, "delete_queued_" + e.failure.name.lowercase(), e.code)
-                if (e.failure == BackupClient.Failure.NETWORK || e.failure == BackupClient.Failure.BUSY) return
+            when (val outcome = deleteIfOurs(client, id, entry.tag)) {
+                DeleteOutcome.Deleted -> {
+                    backupStore.removePendingDelete(id)
+                    SecuredLog.i(Ev.BACKUP_DISABLED, "old_copy_deleted")
+                }
+                DeleteOutcome.Gone -> backupStore.removePendingDelete(id)
+                DeleteOutcome.Kept -> {
+                    backupStore.removePendingDelete(id)
+                    SecuredLog.w(Ev.BACKUP_DISABLED, "old_copy_kept")
+                }
+                is DeleteOutcome.Failed -> {
+                    SecuredLog.w(Ev.BACKUP_FAILED, "delete_queued_" + outcome.failure.name.lowercase(), outcome.code)
+                    if (outcome.failure == BackupClient.Failure.NETWORK || outcome.failure == BackupClient.Failure.BUSY) return
+                }
             }
         }
     }
 
-    /** Backup thread: best effort for an old copy that couldn't be queued. */
-    private fun deleteOldCopyOnWorker(id: String) {
-        try {
-            backupClient?.delete(id)
-        } catch (e: BackupClient.HttpFailure) {
-            SecuredLog.w(Ev.BACKUP_FAILED, "delete_old", e.code)
-        }
+    /** Backup thread: best effort for an old copy that couldn't be queued; only if it is still this phone's (R6.3). */
+    private fun deleteOldCopyOnWorker(id: String, tag: String?) {
+        val client = backupClient ?: return
+        val outcome = deleteIfOurs(client, id, tag)
+        if (outcome is DeleteOutcome.Failed) SecuredLog.w(Ev.BACKUP_FAILED, "delete_old", outcome.code)
+        if (outcome == DeleteOutcome.Kept) SecuredLog.w(Ev.BACKUP_DISABLED, "old_copy_kept")
     }
+
+    /** A sealed envelope findBackup downloaded (backup thread only); [key] is the one-way hash of its id. */
+    private class FoundDownload(val key: String, val download: BackupClient.Download, val atMs: Long)
+
+    // backup thread only
+    private var foundDownload: FoundDownload? = null
 
     private sealed class Fetched {
         class Ok(val payload: Envelope.Payload, val etag: String?) : Fetched()
         class Failed(val error: SecuredError) : Fetched()
     }
 
-    /** Backup thread: download, open and check the counter (a copy older than one already seen is refused). */
-    private fun fetchBackup(client: BackupClient, secrets: BackupSecrets): Fetched {
-        val download = try {
+    /**
+     * Backup thread: download, open and check the counter (a copy older than one already seen is refused). [keep]:
+     * remember the sealed download for [FOUND_CACHE_MS] (findBackup); [reuse]: take that download instead of a second
+     * GET (the restore right after a find, R6.7). Only the sealed envelope is kept, never the opened archive.
+     */
+    private fun fetchBackup(client: BackupClient, secrets: BackupSecrets, keep: Boolean = false, reuse: Boolean = false): Fetched {
+        val key = BackupStore.seenKey(secrets.id)
+        val cached = foundDownload?.takeIf { reuse && it.key == key && System.currentTimeMillis() - it.atMs < FOUND_CACHE_MS }
+        foundDownload = null
+        val download = cached?.download ?: try {
             client.get(secrets.id)
         } catch (e: BackupClient.HttpFailure) {
             SecuredLog.w(Ev.BACKUP_LOOKUP_FAILED, e.failure.name.lowercase(), e.code)
@@ -1083,7 +1348,8 @@ internal class SimplexSecuredEngine(
                     Fetched.Failed(SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.BACKUP_ROLLBACK))
                 } else {
                     backupStore.noteSeen(secrets.id, p.counter)
-                    SecuredLog.i(Ev.BACKUP_LOOKUP)
+                    SecuredLog.i(Ev.BACKUP_LOOKUP, if (cached != null) "reused" else null)
+                    if (keep) foundDownload = FoundDownload(key, download, System.currentTimeMillis())
                     Fetched.Ok(p, download.etag)
                 }
             }
@@ -1109,7 +1375,7 @@ internal class SimplexSecuredEngine(
             if (secrets == null) return err(callback, ErrorMapper.wrongPhrase())
             // Checked first: the restored words must be stored behind the screen lock so backup stays on.
             if (!vault.deviceSecure()) return err(callback, ErrorMapper.notAllowed(ErrorMapper.NO_SCREEN_LOCK))
-            val fetched = when (val f = fetchBackup(client, secrets)) {
+            val fetched = when (val f = fetchBackup(client, secrets, reuse = true)) {
                 is Fetched.Ok -> f
                 is Fetched.Failed -> return err(callback, f.error)
             }
@@ -1132,10 +1398,12 @@ internal class SimplexSecuredEngine(
      *     databases in (Archive.hs:72-85), then marks the store changed, so this controller is finished;
      *  2. close it (chatCloseStore is safe on closed stores, simplexmq Agent/Store/SQLite.hs:151-156), store the
      *     backup's passphrase (DbKeyStore.replace, commit() before init), chatMigrateInit with it;
-     *  3. `/_db encryption` to a fresh random passphrase, so the words no longer open this phone's live files
-     *     (Archive.hs:149-175), store it, close that controller too;
+     *  3. `/_db encryption` to a fresh random passphrase (Archive.hs:149-175), so the restored files don't stay under the
+     *     old phone's key, store it, close that controller too. (Every later backup carries this key inside its
+     *     envelope, so the words open the copy that holds it, as they always do.);
      *  4. delete the `.bak`/`.exported` copies and the zip, open a new controller with the fresh key;
-     *  5. list the contacts to repair, store the words, keys and server tag (backup stays on, one upload owed at once),
+     *  5. list the contacts and group member connections to repair, store the words, keys and server tag (backup stays
+     *     on, one upload owed at once),
      *     and only then clear the restore marker ([RestoreRepair.commitRestore], finding 8): before that, a crash or a
      *     failed step is wiped at the next start, see [restoreMarker]; after it, nothing wipes the restore;
      *  6. lock the network until our servers are verified, and start like any other start ([configureAndRun]).
@@ -1181,17 +1449,33 @@ internal class SimplexSecuredEngine(
                     return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.RESTORE_FAILED))
                 }
                 val chats = CoreJson.parseChats(r.body)
-                val contacts = chats.filter { !it.contact.isContactCard && !it.contact.removed }.map { it.contact.contactId }
-                // G1: when groups exist, every group member connection must join this repair list too, keyed apart from
-                // contact ids: `/_info #<groupId> <memberId>` stats, `/_sync #<groupId> <memberId> force=on` once
-                // (APISyncGroupMemberRatchet, Commands.hs:5572), `/_switch #<groupId> <memberId>` after proof, and the
-                // groupMemberRatchetSync / groupMemberSwitch events; their completed switches also trigger an upload.
+                val contacts = chats.filter { !it.contact.isContactCard && !it.contact.removed }.map { RepairKey.contact(it.contact.contactId) }
+                // Every group member connection joins the same repair, keyed apart from contacts: `/_info #g <memberId>`,
+                // one `/_sync #g <memberId> force=on` (Commands.hs:5572), `/_switch #g <memberId>` after proof, and the
+                // groupMemberRatchetSync / groupMemberSwitch events (Controller.hs:926-928).
+                val groups = CoreJson.parseGroupChats(r.body)
+                val members = ArrayList<RepairKey>()
+                for (g in groups) {
+                    if (g.group.invited || g.group.myStatus in GONE_STATUSES) continue
+                    val mr = send(Commands.listMembers(g.group.groupId))
+                    if (mr !is CoreReply.Result || mr.type != "groupMembers") {
+                        // Same rule as the chat list: never leave member connections on old ratchets unnoticed.
+                        SecuredLog.e(Ev.RESTORE_FAILED, "members_" + replyTag(mr))
+                        backToEmptyProfile()
+                        return err(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.RESTORE_FAILED))
+                    }
+                    for (m in CoreJson.parseMembers(mr.body)) {
+                        if (!m.isMe && m.active) members.add(RepairKey.member(g.group.groupId, m.groupMemberId))
+                    }
+                }
                 // Our messages with a higher item id than every restored one were sent after the restore (receipt proof).
-                val since = chats.mapNotNull { it.lastItem?.itemId }.maxOrNull() ?: 0L
+                // Item ids are one counter across all chats, so groups and notes count too.
+                val since = (chats.mapNotNull { it.lastItem?.itemId } + groups.mapNotNull { it.lastItem?.itemId } +
+                    listOfNotNull(CoreJson.parseNoteChat(r.body)?.lastItem?.itemId)).maxOrNull() ?: 0L
                 // The restored databases carry the old phone's server list: lock the network until ours are verified.
                 if (!markFirstRunLockdown()) SecuredLog.w(Ev.CONFIG_STEP_FAILED, "lockdown_mark")
                 val failed = RestoreRepair.commitRestore(
-                    saveRepairList = { saveRepairList(contacts, since) },
+                    saveRepairList = { saveRepairList(contacts + members, since) },
                     storeKeys = { storeRestoredSecrets(payload, etag, secrets, entropy) },
                     clearMarker = { clearRestoreMarker() },
                 )
@@ -1202,6 +1486,7 @@ internal class SimplexSecuredEngine(
                     return err(callback, SecuredError(SecuredError.Kind.ENGINE, msg))
                 }
                 SecuredLog.i(Ev.RESTORE_DONE, "contacts", contacts.size)
+                SecuredLog.i(Ev.RESTORE_DONE, "members", members.size)
                 configureAndRun(user)
             } catch (f: StartFailure) {
                 failClosed(f)
@@ -1349,9 +1634,11 @@ internal class SimplexSecuredEngine(
         }
         backupStore.removePendingDelete(secrets.id)
         if (!backupStore.setServerTag(secrets.id, etag)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "tag")
+        // The restored phone's uploads count on from far above the copy's counter, so an upload the old phone still
+        // makes from the same counter can never look newer than, or equal to, the restored phone's (R6.2 part B).
         val stored = backupStore.update {
             BackupStore.Meta(
-                counter = maxOf(it.counter, payload.counter), lastBackupMs = payload.createdAtMs,
+                counter = maxOf(it.counter, payload.counter) + RESTORE_COUNTER_STEP, lastBackupMs = payload.createdAtMs,
                 dirty = true, urgent = true, unconditional = true,
             )
         }
@@ -1363,9 +1650,9 @@ internal class SimplexSecuredEngine(
         return true
     }
 
-    // ---- per-contact repair after a restore (RestoreRepair) ----
+    // ---- per-connection repair after a restore (RestoreRepair): contacts and group member connections ----
 
-    private fun pendingMap(): MutableMap<Long, BackupStore.Pending> =
+    private fun pendingMap(): MutableMap<RepairKey, BackupStore.Pending> =
         pendingCache ?: LinkedHashMap(backupStore.pending()).also {
             pendingCache = it
             repairSinceCache = backupStore.repairSince()
@@ -1376,62 +1663,75 @@ internal class SimplexSecuredEngine(
         return repairSinceCache
     }
 
-    private fun savePending(map: MutableMap<Long, BackupStore.Pending>) {
+    private fun savePending(map: MutableMap<RepairKey, BackupStore.Pending>) {
         pendingCache = map
         if (map.isEmpty()) repairSinceCache = Long.MAX_VALUE
         if (!backupStore.setPending(map)) SecuredLog.w(Ev.BACKUP_IO_FAILED, "pending")
     }
 
     /** A fresh repair list after a restore. False when it couldn't be written (the restore then fails). */
-    private fun saveRepairList(contacts: List<Long>, sinceItemId: Long): Boolean {
-        val map = contacts.associateWithTo(LinkedHashMap()) { BackupStore.Pending() }
+    private fun saveRepairList(connections: List<RepairKey>, sinceItemId: Long): Boolean {
+        val map = connections.associateWithTo(LinkedHashMap()) { BackupStore.Pending() }
         pendingCache = map
         repairSinceCache = if (map.isEmpty()) Long.MAX_VALUE else sinceItemId
         return backupStore.startRepair(map, sinceItemId)
     }
 
-    private fun updatePending(contactId: Long, change: (BackupStore.Pending) -> BackupStore.Pending?) {
+    private fun updatePending(key: RepairKey, change: (BackupStore.Pending) -> BackupStore.Pending?) {
         val map = pendingMap()
-        val old = map[contactId] ?: return
+        val old = map[key] ?: return
         val next = change(old)
         if (next == old) return
-        if (next == null) map.remove(contactId) else map[contactId] = next
+        if (next == null) map.remove(key) else map[key] = next
         savePending(map)
     }
 
     private fun checkAllPending() {
         if (state != EngineState.RUNNING) return
-        for (id in pendingMap().keys.toList()) checkPending(id)
+        for (key in pendingMap().keys.toList()) checkPending(key)
+    }
+
+    /** `/_info @id` or `/_info #g <memberId>`. */
+    private fun infoCommand(key: RepairKey): String =
+        if (key.isMember) Commands.groupMemberInfo(key.groupId, key.memberId) else Commands.contactInfo(key.contactId)
+
+    /** (connection ready, stats) of an info reply for [key], or null when the reply isn't one. */
+    private fun connInfo(key: RepairKey, r: CoreReply.Result): Pair<Boolean, RestoreRepair.ConnStats?>? = when {
+        key.isMember && r.type == "groupMemberInfo" -> CoreJson.memberInfoStats(r.body)
+        !key.isMember && r.type == "contactInfo" -> CoreJson.contactInfoStats(r.body).let { (c, stats) -> (c?.ready == true) to stats }
+        else -> null
     }
 
     /**
-     * One step for one restored contact: `/_info @id`, fold the sync state into its entry, then sync (plain, or the
+     * One step for one restored connection: `/_info`, fold the sync state into its entry, then sync (plain, or the
      * one forced sync), switch, wait or drop (RestoreRepair.decide).
      */
-    private fun checkPending(contactId: Long) {
+    private fun checkPending(key: RepairKey) {
         if (state != EngineState.RUNNING || ctrl == 0L) return
-        if (pendingMap()[contactId] == null) return
-        val (contact, stats) = when (val r = send(Commands.contactInfo(contactId))) {
-            is CoreReply.Result -> if (r.type == "contactInfo") CoreJson.contactInfoStats(r.body) else return
+        if (pendingMap()[key] == null) return
+        val (ready, stats) = when (val r = send(infoCommand(key))) {
+            is CoreReply.Result -> connInfo(key, r) ?: return
             is CoreReply.Error -> {
-                if (r.error.detail == "contactNotFound" || r.error.detail == "contactNotActive") {
+                if (r.error.detail in GONE_CONNECTION_ERRORS) {
                     SecuredLog.i(Ev.RESTORE_REPAIR, "drop")
-                    updatePending(contactId) { null }
+                    updatePending(key) { null }
                 }
                 return
             }
             CoreReply.Invalid -> return
         }
-        if (stats != null) observeSync(contactId, stats.ratchetSyncState)
-        val entry = pendingMap()[contactId] ?: return
-        when (RestoreRepair.decide(stats, contact?.ready == true, entry)) {
-            RestoreRepair.Action.SYNC -> syncRatchet(contactId, "restore")
-            RestoreRepair.Action.FORCE_SYNC -> syncRatchet(contactId, "restore_force", force = true)
+        if (stats != null) observeSync(key, stats.ratchetSyncState)
+        val entry = pendingMap()[key] ?: return
+        when (RestoreRepair.decide(stats, ready, entry, System.currentTimeMillis())) {
+            RestoreRepair.Action.SYNC -> syncRatchet(key, "restore")
+            RestoreRepair.Action.FORCE_SYNC -> syncRatchet(key, "restore_force", force = true)
             RestoreRepair.Action.SWITCH -> {
-                val s = send(Commands.switchContact(contactId))
-                if (s is CoreReply.Result && s.type == "contactSwitchStarted") {
+                val cmd = if (key.isMember) Commands.switchGroupMember(key.groupId, key.memberId) else Commands.switchContact(key.contactId)
+                val expected = if (key.isMember) "groupMemberSwitchStarted" else "contactSwitchStarted"
+                val s = send(cmd)
+                if (s is CoreReply.Result && s.type == expected) {
                     SecuredLog.i(Ev.QUEUE_SWITCH, "started")
-                    updatePending(contactId) { it.copy(switched = true) }
+                    updatePending(key) { it.copy(switched = true) }
                 } else {
                     SecuredLog.w(Ev.QUEUE_SWITCH, replyTag(s))
                 }
@@ -1439,21 +1739,24 @@ internal class SimplexSecuredEngine(
             RestoreRepair.Action.WAIT -> Unit
             RestoreRepair.Action.DONE -> {
                 SecuredLog.i(Ev.RESTORE_REPAIR, "done")
-                updatePending(contactId) { null }
+                updatePending(key) { null }
+                // DONE means our switch finished. Its event may have come while not RUNNING (dropped), so the copy
+                // that knows the new address is owed here too; coalesced with any other request (R6.5).
+                requestUrgentBackup("switch", SWITCH_BACKUP_DELAY_MS)
             }
             RestoreRepair.Action.DROP -> {
                 SecuredLog.i(Ev.RESTORE_REPAIR, "drop")
-                updatePending(contactId) { null }
+                updatePending(key) { null }
             }
         }
     }
 
-    /** A sync state seen for a restored contact. A completed sync proves the ratchet and refreshes the server copy. */
-    private fun observeSync(contactId: Long, status: String) {
-        val old = pendingMap()[contactId] ?: return
+    /** A sync state seen for a restored connection. A completed sync proves the ratchet and refreshes the server copy. */
+    private fun observeSync(key: RepairKey, status: String) {
+        val old = pendingMap()[key] ?: return
         val next = RestoreRepair.observe(old, status)
         if (next == old) return
-        updatePending(contactId) { next }
+        updatePending(key) { next }
         if (next.proven && !old.proven) {
             SecuredLog.i(Ev.RESTORE_REPAIR, "sync_done")
             requestUrgentBackup("repair_sync", SWITCH_BACKUP_DELAY_MS)
@@ -1461,18 +1764,24 @@ internal class SimplexSecuredEngine(
     }
 
     /**
-     * `/_sync @id`; [force] only from the restore repair (once per restored contact, RestoreRepair.Action.FORCE_SYNC).
-     * At most once per contact per [AUTO_SYNC_GAP_MS] (a peer can't make us loop).
+     * `/_sync @id` or `/_sync #g <memberId>`; [force] only from the restore repair (RestoreRepair.Action.FORCE_SYNC).
+     * At most once per connection per [AUTO_SYNC_GAP_MS] (a peer can't make us loop); a refusal by that guard queues a
+     * re-check for when it ends, so the sync isn't simply lost (R6.6).
      */
-    private fun syncRatchet(contactId: Long, tag: String, force: Boolean = false): Boolean {
+    private fun syncRatchet(key: RepairKey, tag: String, force: Boolean = false): Boolean {
         val now = System.currentTimeMillis()
-        val last = lastAutoSync[contactId]
-        if (last != null && now - last < AUTO_SYNC_GAP_MS) return false
-        lastAutoSync[contactId] = now
-        val r = send(Commands.syncRatchet(contactId, force))
-        return if (r is CoreReply.Result && r.type == "contactRatchetSyncStarted") {
+        val last = lastAutoSync[key]
+        if (last != null && now - last < AUTO_SYNC_GAP_MS) {
+            scheduleSyncRecheck(key, last + AUTO_SYNC_GAP_MS - now)
+            return false
+        }
+        lastAutoSync[key] = now
+        val cmd = if (key.isMember) Commands.syncGroupMember(key.groupId, key.memberId, force) else Commands.syncRatchet(key.contactId, force)
+        val expected = if (key.isMember) "groupMemberRatchetSyncStarted" else "contactRatchetSyncStarted"
+        val r = send(cmd)
+        return if (r is CoreReply.Result && r.type == expected) {
             SecuredLog.i(Ev.RATCHET_SYNC, tag)
-            updatePending(contactId) { RestoreRepair.syncAccepted(it, force) }
+            updatePending(key) { RestoreRepair.syncAccepted(it, now) }
             true
         } else {
             SecuredLog.w(Ev.RATCHET_SYNC, replyTag(r))
@@ -1480,56 +1789,133 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    /** Events that matter for the backup and for repairing restored contacts. Engine thread, RUNNING only. */
+    /** One re-check per connection, on the engine thread, a moment after its sync guard ends (R6.6). */
+    private fun scheduleSyncRecheck(key: RepairKey, delayMs: Long) {
+        if (!syncRechecks.add(key)) return
+        try {
+            worker.schedule({ post { syncRechecks.remove(key); recheckSync(key) } }, delayMs + SYNC_RECHECK_SLACK_MS, TimeUnit.MILLISECONDS)
+        } catch (t: Throwable) {
+            syncRechecks.remove(key)
+            SecuredLog.crash(Ev.RATCHET_SYNC, t)
+        }
+    }
+
+    /**
+     * Engine thread. A restored connection takes its normal step; any other connection is synced again only when the
+     * core still says it must (`required`, sending blocked).
+     */
+    private fun recheckSync(key: RepairKey) {
+        if (state != EngineState.RUNNING || ctrl == 0L) return
+        if (key in pendingMap()) return checkPending(key)
+        val r = send(infoCommand(key)) as? CoreReply.Result ?: return
+        val stats = connInfo(key, r)?.second ?: return
+        if (RestoreRepair.syncOnEvent(stats.ratchetSyncState, restoredContact = false) && RestoreRepair.syncAllowed(stats)) {
+            syncRatchet(key, "recheck")
+        }
+    }
+
+    /** A sync state change for any connection, from a contactRatchetSync or groupMemberRatchetSync event. */
+    private fun onRatchetSyncEvent(key: RepairKey, status: String) {
+        val restored = key in pendingMap()
+        if (restored) observeSync(key, status)
+        val synced = RestoreRepair.syncOnEvent(status, restored) && syncRatchet(key, "event_$status")
+        if (restored && !synced) checkPending(key)
+    }
+
+    /** A queue switch step for any connection, from a contactSwitch or groupMemberSwitch event. */
+    private fun onSwitchEvent(key: RepairKey, progress: String) {
+        if (!progress.endsWith(".completed")) return
+        SecuredLog.i(Ev.QUEUE_SWITCH, progress)
+        // The old queue is deleted on the server: a copy from before this switch would restore a dead address
+        // (8 Nov device test), so the server copy is refreshed. Coalesced with other switches.
+        requestUrgentBackup("switch", SWITCH_BACKUP_DELAY_MS)
+        if (progress == "rcv.completed" && key in pendingMap()) updatePending(key) { null }
+    }
+
+    /** The connection an incoming item came over: the contact, or the member who sent it in a group. */
+    private fun keyOfIncoming(item: CoreItem): RepairKey? = when {
+        item.chatId == SAVED_MESSAGES_CHAT_ID -> null
+        item.group -> {
+            val groupId = CoreJson.groupIdFromChatId(item.chatId)
+            val sender = item.sender
+            if (groupId != null && sender != null) RepairKey.member(groupId, sender.memberId) else null
+        }
+        else -> RepairKey.contact(item.chatId)
+    }
+
+    /** Events that matter for the backup and for repairing restored connections. Engine thread, RUNNING only. */
     private fun backupOnEvent(reply: CoreReply.Result) {
         when (reply.type) {
             "contactRatchetSync" -> {
                 val (contactId, status) = CoreJson.ratchetSyncEvent(reply.body) ?: return
-                val restored = contactId in pendingMap()
-                if (restored) observeSync(contactId, status)
-                val synced = RestoreRepair.syncOnEvent(status, restored) && syncRatchet(contactId, "event_$status")
-                if (restored && !synced) checkPending(contactId)
+                onRatchetSyncEvent(RepairKey.contact(contactId), status)
+            }
+            "groupMemberRatchetSync" -> {
+                val (groupId, memberId, status) = CoreJson.memberRatchetSyncEvent(reply.body) ?: return
+                onRatchetSyncEvent(RepairKey.member(groupId, memberId), status)
             }
             "contactSwitch" -> {
                 val (contactId, progress) = CoreJson.switchEvent(reply.body) ?: return
-                if (progress.endsWith(".completed")) {
-                    SecuredLog.i(Ev.QUEUE_SWITCH, progress)
-                    // The old queue is deleted on the server: a copy from before this switch would restore a dead
-                    // address (8 Nov device test), so the server copy is refreshed. Coalesced with other switches.
-                    requestUrgentBackup("switch", SWITCH_BACKUP_DELAY_MS)
-                    if (progress == "rcv.completed" && contactId in pendingMap()) updatePending(contactId) { null }
-                }
+                onSwitchEvent(RepairKey.contact(contactId), progress)
+            }
+            "groupMemberSwitch" -> {
+                val (groupId, memberId, progress) = CoreJson.memberSwitchEvent(reply.body) ?: return
+                onSwitchEvent(RepairKey.member(groupId, memberId), progress)
             }
             "contactConnected" -> {
                 markChanged()
                 requestUrgentBackup("contact", CONTACT_BACKUP_DELAY_MS)
             }
-            "contactSndReady" -> CoreJson.parseContact(reply.body.optJSONObject("contact"))?.contactId?.let { checkPending(it) }
+            // New member connections: their keys must be in the server copy too, like a new contact's.
+            "connectedToGroupMember", "userJoinedGroup", "joinedGroupMember" -> {
+                markChanged()
+                requestUrgentBackup("member", CONTACT_BACKUP_DELAY_MS)
+                if (reply.type == "connectedToGroupMember") {
+                    val groupId = reply.body.optJSONObject("groupInfo")?.optLong("groupId", 0L) ?: 0L
+                    val memberId = reply.body.optJSONObject("member")?.optLong("groupMemberId", 0L) ?: 0L
+                    if (groupId > 0 && memberId > 0) checkPending(RepairKey.member(groupId, memberId))
+                }
+            }
+            "contactSndReady" -> CoreJson.parseContact(reply.body.optJSONObject("contact"))?.contactId?.let { checkPending(RepairKey.contact(it)) }
             "newChatItems" -> {
                 val pending = pendingMap()
                 if (pending.isEmpty()) return
-                // A message from the contact proves only their direction (finding 1): look again, but it is no proof.
-                val heard = CoreJson.parseChatItems(reply.body).filter { it.isMessage && !it.outgoing && it.chatId in pending }.map { it.chatId }.toSet()
-                for (id in heard) {
-                    updatePending(id) { RestoreRepair.received(it) }
-                    checkPending(id)
+                // A message from the other side proves only their direction (finding 1): look again, but it is no proof.
+                val heard = CoreJson.parseChatItems(reply.body).filter { it.isMessage && !it.outgoing }
+                    .mapNotNull { keyOfIncoming(it) }.filter { it in pending }.toSet()
+                for (key in heard) {
+                    updatePending(key) { RestoreRepair.received(it) }
+                    checkPending(key)
                 }
             }
             "chatItemsStatusesUpdated" -> {
                 val pending = pendingMap()
                 if (pending.isEmpty()) return
                 val since = repairSince()
-                val delivered = CoreJson.parseChatItems(reply.body)
-                    .filter { it.outgoing && it.status == MessageStatus.DELIVERED && it.chatId in pending }
-                for (item in delivered) updatePending(item.chatId) { RestoreRepair.delivered(it, item.itemId, since) }
-                for (id in delivered.map { it.chatId }.toSet()) checkPending(id)
+                val delivered = CoreJson.parseChatItems(reply.body).filter { it.outgoing && it.status == MessageStatus.DELIVERED }
+                val touched = LinkedHashSet<RepairKey>()
+                for (item in delivered) {
+                    // In a group DELIVERED means every member sent a receipt (StatusMapper): proof for each of them.
+                    val keys = if (item.group) {
+                        val groupId = CoreJson.groupIdFromChatId(item.chatId)
+                        pending.keys.filter { it.isMember && it.groupId == groupId }
+                    } else {
+                        listOf(RepairKey.contact(item.chatId)).filter { it in pending }
+                    }
+                    for (key in keys) {
+                        updatePending(key) { RestoreRepair.delivered(it, item.itemId, since) }
+                        touched.add(key)
+                    }
+                }
+                for (key in touched) checkPending(key)
             }
-            // A decryption error merged into the last item arrives as an update, not as contactRatchetSync (Subscriber.hs:686-692).
+            // A decryption error merged into the last item arrives as an update, not as a ratchet sync event (Subscriber.hs:686-692).
             "chatItemUpdated" -> {
                 val pending = pendingMap()
                 if (pending.isEmpty()) return
                 val item = CoreJson.parseAChatItem(reply.body.optJSONObject("chatItem")) ?: return
-                if (item.chatId in pending && !item.isMessage) checkPending(item.chatId)
+                if (item.isMessage || item.outgoing) return
+                keyOfIncoming(item)?.takeIf { it in pending }?.let { checkPending(it) }
             }
         }
     }
@@ -1640,11 +2026,12 @@ internal class SimplexSecuredEngine(
     private fun reactOnEngine(chatId: Long, ids: List<Long>, action: ItemAction.React, callback: SecuredCallback<Unit>) {
         val id = ids.singleOrNull() ?: return err(callback, ErrorMapper.invalid("React to one message at a time."))
         if (!InputRules.reactionAllowed(action.emoji)) return refuse(callback, "react_unknown", ErrorMapper.CANT_REACT)
+        val ref = refOf(chatId) ?: return err(callback, ErrorMapper.chatGone())
         val item = itemOrErr(chatId, id, callback) ?: return
         if (item.deleted || !item.shared) return refuse(callback, "react_item", ErrorMapper.CANT_REACT)
         // No own-reaction check here: `/_get chat around=` returns the item itself WITHOUT reactions
         // (Store/Messages.hs getDirectChatAround' uses getDirectChatItem), so the core decides and we map its answer.
-        when (val r = send(Commands.reaction(chatId, id, action.add, action.emoji))) {
+        when (val r = send(Commands.reaction(ref, id, action.add, action.emoji))) {
             is CoreReply.Result -> {
                 if (r.type != "chatItemReaction") return err(callback, unexpected(r))
                 SecuredLog.i(Ev.ITEM_ACTION, if (action.add) "react_on" else "react_off")
@@ -1664,13 +2051,15 @@ internal class SimplexSecuredEngine(
     /** Between contacts and Saved Messages in any direction. Copies into notes are local; out of notes they are sent. */
     private fun forwardOnEngine(chatId: Long, ids: List<Long>, toChatId: Long, callback: SecuredCallback<Unit>) {
         if (chatCache[toChatId] == null) return err(callback, ErrorMapper.chatGone())
+        postRefusal(toChatId)?.let { return refuse(callback, "forward_group", it) }
         val from = refOf(chatId) ?: return err(callback, ErrorMapper.chatGone())
         val to = refOf(toChatId) ?: return err(callback, ErrorMapper.chatGone())
         when (val r = send(Commands.forward(to, from, ids))) {
             is CoreReply.Result -> {
                 if (r.type != "newChatItems") return err(callback, unexpected(r))
                 val items = CoreJson.parseChatItems(r.body).filter { it.chatId == toChatId }
-                val copies = items.filter { it.isMessage }.map { MessageMapper.toMessage(it) }
+                val role = roleIn(toChatId)
+                val copies = items.filter { it.isMessage }.map { MessageMapper.toMessage(it, role) }
                 if (copies.isEmpty()) return refuse(callback, "forward_none", "These messages can't be forwarded.")
                 SecuredLog.i(Ev.ITEM_ACTION, "forward", copies.size)
                 ok(callback, Unit)
@@ -1682,10 +2071,136 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    /** `/_settings` replaces all of ChatSettings: read the current one, change one field, send it all back. */
+    /**
+     * `/_settings` replaces all of ChatSettings: read the current one (the contact's, or the group's GroupInfo), change
+     * one field, send it all back.
+     */
     private fun updateChatSettings(chatId: Long, tag: String, callback: SecuredCallback<Unit>, edit: (JSONObject) -> Unit) {
-        val contact = contactOrErr(chatId, callback) ?: return
-        chatCommand(tag, Commands.chatSettings(chatId, CoreJson.chatSettingsUpdate(contact, edit)), "cmdOk", callback)
+        val ref = refOf(chatId) ?: return err(callback, ErrorMapper.chatGone())
+        val owner = (if (ref.isGroup) groupInfoOrErr(chatId, callback) else contactOrErr(chatId, callback)) ?: return
+        chatCommand(tag, Commands.chatSettings(ref, CoreJson.chatSettingsUpdate(owner, edit)), "cmdOk", callback)
+    }
+
+    /** The group's GroupInfo as stored now (for read-modify-write of its settings), or null after an error. */
+    private fun <T> groupInfoOrErr(chatId: Long, callback: SecuredCallback<T>): JSONObject? {
+        val ref = refOf(chatId) ?: run {
+            err(callback, ErrorMapper.chatGone())
+            return null
+        }
+        when (val r = send(Commands.getChat(ref, 1))) {
+            is CoreReply.Result -> {
+                if (r.type == "apiChat") CoreJson.groupInfoOfChat(r.body)?.let { return it }
+                err(callback, unexpected(r))
+            }
+            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        return null
+    }
+
+    /** Our role in a group chat as of the last chat list load; null for contacts and notes. */
+    private fun roleIn(chatId: Long): MemberRole? = if (isGroupChatId(chatId)) chatCache[chatId]?.myRole else null
+
+    /**
+     * Why we can't post to [chatId] right now, or null (contacts and notes: never refused here). Not joined yet, or an
+     * observer (a channel's subscriber). Other states (left, removed, still connecting) are left to the core's answer.
+     */
+    private fun postRefusal(chatId: Long): String? {
+        if (!isGroupChatId(chatId)) return null
+        val g = groupCache[chatId] ?: return null
+        return when {
+            g.invited -> ErrorMapper.NOT_JOINED
+            g.myRole < MemberRole.MEMBER -> ErrorMapper.ONLY_ADMINS_POST
+            else -> null
+        }
+    }
+
+    /**
+     * Delete for everyone in a group. Our own messages: a broadcast delete (`/_delete item #g ids broadcast`, 24 h
+     * limit, core :859-865). Someone else's: `/_delete member item #g ids` (:901-907), only as a moderator or higher
+     * and never for a sender of a higher role (:4079-4088); anything else is refused before anything is sent.
+     */
+    private fun deleteInGroupOnEngine(chatId: Long, ids: List<Long>, callback: SecuredCallback<Unit>) {
+        val groupId = CoreJson.groupIdFromChatId(chatId) ?: return err(callback, ErrorMapper.chatGone())
+        val ref = ChatRef.group(groupId)
+        val myRole = roleIn(chatId)
+        val own = ArrayList<Long>()
+        val others = ArrayList<Long>()
+        for (id in ids) {
+            val item = itemOrErr(chatId, id, callback) ?: return
+            if (item.outgoing) {
+                own.add(id)
+            } else {
+                val sender = item.sender
+                val allowed = item.shared && !item.deleted && sender != null && myRole != null &&
+                    myRole >= MemberRole.MODERATOR && myRole >= sender.role
+                if (!allowed) return refuse(callback, "moderate", ErrorMapper.CANT_MODERATE)
+                others.add(id)
+            }
+        }
+        val deletions = ArrayList<CoreDeletion>()
+        var failure: SecuredError? = null
+        if (own.isNotEmpty()) {
+            when (val r = send(Commands.deleteItems(ref, own, Commands.DeleteMode.BROADCAST))) {
+                is CoreReply.Result -> if (r.type == "chatItemsDeleted") deletions.addAll(CoreJson.parseDeletions(r.body)) else failure = unexpected(r)
+                is CoreReply.Error -> failure = ErrorMapper.fromCore(r.error, Op.DELETE)
+                CoreReply.Invalid -> failure = ErrorMapper.engine("invalid_reply")
+            }
+        }
+        if (others.isNotEmpty() && failure == null) {
+            when (val r = send(Commands.deleteMemberItems(groupId, others))) {
+                is CoreReply.Result -> if (r.type == "chatItemsDeleted") deletions.addAll(CoreJson.parseDeletions(r.body)) else failure = unexpected(r)
+                is CoreReply.Error -> failure = ErrorMapper.fromCore(r.error, Op.DELETE)
+                CoreReply.Invalid -> failure = ErrorMapper.engine("invalid_reply")
+            }
+        }
+        if (own.isNotEmpty()) SecuredLog.i(Ev.ITEM_ACTION, Commands.DeleteMode.BROADCAST.word, own.size)
+        if (others.isNotEmpty()) SecuredLog.i(Ev.ITEM_ACTION, "moderate", others.size)
+        val f = failure
+        if (f != null) err(callback, f) else ok(callback, Unit)
+        applyDeletions(deletions)
+    }
+
+    /**
+     * ChatAction.Delete on a group. Invited (declining), already left or removed, or the group is gone: delete it here
+     * (`/_delete #g`, allowed once we are not a current member, core :1339-1341). The owner with [forEveryone]: delete
+     * it for everyone. Anyone else, and the owner who chose "this phone only": leave first (the core would otherwise
+     * tell every member, since it deletes for everyone whenever an active owner deletes, :1348), then delete here.
+     */
+    private fun deleteGroupOnEngine(chatId: Long, forEveryone: Boolean, callback: SecuredCallback<Unit>) {
+        val g = groupCache[chatId] ?: return err(callback, ErrorMapper.chatGone())
+        val stillMember = !g.invited && g.myStatus !in GONE_STATUSES
+        val everyone = forEveryone && stillMember && g.myRole == MemberRole.OWNER
+        if (stillMember && !everyone) {
+            when (val r = send(Commands.leaveGroup(g.groupId))) {
+                is CoreReply.Result -> if (r.type != "leftMemberUser") return err(callback, unexpected(r))
+                is CoreReply.Error -> return err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+                CoreReply.Invalid -> return err(callback, ErrorMapper.engine("invalid_reply"))
+            }
+            SecuredLog.i(Ev.GROUP_ACTION, "leave")
+        }
+        val tag = when {
+            everyone -> "delete_everyone"
+            g.invited -> "decline"
+            else -> "delete_here"
+        }
+        when (val r = send(Commands.deleteGroup(g.groupId, everyone))) {
+            is CoreReply.Result -> {
+                if (r.type != "groupDeletedUser") {
+                    refreshChats(notify = true)
+                    return err(callback, unexpected(r))
+                }
+                SecuredLog.i(Ev.GROUP_ACTION, tag)
+                ok(callback, Unit)
+                refreshChats(notify = true)
+            }
+            is CoreReply.Error -> {
+                // After a leave the chat stays as "left": show that, then report.
+                refreshChats(notify = true)
+                err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+            }
+            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+        }
     }
 
     /** Local only: never sent. */
@@ -1746,9 +2261,13 @@ internal class SimplexSecuredEngine(
         return null
     }
 
-    /** The chat as the core names it: `*<noteFolderId>` for Saved Messages, `@<contactId>` otherwise. */
-    private fun refOf(chatId: Long): ChatRef? =
-        if (chatId == SAVED_MESSAGES_CHAT_ID) noteFolderId?.let { ChatRef.notes(it) } else ChatRef.contact(chatId)
+    /** The chat as the core names it: `*<noteFolderId>` for Saved Messages, `#<groupId>` for groups, `@<contactId>` otherwise. */
+    private fun refOf(chatId: Long): ChatRef? = when {
+        chatId == SAVED_MESSAGES_CHAT_ID -> noteFolderId?.let { ChatRef.notes(it) }
+        isGroupChatId(chatId) -> CoreJson.groupIdFromChatId(chatId)?.let { ChatRef.group(it) }
+        chatId > 0 -> ChatRef.contact(chatId)
+        else -> null
+    }
 
     /** A text note in Saved Messages: stored on this phone by the core, never sent to any relay. No replies. */
     private fun createNoteOnEngine(text: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) {
@@ -2155,6 +2674,7 @@ internal class SimplexSecuredEngine(
         chatCache.clear()
         lastItemIds.clear()
         timedChats.clear()
+        groupCache.clear()
         noteFolderId = null
         publishChats()
         setState(EngineState.NOT_STARTED)
@@ -2244,9 +2764,10 @@ internal class SimplexSecuredEngine(
                 "newChatItems" -> {
                     val items = CoreJson.parseChatItems(reply.body)
                     applyNewItems(items)
-                    // Notes are always ours (outgoing) and never notify; the chat id check keeps it that way.
-                    val incoming = items.filter { it.isMessage && !it.outgoing && it.chatId != SAVED_MESSAGES_CHAT_ID }
-                        .map { MessageMapper.toMessage(it) }
+                    // Incoming messages, and service rows in either direction ("You left" comes from our own command
+                    // as an event). Notes are always ours (outgoing) and never notify; the chat id check keeps it so.
+                    val incoming = items.filter { it.chatId != SAVED_MESSAGES_CHAT_ID && ((it.isMessage && !it.outgoing) || it.event != null) }
+                        .map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
                     if (incoming.isNotEmpty()) main.post { for (m in incoming) for (l in listeners) l.onMessageReceived(m) }
                 }
                 "chatItemsStatusesUpdated" -> {
@@ -2284,16 +2805,26 @@ internal class SimplexSecuredEngine(
         val r = send(Commands.getChats(userId))
         if (r !is CoreReply.Result || r.type != "apiChats") return
         val chats = CoreJson.parseChats(r.body)
-        if (!archive.retainOnly(chats.mapTo(HashSet()) { it.contact.contactId })) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "prune")
+        val groups = CoreJson.parseGroupChats(r.body)
+        // Group chat ids are kept too: pruning only by contact ids would un-archive every group.
+        val known = chats.mapTo(HashSet()) { it.contact.contactId }.apply { groups.mapTo(this) { it.group.chatId } }
+        if (!archive.retainOnly(known)) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "prune")
         chatCache.clear()
         lastItemIds.clear()
         timedChats.clear()
+        groupCache.clear()
         for (chat in chats) {
             val c = chat.contact
             if (c.isContactCard || c.removed) continue
             chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId))
             chat.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
+        }
+        for (chat in groups) {
+            val id = chat.group.chatId
+            groupCache[id] = chat.group
+            chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
+            chat.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[id] = it.itemId }
         }
         // Saved Messages: the user's note folder (the core creates one with every user).
         val notes = CoreJson.parseNoteChat(r.body)
@@ -2350,9 +2881,9 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    /** An edited (or otherwise updated) message: tell the UI; reload the list when it is a row's last message. */
+    /** An edited (or otherwise updated) message or service row: tell the UI; reload the list when it is a row's last message. */
     private fun applyItemUpdated(item: CoreItem) {
-        if (!item.isMessage) return
+        if (!item.shown) return
         emitChanged(listOf(item))
         if (lastItemIds[item.chatId] == item.itemId) refreshChats(notify = true)
     }
@@ -2364,8 +2895,9 @@ internal class SimplexSecuredEngine(
         val removed = LinkedHashMap<Long, MutableList<Long>>()
         val marked = ArrayList<CoreItem>()
         for (d in deletions) {
+            // A message only marked deleted, or replaced by a "deleted by admin" row, changes in place.
             val now = d.replacement
-            if (now == null || !now.isMessage) removed.getOrPut(d.chatId) { ArrayList() }.add(d.itemId) else marked.add(now)
+            if (now == null || !now.shown) removed.getOrPut(d.chatId) { ArrayList() }.add(d.itemId) else marked.add(now)
         }
         if (removed.isNotEmpty()) {
             val gone = removed.mapValues { it.value.toList() }
@@ -2376,7 +2908,7 @@ internal class SimplexSecuredEngine(
     }
 
     private fun emitChanged(items: List<CoreItem>) {
-        val messages = items.filter { it.isMessage }.map { MessageMapper.toMessage(it) }
+        val messages = items.filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
         if (messages.isEmpty()) return
         markChanged()
         main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
@@ -2515,11 +3047,25 @@ internal class SimplexSecuredEngine(
         const val SWITCH_BACKUP_DELAY_MS = 30_000L
         /** ...but never later than this after the first request of the burst. */
         const val MAX_COALESCE_MS = 5L * 60 * 1000
-        /** Wait before another HEAD for the tag of a fresh upload; longer after a 429 (nginx refills one request per 10 s). */
-        const val TAG_RETRY_MS = 2_000L
-        const val TAG_BUSY_RETRY_MS = 11_000L
-        /** Automatic ratchet re-sync at most this often per contact. */
+        /**
+         * A busy server (429/503) gets one more try after this long, without counting a failure (R6.7); nginx refills
+         * one request per 10 s.
+         */
+        const val BUSY_RETRY_MS = 15_000L
+        /** How long findBackup's download is kept for the restore that follows (sealed bytes only). */
+        const val FOUND_CACHE_MS = 10L * 60 * 1000
+        /** A restored phone's upload counter starts this far above the restored copy's (R6.2 part B). */
+        const val RESTORE_COUNTER_STEP = 1_000_000L
+        /** Automatic ratchet re-sync at most this often per connection. */
         const val AUTO_SYNC_GAP_MS = 10L * 60 * 1000
+        /** A guard re-check runs this long after the guard ends (R6.6). */
+        const val SYNC_RECHECK_SLACK_MS = 2_000L
+        /**
+         * `/_info` errors that mean the connection is gone for good: contacts (errorStore contactNotFound, error
+         * contactNotActive) and members (StoreError groupMemberNotFound / groupNotFound, Store/Shared.hs:98-101; error
+         * groupMemberNotActive / groupMemberNotFound, Controller.hs:1473-1476).
+         */
+        val GONE_CONNECTION_ERRORS = setOf("contactNotFound", "contactNotActive", "groupMemberNotFound", "groupMemberNotActive", "groupNotFound")
 
         /** The unreachable SOCKS proxy for the first-run lock (port 9 is privileged: no app can listen on it). */
         const val LOCK_SOCKS_ADDR = "127.0.0.1:9"
@@ -2529,11 +3075,21 @@ internal class SimplexSecuredEngine(
          */
         const val NETWORK_LOCKED = "/network socks=$LOCK_SOCKS_ADDR socks-mode=always smp-proxy=unknown smp-proxy-fallback=no"
 
-        /** Events after which the chat list is reloaded from the engine. */
+        /**
+         * Events after which the chat list is reloaded from the engine. Groups (Controller.hs:939-1000): an invitation,
+         * joins and connections (member counts, our status), roles, removals, leaves, deletes and profile changes.
+         */
         val CHAT_LIST_EVENTS = setOf(
             "contactConnecting", "contactConnected", "contactSndReady", "contactUpdated", "contactDeletedByContact",
             "contactAnotherClient", "contactDisabled", "contactRatchetSync", "acceptingContactRequest",
             "chatInfoUpdated", "chatCleared",
+            "receivedGroupInvitation", "userJoinedGroup", "joinedGroupMember", "joinedGroupMemberConnecting",
+            "connectedToGroupMember", "memberAcceptedByOther", "acceptingGroupJoinRequestMember", "memberRole",
+            "memberBlockedForAll", "deletedMember", "deletedMemberUser", "leftMember", "groupDeleted", "groupUpdated",
+            "groupMemberUpdated", "groupLinkConnecting",
         )
+
+        /** Our membership is over (Types.hs:1442-1447 memberRemoved): we can't leave, post or be repaired any more. */
+        val GONE_STATUSES = setOf("left", "removed", "rejected", "deleted")
     }
 }

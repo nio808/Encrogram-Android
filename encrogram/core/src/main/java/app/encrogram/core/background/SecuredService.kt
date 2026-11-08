@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.ServiceCompat
+import app.encrogram.core.api.GroupEvent
 import app.encrogram.core.api.SecuredEngine
 import app.encrogram.core.api.SecuredListener
 import app.encrogram.core.api.SecuredMessage
@@ -65,6 +66,10 @@ class SecuredService : Service() {
 
     private fun onIncoming(message: SecuredMessage, e: SecuredEngine) {
         if (message.outgoing) return
+        // Messages, in 1:1 chats and groups alike. Of the service rows only an invitation to a group notifies;
+        // "X joined" and the like don't. Same hidden text either way (NotificationText).
+        val event = message.event
+        if (event != null && event.kind != GroupEvent.Kind.INVITED) return
         val config = SecuredBackground.config ?: return
         if (SecuredBackground.isChatOnScreen(message.chatId)) return
         if (e.chats().firstOrNull { it.chatId == message.chatId }?.muted == true) return

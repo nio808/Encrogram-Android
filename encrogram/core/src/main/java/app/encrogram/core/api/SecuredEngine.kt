@@ -181,7 +181,13 @@ data class GroupMember @JvmOverloads constructor(
 )
 
 /** A service row. [memberName] is who it is about (null when it is you or the group itself). */
-data class GroupEvent(val kind: Kind, val memberName: String? = null, val role: MemberRole? = null) {
+/** [groupName]: for [Kind.INVITED] rows in a 1:1 chat, the group you were invited to (else null). */
+data class GroupEvent @JvmOverloads constructor(
+    val kind: Kind,
+    val memberName: String? = null,
+    val role: MemberRole? = null,
+    val groupName: String? = null,
+) {
     enum class Kind { CREATED, INVITED, JOINED, LEFT, REMOVED, YOU_REMOVED, ROLE_CHANGED, GROUP_DELETED, GROUP_UPDATED, DELETED_BY_ADMIN }
 }
 
@@ -268,6 +274,8 @@ data class ChatSummary @JvmOverloads constructor(
     val lastMessageSender: String? = null,
     /** Groups: you were invited and have not joined yet ([SecuredEngine.joinGroup] or delete to decline). */
     val invited: Boolean = false,
+    /** Set when the newest item is a service row ("Ann joined"): the UI words it as the preview; [lastMessageText] is then null. */
+    val lastEvent: GroupEvent? = null,
 )
 
 data class SecuredMessage @JvmOverloads constructor(

@@ -1,9 +1,14 @@
 package app.encrogram.core.internal
 
+import app.encrogram.core.api.GROUP_CHAT_ID_BASE
+import app.encrogram.core.api.GroupEvent
+import app.encrogram.core.api.MemberRole
+import app.encrogram.core.api.MemberStatus
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.ReactionCount
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SECURED_REACTIONS
+import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.backup.RestoreRepair
 import org.json.JSONException
 import org.json.JSONObject
@@ -91,6 +96,55 @@ internal data class CoreItem(
      * status DELIVERED, never unread: it was stored on this phone and never sent.
      */
     val local: Boolean = false,
+    /** Groups: the member who sent an incoming item (chatDir groupRcv); null for our own items, 1:1 and notes. */
+    val sender: CoreSender? = null,
+    /** A service row we show ("X joined", "deleted by admin"); null for messages and for service items we skip. */
+    val event: GroupEvent? = null,
+) {
+    /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
+    val group: Boolean get() = isGroupChatId(chatId)
+
+    /** Shown in a chat: a message or a service row we know. Every other service item is skipped, never shown raw. */
+    val shown: Boolean get() = isMessage || event != null
+}
+
+/** chatDir groupRcv's member (Messages.hs:308-313): the core's groupMemberId, the name we show and the current role. */
+internal data class CoreSender(val memberId: Long, val displayName: String, val role: MemberRole)
+
+/**
+ * A group as the chat list needs it (GroupInfo, Types.hs:477-503). [myStatus] is membership.memberStatus as the core
+ * writes it (Types.hs:1460-1493: "invited", "accepted", "connected", "complete", "creator", "left", ...).
+ */
+internal data class CoreGroup(
+    val groupId: Long,
+    val displayName: String,
+    val myRole: MemberRole,
+    val myStatus: String,
+    /** groupSummary.currentMembers: current members including us (Store/Groups.hs:450 starts it at 1). */
+    val memberCount: Int,
+    val favorite: Boolean = false,
+    val muted: Boolean = false,
+    /** Our channel marker ([CoreJson.isChannel]). */
+    val channel: Boolean = false,
+    val activityTimeMs: Long = 0,
+) {
+    val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
+    val invited: Boolean get() = myStatus == "invited"
+}
+
+internal data class CoreGroupChat(val group: CoreGroup, val lastItem: CoreItem?, val unreadCount: Int)
+
+/** One entry of `/_members` (GroupMember, Types.hs:1114-1148), or our own membership ([isMe]). */
+internal data class CoreMember(
+    val groupMemberId: Long,
+    val displayName: String,
+    val role: MemberRole,
+    val status: MemberStatus,
+    val isMe: Boolean,
+    /** memberContactId: the contact this member is linked to on our side, if any (never set for [isMe]). */
+    val memberContactId: Long?,
+    /** memberStatus connected or complete: the member's own connection works (the restore repair needs it). */
+    val active: Boolean = false,
 )
 
 /** SimpleX's local note folder (ChatInfo `local`, NoteFolder in Types.hs): Saved Messages. */
@@ -253,6 +307,9 @@ internal object CoreJson {
         return info.optJSONObject("contact")
     }
 
+    /** The raw GroupInfo of a group's `apiChat` body (for read-modify-write of its ChatSettings). */
+    fun groupInfoOfChat(body: JSONObject): JSONObject? = groupInfoOf(body.optJSONObject("chat")?.optJSONObject("chatInfo"))
+
     /**
      * The contact's whole ChatSettings {enableNtfs, sendRcpts?, favorite} with [edit] applied, for `/_settings`.
      * The core replaces all of it, so every field we don't change is copied from the current one.
@@ -329,19 +386,48 @@ internal object CoreJson {
 
     /**
      * Our chat id for a ChatInfo: the contact id for a direct chat, [SAVED_MESSAGES_CHAT_ID] for the note folder,
-     * null for everything else (groups, requests, pending connections).
+     * [GROUP_CHAT_ID_BASE] + groupId for a group ([groupIdOf]), null for everything else (requests, pending
+     * connections, member-support scopes, relay channels).
      */
     fun chatIdOf(chatInfo: JSONObject?): Long? =
         directContact(chatInfo)?.contactId ?: noteFolder(chatInfo)?.let { SAVED_MESSAGES_CHAT_ID }
+            ?: groupIdOf(chatInfo)?.let { groupChatId(it) }
 
-    /** An AChatItem `{chatInfo, chatItem}` in a direct chat or the note folder (chat id -1), else null. */
-    fun parseAChatItem(aChatItem: JSONObject?): CoreItem? {
-        if (aChatItem == null) return null
-        val chatId = chatIdOf(aChatItem.optJSONObject("chatInfo")) ?: return null
-        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"))
+    fun groupChatId(groupId: Long): Long = GROUP_CHAT_ID_BASE + groupId
+
+    /** The core's groupId behind one of our group chat ids, or null for any other chat id. */
+    fun groupIdFromChatId(chatId: Long): Long? = if (isGroupChatId(chatId)) (chatId - GROUP_CHAT_ID_BASE).takeIf { it > 0 } else null
+
+    /**
+     * The groupId of a group ChatInfo `{type: "group", groupInfo, groupChatScope?}` (Messages.hs:204-206), else null.
+     * A member-support scope (knocking, `groupChatScope` set) is not the group's main chat. A relay channel
+     * (`useRelays`, Types.hs:479) is not something Encrogram creates or joins: never shown (fail closed).
+     */
+    fun groupIdOf(chatInfo: JSONObject?): Long? {
+        if (chatInfo == null || tagOf(chatInfo) != "group") return null
+        if (present(chatInfo, "groupChatScope")) return null
+        val g = chatInfo.optJSONObject("groupInfo") ?: return null
+        if (g.optBoolean("useRelays", false)) return null
+        return g.optLong("groupId", 0L).takeIf { it > 0 }
     }
 
-    fun parseChatItem(chatId: Long, item: JSONObject?): CoreItem? {
+    /** The GroupInfo of a group ChatInfo that [groupIdOf] accepts. */
+    fun groupInfoOf(chatInfo: JSONObject?): JSONObject? =
+        if (groupIdOf(chatInfo) != null) chatInfo?.optJSONObject("groupInfo") else null
+
+    /** The display name of a direct ChatInfo's contact (for "Bob was invited" in our chat with Bob), else null. */
+    private fun peerNameOf(chatInfo: JSONObject?): String? = directContact(chatInfo)?.displayName?.ifEmpty { null }
+
+    /** An AChatItem `{chatInfo, chatItem}` in a direct chat, a group or the note folder (chat id -1), else null. */
+    fun parseAChatItem(aChatItem: JSONObject?): CoreItem? {
+        if (aChatItem == null) return null
+        val info = aChatItem.optJSONObject("chatInfo")
+        val chatId = chatIdOf(info) ?: return null
+        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info))
+    }
+
+    /** [peerName]: the contact's name in a direct chat, used only for our own sent invitation row. */
+    fun parseChatItem(chatId: Long, item: JSONObject?, peerName: String? = null): CoreItem? {
         if (item == null) return null
         val meta = item.optJSONObject("meta") ?: return null
         if (!meta.has("itemId")) return null
@@ -355,15 +441,24 @@ internal object CoreJson {
             "directRcv", "groupRcv", "channelRcv", "localRcv" -> local
             else -> local || contentType?.startsWith("snd") == true
         }
+        val group = isGroupChatId(chatId)
+        val sender = if (group && dir == "groupRcv") parseSender(item.optJSONObject("chatDir")?.optJSONObject("groupMember")) else null
+        // Deleted by a moderator: a "moderated" placeholder (fullDelete on, Store/Messages.hs:2833-2850) or a marked
+        // item (fullDelete off, itemDeleted {type: moderated}, Messages.hs:1291-1295). Shown as a service row only.
+        val moderated = contentType == "rcvModerated" || contentType == "sndModerated" ||
+            tagOf(meta.opt("itemDeleted")) == "moderated"
         // sndDeleted/rcvDeleted: legacy deleted items (before meta.itemDeleted existed). Shown as deleted messages.
         val legacyDeleted = contentType == "sndDeleted" || contentType == "rcvDeleted"
-        val isMessage = contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted
-        val deleted = legacyDeleted || present(meta, "itemDeleted")
+        val isMessage = !moderated && (contentType == "sndMsgContent" || contentType == "rcvMsgContent" || legacyDeleted)
+        val deleted = moderated || legacyDeleted || present(meta, "itemDeleted")
+        val event = if (moderated) GroupEvent(GroupEvent.Kind.DELETED_BY_ADMIN, sender?.displayName) else serviceEvent(content, contentType, sender, peerName)
         val msgContent = content?.optJSONObject("msgContent")
         val msgText = msgContent?.str("text").orEmpty()
         // A deleted message never carries its old text: the core keeps it in the JSON when it only marks it.
-        val text = if (deleted) "" else msgText.ifEmpty { meta.str("itemText").orEmpty() }
-        val statusTag = tagOf(meta.opt("itemStatus"))
+        // A service row carries no text at all: the UI words it from [event].
+        val text = if (deleted || !isMessage) "" else msgText.ifEmpty { meta.str("itemText").orEmpty() }
+        val status = meta.optJSONObject("itemStatus")
+        val statusTag = tagOf(status)
         val timed = meta.optJSONObject("itemTimed")
         val expiresAt = timeMs(timed?.str("deleteAt")).takeIf { it > 0 }
         return CoreItem(
@@ -374,7 +469,7 @@ internal object CoreJson {
             text = text,
             timeMs = timeMs(meta.str("itemTs")),
             statusTag = statusTag,
-            status = if (local) MessageStatus.DELIVERED else StatusMapper.map(statusTag, outgoing),
+            status = if (local) MessageStatus.DELIVERED else StatusMapper.map(statusTag, outgoing, status?.str("sndProgress"), group),
             unread = !local && !outgoing && statusTag == "rcvNew",
             msgContentType = tagOf(msgContent),
             quote = if (deleted) null else parseQuote(item.optJSONObject("quotedItem")),
@@ -384,10 +479,270 @@ internal object CoreJson {
             deletable = !deleted && meta.optBoolean("deletable", false),
             shared = meta.str("itemSharedMsgId") != null,
             forwarded = present(meta, "itemForwarded"),
-            reactions = if (deleted || local) emptyList() else parseReactions(item),
+            reactions = if (deleted || local || !isMessage) emptyList() else parseReactions(item),
             expiresAtMs = expiresAt,
             local = local,
+            sender = sender,
+            event = event,
         )
+    }
+
+    // ---- groups ----------------------------------------------------------------------------------------------------
+
+    /**
+     * The service rows we show, from CIContent's API JSON (Messages/CIContent.hs:479-511; events in
+     * Messages/CIContent/Events.hs:15-47, tagged by constructor minus RGE/SGE). Anything else (feature items, the
+     * chat banner, E2EE info of a member, profile updates, blocks, signature warnings) is null and the row is skipped.
+     * A row about a member always names them; without a name it is skipped rather than worded as if it were about us.
+     */
+    private fun serviceEvent(content: JSONObject?, contentType: String?, sender: CoreSender?, peerName: String?): GroupEvent? {
+        if (content == null) return null
+        return when (contentType) {
+            "rcvGroupEvent" -> rcvGroupEvent(content.optJSONObject("rcvGroupEvent"), sender)
+            "sndGroupEvent" -> sndGroupEvent(content.optJSONObject("sndGroupEvent"))
+            // In the inviting contact's 1:1 chat: "You were invited" (CIRcvGroupInvitation, CIContent.hs:152).
+            "rcvGroupInvitation" -> GroupEvent(GroupEvent.Kind.INVITED)
+            // In our 1:1 chat with the person we invited: "Bob was invited".
+            "sndGroupInvitation" -> peerName?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
+            // Created with every new group (Commands.hs:4182-4187 createNewGroupItems; CIContent.hs:172).
+            "sndGroupE2EEInfo" -> GroupEvent(GroupEvent.Kind.CREATED)
+            else -> null
+        }
+    }
+
+    private fun rcvGroupEvent(e: JSONObject?, sender: CoreSender?): GroupEvent? {
+        if (e == null) return null
+        val about = profileName(e)
+        return when (tagOf(e)) {
+            "memberAdded" -> about?.let { GroupEvent(GroupEvent.Kind.INVITED, it) }
+            // The member the item is from finished connecting ("X joined").
+            "memberConnected" -> sender?.let { GroupEvent(GroupEvent.Kind.JOINED, it.displayName) }
+            "memberAccepted" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
+            "userAccepted" -> GroupEvent(GroupEvent.Kind.JOINED)
+            "memberLeft" -> sender?.let { GroupEvent(GroupEvent.Kind.LEFT, it.displayName) }
+            "memberRole" -> about?.let { GroupEvent(GroupEvent.Kind.ROLE_CHANGED, it, memberRole(e.str("role"))) }
+            "userRole" -> GroupEvent(GroupEvent.Kind.ROLE_CHANGED, null, memberRole(e.str("role")))
+            "memberDeleted" -> GroupEvent(GroupEvent.Kind.REMOVED, about)
+            "userDeleted" -> GroupEvent(GroupEvent.Kind.YOU_REMOVED)
+            "groupDeleted" -> GroupEvent(GroupEvent.Kind.GROUP_DELETED)
+            "groupUpdated" -> GroupEvent(GroupEvent.Kind.GROUP_UPDATED)
+            // Made on our side when we invite someone through a link (Events.hs:28-31), attributed to them.
+            "invitedViaGroupLink" -> sender?.let { GroupEvent(GroupEvent.Kind.INVITED, it.displayName) }
+            else -> null
+        }
+    }
+
+    private fun sndGroupEvent(e: JSONObject?): GroupEvent? {
+        if (e == null) return null
+        val about = profileName(e)
+        return when (tagOf(e)) {
+            "memberRole" -> about?.let { GroupEvent(GroupEvent.Kind.ROLE_CHANGED, it, memberRole(e.str("role"))) }
+            "userRole" -> GroupEvent(GroupEvent.Kind.ROLE_CHANGED, null, memberRole(e.str("role")))
+            "memberDeleted" -> GroupEvent(GroupEvent.Kind.REMOVED, about)
+            "userLeft" -> GroupEvent(GroupEvent.Kind.LEFT)
+            "groupUpdated" -> GroupEvent(GroupEvent.Kind.GROUP_UPDATED)
+            "memberAccepted" -> about?.let { GroupEvent(GroupEvent.Kind.JOINED, it) }
+            else -> null
+        }
+    }
+
+    /** `profile.displayName` of an event about a member (Profile, not LocalProfile: no alias). */
+    private fun profileName(e: JSONObject): String? = e.optJSONObject("profile")?.str("displayName")?.ifEmpty { null }
+
+    /** GroupMemberRole (Types/Shared.hs:19-28, text values :34-52). relay, author and newer roles map down, never up. */
+    fun memberRole(s: String?): MemberRole = when (s) {
+        "owner" -> MemberRole.OWNER
+        "admin" -> MemberRole.ADMIN
+        "moderator" -> MemberRole.MODERATOR
+        "member", "author" -> MemberRole.MEMBER
+        else -> MemberRole.OBSERVER
+    }
+
+    /** The core's role word for [role] (Commands.hs:5914-5921 memberRole parser). */
+    fun roleWord(role: MemberRole): String = when (role) {
+        MemberRole.OWNER -> "owner"
+        MemberRole.ADMIN -> "admin"
+        MemberRole.MODERATOR -> "moderator"
+        MemberRole.MEMBER -> "member"
+        MemberRole.OBSERVER -> "observer"
+    }
+
+    /**
+     * GroupMemberStatus text (Types.hs:1460-1493) -> what we show. Null for `unknown` (a member known only from
+     * forwarded history, not really in the group) and for statuses newer than this reader.
+     */
+    fun memberStatus(s: String?): MemberStatus? = when (s) {
+        "invited" -> MemberStatus.INVITED
+        "pending_approval", "pending_review", "introduced", "intro-inv", "accepted", "announced" -> MemberStatus.CONNECTING
+        "connected", "complete", "creator" -> MemberStatus.CONNECTED
+        "left" -> MemberStatus.LEFT
+        "removed", "rejected", "deleted" -> MemberStatus.REMOVED
+        else -> null
+    }
+
+    /** We can post: member or higher and an active member (Commands.hs:4063-4068 assertUserGroupRole, :783 GRAuthor). */
+    fun canPost(g: CoreGroup): Boolean = g.myRole >= MemberRole.MEMBER && g.myStatus in POSTING_STATUSES
+
+    /** Still connecting to the group: accepted an invitation or joined, not yet connected (memberActive, Types.hs:1391-1407). */
+    fun groupConnecting(g: CoreGroup): Boolean = g.myStatus in CONNECTING_STATUSES
+
+    private val POSTING_STATUSES = setOf("connected", "complete", "creator")
+    private val CONNECTING_STATUSES = setOf("accepted", "announced", "introduced", "intro-inv", "pending_approval", "pending_review")
+
+    /**
+     * The group preference that marks an Encrogram channel: `comments` on. Upstream reserves `comments` for relay
+     * channels; in core 7.0.0.12 nothing reads it (only Types/Preferences.hs defines it), no client shows it
+     * (allGroupFeatures leaves it out, Preferences.hs:240-255, so the core makes no feature item for it), and it travels
+     * with the group profile to every member (GroupInvitation.groupProfile, Commands.hs:4189-4200) and survives profile
+     * edits by any client (FullGroupPreferences keeps it). Re-check at every core upgrade.
+     */
+    const val CHANNEL_MARKER_PREF = "comments"
+
+    /** True when [groupInfo] carries our channel marker (the profile's own preferences first, then the merged ones). */
+    fun isChannel(groupInfo: JSONObject): Boolean {
+        val own = groupInfo.optJSONObject("groupProfile")?.optJSONObject("groupPreferences")?.optJSONObject(CHANNEL_MARKER_PREF)
+        val pref = own ?: groupInfo.optJSONObject("fullGroupPreferences")?.optJSONObject(CHANNEL_MARKER_PREF)
+        return pref?.str("enable") == "on"
+    }
+
+    /**
+     * The GroupProfile for `/_group` (Types.hs:865-875): name, empty fullName (required), and GroupPreferences
+     * (Preferences.hs:360-376, GroupFeatureEnabled "on"/"off", Preferences.hs:987-995): `history` on (new members get
+     * up to 100 earlier messages, Library/Internal.hs:1316-1329), `fullDelete` on, and for a channel our marker
+     * [CHANNEL_MARKER_PREF]. "Only admins post" itself is the role gate: channel members join as observers.
+     */
+    fun newGroupProfile(name: String, channel: Boolean): JSONObject {
+        val prefs = JSONObject()
+            .put("history", JSONObject().put("enable", "on"))
+            .put("fullDelete", JSONObject().put("enable", "on"))
+        if (channel) prefs.put(CHANNEL_MARKER_PREF, JSONObject().put("enable", "on"))
+        return JSONObject().put("displayName", name).put("fullName", "").put("groupPreferences", prefs)
+    }
+
+    /** GroupInfo -> [CoreGroup]; null without a groupId or for a relay channel. */
+    fun parseGroup(g: JSONObject?): CoreGroup? {
+        if (g == null || g.optBoolean("useRelays", false)) return null
+        val groupId = g.optLong("groupId", 0L).takeIf { it > 0 } ?: return null
+        val profile = g.optJSONObject("groupProfile")
+        val name = g.str("localAlias").orEmpty().ifEmpty { profile?.str("displayName").orEmpty() }
+            .ifEmpty { g.str("localDisplayName").orEmpty() }
+        val membership = g.optJSONObject("membership")
+        val settings = g.optJSONObject("chatSettings")
+        val ntfs = tagOf(settings?.opt("enableNtfs"))
+        val ts = timeMs(g.str("chatTs")).takeIf { it > 0 }
+            ?: timeMs(g.str("updatedAt")).takeIf { it > 0 }
+            ?: timeMs(g.str("createdAt"))
+        return CoreGroup(
+            groupId = groupId,
+            displayName = name,
+            myRole = memberRole(membership?.str("memberRole")),
+            myStatus = membership?.str("memberStatus").orEmpty(),
+            memberCount = g.optJSONObject("groupSummary")?.optLong("currentMembers", 0L)?.coerceIn(0L, Int.MAX_VALUE.toLong())?.toInt() ?: 0,
+            favorite = settings?.optBoolean("favorite", false) ?: false,
+            muted = ntfs != null && ntfs != "all",
+            channel = isChannel(g),
+            activityTimeMs = ts,
+        )
+    }
+
+    /** chatDir groupRcv's GroupMember -> the sender we show. */
+    fun parseSender(m: JSONObject?): CoreSender? {
+        if (m == null || !present(m, "groupMemberId")) return null
+        return CoreSender(m.optLong("groupMemberId"), memberName(m), memberRole(m.str("memberRole")))
+    }
+
+    /** A member's name as we show it: our local alias, else their profile name, else the core's local name. */
+    private fun memberName(m: JSONObject): String {
+        val p = m.optJSONObject("memberProfile")
+        return p?.str("localAlias").orEmpty().ifEmpty { p?.str("displayName").orEmpty() }
+            .ifEmpty { m.str("localDisplayName").orEmpty() }
+    }
+
+    /** One GroupMember; null for relays, `unknown` members and statuses newer than this reader. */
+    fun parseMember(m: JSONObject?, isMe: Boolean): CoreMember? {
+        if (m == null || !present(m, "groupMemberId")) return null
+        val roleWord = m.str("memberRole")
+        if (roleWord == "relay") return null
+        val statusWord = m.str("memberStatus")
+        val status = memberStatus(statusWord) ?: return null
+        val contactId = if (!isMe && present(m, "memberContactId")) m.optLong("memberContactId").takeIf { it > 0 } else null
+        return CoreMember(
+            groupMemberId = m.optLong("groupMemberId"),
+            displayName = memberName(m),
+            role = memberRole(roleWord),
+            status = status,
+            isMe = isMe,
+            memberContactId = contactId,
+            active = statusWord == "connected" || statusWord == "complete",
+        )
+    }
+
+    /** `groupMembers` body {group: {groupInfo, members}} (Controller.hs:822, Types.hs:456): us first, then the others. */
+    fun parseMembers(body: JSONObject): List<CoreMember> {
+        val group = body.optJSONObject("group") ?: return emptyList()
+        val out = ArrayList<CoreMember>()
+        // The core's list leaves us out (Store/Groups.hs:1230-1237): our membership comes from groupInfo.
+        parseMember(group.optJSONObject("groupInfo")?.optJSONObject("membership"), isMe = true)?.let { out.add(it) }
+        group.optJSONArray("members").forEachObject { m -> parseMember(m, isMe = false)?.let { out.add(it) } }
+        return out
+    }
+
+    /** `groupCreated` body {groupInfo} (Controller.hs:815) -> the new groupId. */
+    fun createdGroupId(body: JSONObject): Long? = body.optJSONObject("groupInfo")?.optLong("groupId", 0L)?.takeIf { it > 0 }
+
+    /** `apiChats` body -> group chats (not relay channels, not support scopes), each with its newest item. */
+    fun parseGroupChats(body: JSONObject): List<CoreGroupChat> {
+        val arr = body.optJSONArray("chats") ?: return emptyList()
+        val out = ArrayList<CoreGroupChat>()
+        for (i in 0 until arr.length()) {
+            val chat = arr.optJSONObject(i) ?: continue
+            val info = groupInfoOf(chat.optJSONObject("chatInfo")) ?: continue
+            val group = parseGroup(info) ?: continue
+            val items = chat.optJSONArray("chatItems")
+            var last: CoreItem? = null
+            if (items != null) {
+                for (j in 0 until items.length()) {
+                    val it = parseChatItem(group.chatId, items.optJSONObject(j)) ?: continue
+                    if (last == null || it.itemId > last.itemId) last = it
+                }
+            }
+            val unread = chat.optJSONObject("chatStats")?.optInt("unreadCount", 0) ?: 0
+            out.add(CoreGroupChat(group, last, unread))
+        }
+        return out
+    }
+
+    /**
+     * `groupMemberInfo` body {groupInfo, member, connectionStats_?} (Controller.hs:790) -> (member connected, stats).
+     * Stats are absent for a member without an active connection.
+     */
+    fun memberInfoStats(body: JSONObject): Pair<Boolean, RestoreRepair.ConnStats?> {
+        val stats = body.optJSONObject("connectionStats_") ?: body.optJSONObject("connectionStats")
+        val status = body.optJSONObject("member")?.str("memberStatus")
+        return (status == "connected" || status == "complete") to connectionStats(stats)
+    }
+
+    /** (groupId, groupMemberId) of a `{groupInfo, member, ...}` body, or null. */
+    private fun memberKeyOf(body: JSONObject): Pair<Long, Long>? {
+        val groupId = body.optJSONObject("groupInfo")?.optLong("groupId", 0L)?.takeIf { it > 0 } ?: return null
+        val memberId = body.optJSONObject("member")?.optLong("groupMemberId", 0L)?.takeIf { it > 0 } ?: return null
+        return groupId to memberId
+    }
+
+    /** `groupMemberRatchetSync` event {groupInfo, member, ratchetSyncProgress} (Controller.hs:928) -> (groupId, memberId, status). */
+    fun memberRatchetSyncEvent(body: JSONObject): Triple<Long, Long, String>? {
+        val (g, m) = memberKeyOf(body) ?: return null
+        val status = body.optJSONObject("ratchetSyncProgress")?.str("ratchetSyncStatus")?.ifEmpty { null } ?: return null
+        return Triple(g, m, status)
+    }
+
+    /** `groupMemberSwitch` event {groupInfo, member, switchProgress} (Controller.hs:926) -> (groupId, memberId, "rcv.completed"). */
+    fun memberSwitchEvent(body: JSONObject): Triple<Long, Long, String>? {
+        val (g, m) = memberKeyOf(body) ?: return null
+        val p = body.optJSONObject("switchProgress") ?: return null
+        val dir = p.str("queueDirection") ?: return null
+        val phase = p.str("switchPhase") ?: return null
+        return Triple(g, m, "$dir.$phase")
     }
 
     /** CIQuote {chatDir, itemId?, sharedMsgId?, sentAt, content: MsgContent}. */
@@ -415,26 +770,33 @@ internal object CoreJson {
         return out
     }
 
-    /** `chatItemReaction` body {added, reaction: {chatInfo, chatReaction: {chatDir, chatItem, sentAt, reaction}}}. */
+    /**
+     * `chatItemReaction` body {added, reaction: {chatInfo, chatReaction: {chatDir, chatItem, sentAt, reaction}}}, in a
+     * contact's chat or a group.
+     */
     fun parseReactionItem(body: JSONObject): CoreItem? {
         val reaction = body.optJSONObject("reaction") ?: return null
-        val contact = directContact(reaction.optJSONObject("chatInfo")) ?: return null
-        return parseChatItem(contact.contactId, reaction.optJSONObject("chatReaction")?.optJSONObject("chatItem"))
+        val info = reaction.optJSONObject("chatInfo")
+        val chatId = chatIdOf(info)?.takeIf { it != SAVED_MESSAGES_CHAT_ID } ?: return null
+        return parseChatItem(chatId, reaction.optJSONObject("chatReaction")?.optJSONObject("chatItem"), peerNameOf(info))
     }
 
-    /** `chatItemsDeleted` body {chatItemDeletions: [{deletedChatItem, toChatItem?}], byUser, timed}: messages only. */
+    /**
+     * `chatItemsDeleted` body {chatItemDeletions: [{deletedChatItem, toChatItem?}], byUser, timed}: items we show
+     * only (messages and known service rows, e.g. a "deleted by admin" row deleted for me).
+     */
     fun parseDeletions(body: JSONObject): List<CoreDeletion> {
         val out = ArrayList<CoreDeletion>()
         body.optJSONArray("chatItemDeletions").forEachObject { d ->
             val gone = parseAChatItem(d.optJSONObject("deletedChatItem")) ?: return@forEachObject
-            if (!gone.isMessage) return@forEachObject
+            if (!gone.shown) return@forEachObject
             val now = parseAChatItem(d.optJSONObject("toChatItem"))
             out.add(CoreDeletion(gone.chatId, gone.itemId, now))
         }
         return out
     }
 
-    /** All AChatItems of a `newChatItems` / `chatItemsStatusesUpdated` body that belong to direct chats or the note folder. */
+    /** All AChatItems of a `newChatItems` / `chatItemsStatusesUpdated` body in direct chats, groups or the note folder. */
     fun parseChatItems(body: JSONObject): List<CoreItem> {
         val arr = body.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(arr.length())
@@ -485,13 +847,15 @@ internal object CoreJson {
         return null
     }
 
-    /** `apiChat` body -> items of that direct chat or of the note folder (chat id -1), oldest first. */
+    /** `apiChat` body -> items of that direct chat, group or note folder (chat id -1), oldest first. */
     fun parseChatItemsOfChat(body: JSONObject): List<CoreItem> {
         val chat = body.optJSONObject("chat") ?: return emptyList()
-        val chatId = chatIdOf(chat.optJSONObject("chatInfo")) ?: return emptyList()
+        val info = chat.optJSONObject("chatInfo")
+        val chatId = chatIdOf(info) ?: return emptyList()
+        val peer = peerNameOf(info)
         val items = chat.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(items.length())
-        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j))?.let { out.add(it) }
+        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j), peer)?.let { out.add(it) }
         out.sortBy { it.itemId }
         return out
     }

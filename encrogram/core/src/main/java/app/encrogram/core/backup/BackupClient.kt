@@ -5,16 +5,25 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.URI
 import java.net.URL
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import javax.net.ssl.HttpsURLConnection
 
 /**
  * Stores and fetches backup envelopes on our own web host: `PUT | GET | HEAD | DELETE <base><backupId>`
  * (nginx WebDAV location, docs/recovery-phrase-plan.md "Server").
  *
- * nginx answers GET and HEAD with an `ETag` that changes on every PUT (PUT replies may carry none). The engine keeps
- * the tag of its own last upload and HEADs before every automatic upload ([tagDecision]): a different tag means
- * another phone uploaded with the same words, so this phone must not overwrite that copy (review finding 4). The
- * HEAD is also the connectivity probe that runs before the chat is paused (finding 5). Tags are never logged.
+ * nginx answers GET and HEAD with an `ETag` that changes on every PUT (PUT replies carry none). Its WebDAV PUT takes
+ * the file's modification time from the request's `Date` header, and the ETag is `"%x-%x"` of (modification time in
+ * epoch seconds, length) (R6.2, checked on our server 8 Nov 2026: `Date: Sun, 01 Nov 2026 10:00:00 GMT` with 1000
+ * bytes gave `"6ae70da0-3e8"`). So [put] sends a `Date` and returns the tag of the copy it wrote ([etagFor]) without
+ * a HEAD that could fail. The engine keeps that tag and HEADs before every automatic upload ([tagDecision]): the same
+ * tag means the copy is ours; any doubt (another tag, none stored, none sent) is settled by reading the copy's counter
+ * ([counterDecision]), so a copy another phone uploaded with the same words is never overwritten (review finding 4)
+ * and a lost tag never pauses uploads for good. The HEAD is also the connectivity probe that runs before the chat is
+ * paused (finding 5), and the check before every DELETE ([deleteDecision], R6.3). Tags are never logged.
  *
  * Only the platform's [HttpsURLConnection], never Telegram's network code. HTTPS only, no redirects, no caches,
  * bodies capped at [Envelope.MAX_ENVELOPE_BYTES]. The URL contains the backup id, which is a secret: it is never
@@ -39,29 +48,48 @@ internal class BackupClient private constructor(private val base: String) {
         data class Failed(val failure: Failure, val code: Int) : Probe()
     }
 
-    /** What to do before an upload ([tagDecision]). */
+    /** What to do before an upload ([tagDecision], then [counterDecision] for [VERIFY]). */
     enum class Check {
         UPLOAD,
         /** Another phone uploaded after this phone's last upload: don't overwrite it. */
         OTHER_PHONE,
-        /** A copy exists but the server sent no tag to compare: try again later. */
-        CANT_CHECK,
+        /** A copy exists and its tag doesn't prove it is ours: download it and compare its counter ([counterDecision]). */
+        VERIFY,
         /** The server can't be reached (or is busy): don't pause the chat, try again later. */
         UNREACHABLE,
     }
 
+    /** What to do with a server copy before deleting it ([deleteDecision], R6.3). */
+    enum class Del {
+        /** The copy is the one this phone uploaded last: delete it. */
+        DELETE,
+        /** Nothing stored: nothing to delete. */
+        GONE,
+        /** Another phone's copy, or one this phone can't prove is its own: keep it. */
+        KEEP,
+        /** No answer: try again later. */
+        RETRY,
+    }
+
+    /**
+     * Uploads [body] with `Date` = [dateSeconds] (whole seconds, RFC 1123 GMT) and returns the copy's tag: the reply's
+     * ETag when it sends one, else [etagFor] (nginx WebDAV, see the class comment).
+     */
     @Throws(HttpFailure::class)
-    fun put(id: String, body: ByteArray) {
+    fun put(id: String, body: ByteArray, dateSeconds: Long): String {
         if (body.size > Envelope.MAX_ENVELOPE_BYTES) throw HttpFailure(Failure.TOO_LARGE, 0)
         val conn = open(id, "PUT")
         try {
             conn.doOutput = true
             conn.setFixedLengthStreamingMode(body.size)
             conn.setRequestProperty("Content-Type", "application/octet-stream")
+            conn.setRequestProperty("Date", httpDate(dateSeconds))
             conn.outputStream.use { it.write(body) }
             val code = conn.responseCode
             if (code !in 200..299) throw HttpFailure(failureFor(code), code)
+            val replyTag = cleanTag(conn.getHeaderField("ETag"))
             drain(conn)
+            return replyTag ?: etagFor(dateSeconds, body.size.toLong())
         } catch (e: IOException) {
             throw HttpFailure(Failure.NETWORK, 0)
         } finally {
@@ -167,20 +195,48 @@ internal class BackupClient private constructor(private val base: String) {
          *
          * - No answer: [Check.UNREACHABLE], for every upload, so the chat is never paused while offline.
          * - Nothing stored (404): upload.
-         * - Same tag: upload. A different tag, or no stored tag next to an existing copy: another phone may have
-         *   uploaded, so don't overwrite it ([Check.OTHER_PHONE]).
-         * - A copy without a tag can't be compared: [Check.CANT_CHECK] (a server problem, retried later).
+         * - Same tag: upload.
+         * - A different tag, no stored tag (a dev install, a lost HEAD in an older build, a server move) or no tag
+         *   from the server: [Check.VERIFY], never "no tag means upload" (R6.2 part B): that is exactly when an old
+         *   phone would overwrite the restored phone's copy.
          */
         fun tagDecision(probe: Probe, lastTag: String?, skipCheck: Boolean): Check = when (probe) {
             is Probe.Failed -> Check.UNREACHABLE
             Probe.Missing -> Check.UPLOAD
             is Probe.Found -> when {
                 skipCheck -> Check.UPLOAD
-                probe.etag == null -> Check.CANT_CHECK
-                lastTag != null && sameTag(probe.etag, lastTag) -> Check.UPLOAD
-                else -> Check.OTHER_PHONE
+                probe.etag != null && lastTag != null && sameTag(probe.etag, lastTag) -> Check.UPLOAD
+                else -> Check.VERIFY
             }
         }
+
+        /**
+         * [Check.VERIFY] settled by the stored copy's counter (R6.2 part B): every upload's counter is one more than
+         * the highest this phone knew ([myCounter] = the counter of this phone's last upload, or of the restored copy).
+         * Not higher: the copy is ours (or older), upload. Higher: another phone uploaded after us, keep it.
+         */
+        fun counterDecision(serverCounter: Long, myCounter: Long): Check =
+            if (serverCounter <= myCounter) Check.UPLOAD else Check.OTHER_PHONE
+
+        /**
+         * Before a DELETE (R6.3): only the copy this phone uploaded last ([storedTag], kept next to the queued id) may
+         * be deleted; another phone's copy made with the same words stays.
+         */
+        fun deleteDecision(probe: Probe, storedTag: String?): Del = when (probe) {
+            is Probe.Failed -> Del.RETRY
+            Probe.Missing -> Del.GONE
+            is Probe.Found -> if (probe.etag != null && storedTag != null && sameTag(probe.etag, storedTag)) Del.DELETE else Del.KEEP
+        }
+
+        /** nginx's ETag of a static file: `"<mtime hex>-<length hex>"` (ngx_http_set_etag, `"%xT-%xO"`). */
+        fun etagFor(epochSeconds: Long, length: Long): String =
+            "\"" + java.lang.Long.toHexString(epochSeconds) + "-" + java.lang.Long.toHexString(length) + "\""
+
+        private val HTTP_DATE: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US).withZone(ZoneOffset.UTC)
+
+        /** RFC 1123 date with a two-digit day (nginx's ngx_parse_http_time needs it): `Sun, 01 Nov 2026 10:00:00 GMT`. */
+        fun httpDate(epochSeconds: Long): String = HTTP_DATE.format(Instant.ofEpochSecond(epochSeconds))
 
         /** An ETag header as we keep it: trimmed printable ASCII, at most [MAX_TAG_CHARS]; null otherwise. */
         fun cleanTag(raw: String?): String? {

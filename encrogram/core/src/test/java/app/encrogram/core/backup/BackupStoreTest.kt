@@ -72,19 +72,22 @@ class BackupStoreTest {
         val s = BackupStore(dir)
         assertTrue(s.pending().isEmpty())
         assertEquals(Long.MAX_VALUE, s.repairSince())
+        val c3 = RepairKey.contact(3)
+        val c7 = RepairKey.contact(7)
+        val c9 = RepairKey.contact(9)
         val proven = BackupStore.Pending(proven = true)
-        val all = BackupStore.Pending(proven = true, switched = true, forced = true, syncing = true)
-        assertTrue(s.startRepair(linkedMapOf(3L to BackupStore.Pending(), 7L to proven, 9L to all), sinceItemId = 120))
+        val all = BackupStore.Pending(proven = true, switched = true, forced = true, syncing = true, reforced = true, forcedAtMs = 1_700_000_000_000L)
+        assertTrue(s.startRepair(linkedMapOf(c3 to BackupStore.Pending(), c7 to proven, c9 to all), sinceItemId = 120))
         val p = BackupStore(dir).pending()
-        assertEquals(listOf(3L, 7L, 9L), p.keys.toList())
-        assertEquals(BackupStore.Pending(), p[3L])
-        assertEquals(proven, p[7L])
-        assertEquals(all, p[9L])
+        assertEquals(listOf(c3, c7, c9), p.keys.toList())
+        assertEquals(BackupStore.Pending(), p[c3])
+        assertEquals(proven, p[c7])
+        assertEquals(all, p[c9])
         assertEquals(120L, BackupStore(dir).repairSince())
-        assertTrue(s.updatePending { it.remove(3L); it[7L] = it[7L]!!.copy(switched = true) })
-        assertEquals(mapOf(7L to BackupStore.Pending(proven = true, switched = true), 9L to all), BackupStore(dir).pending())
+        assertTrue(s.updatePending { it.remove(c3); it[c7] = it[c7]!!.copy(switched = true) })
+        assertEquals(mapOf(c7 to BackupStore.Pending(proven = true, switched = true), c9 to all), BackupStore(dir).pending())
         // Later writes keep the restore's starting item id.
-        assertTrue(s.setPending(mapOf(9L to all)))
+        assertTrue(s.setPending(mapOf(c9 to all)))
         assertEquals(120L, BackupStore(dir).repairSince())
         assertTrue(s.setPending(emptyMap()))
         assertFalse(File(dir, BackupStore.PENDING_FILE).exists())
@@ -96,8 +99,8 @@ class BackupStoreTest {
         // Builds before 8 Nov 2026 wrote 'h' when an incoming message decrypted: that proves one direction only.
         File(dir, BackupStore.PENDING_FILE).writeText("4 h\n5 hs\n")
         val p = BackupStore(dir).pending()
-        assertEquals(BackupStore.Pending(), p[4L])
-        assertEquals(BackupStore.Pending(switched = true), p[5L])
+        assertEquals(BackupStore.Pending(), p[RepairKey.contact(4)])
+        assertEquals(BackupStore.Pending(switched = true), p[RepairKey.contact(5)])
         assertEquals(Long.MAX_VALUE, BackupStore(dir).repairSince())
     }
 
@@ -225,6 +228,38 @@ class BackupStoreTest {
         assertTrue(s.pendingDeletes().isEmpty())
         assertFalse(File(dir, BackupStore.DELETE_FILE).exists())
         assertFalse(s.addPendingDelete("not-an-id"))
+    }
+
+    @Test
+    fun queuedDeletesKeepTheTagOfOurLastUpload() {
+        // R6.3: the delete is guarded by the tag stored next to each queued id.
+        val s = BackupStore(dir, TestBox())
+        assertTrue(s.addPendingDelete(id, tag))
+        assertTrue(s.addPendingDelete(id2))
+        assertTrue(s.addPendingDelete(id3, "W/\"a b\""))
+        val q = BackupStore(dir, TestBox()).pendingDeleteEntries()
+        assertEquals(listOf(id, id2, id3), q.map { it.id })
+        assertEquals(listOf(tag, null, "W/\"a b\""), q.map { it.tag })
+        assertEquals(listOf(id, id2, id3), s.pendingDeletes())
+        assertFalse(allFileText().contains("6aefff83"))
+        // Re-queueing replaces the tag; a tag that isn't clean is dropped, never stored half.
+        assertTrue(s.addPendingDelete(id, "bad\ntag"))
+        assertEquals(BackupStore.QueuedDelete(id, null), s.pendingDeleteEntries().last())
+        assertEquals("QueuedDelete(redacted)", s.pendingDeleteEntries().last().toString())
+    }
+
+    @Test
+    fun memberRepairLinesSurviveRestarts() {
+        val s = BackupStore(dir)
+        val m = RepairKey.member(3, 12)
+        val c = RepairKey.contact(12)
+        val stuck = BackupStore.Pending(forced = true, syncing = true, reforced = true, forcedAtMs = 1_700_000_000_000L)
+        assertTrue(s.startRepair(linkedMapOf(c to BackupStore.Pending(), m to stuck), sinceItemId = 7))
+        assertEquals(mapOf(c to BackupStore.Pending(), m to stuck), BackupStore(dir).pending())
+        assertEquals("since 7\n12 -\n#3:12 fyr 1700000000000\n", File(dir, BackupStore.PENDING_FILE).readText())
+        // A damaged line is skipped, the rest still reads.
+        File(dir, BackupStore.PENDING_FILE).writeText("#3 f\n#3:12 p\n")
+        assertEquals(mapOf(m to BackupStore.Pending(proven = true)), BackupStore(dir).pending())
     }
 
     @Test

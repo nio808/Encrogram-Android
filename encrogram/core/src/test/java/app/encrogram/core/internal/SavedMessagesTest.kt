@@ -73,7 +73,7 @@ class SavedMessagesTest {
         assertEquals(-1L, SAVED_MESSAGES_CHAT_ID)
         assertEquals(5L, CoreJson.chatIdOf(obj("""{"type":"direct","contact":${Samples.contact(5, "Bob", "ready")}}""")))
         assertEquals(SAVED_MESSAGES_CHAT_ID, CoreJson.chatIdOf(obj(folder(id = 3))))
-        assertNull(CoreJson.chatIdOf(obj("""{"type":"group","groupInfo":{"groupId":3}}""")))
+        assertEquals(app.encrogram.core.api.GROUP_CHAT_ID_BASE + 3, CoreJson.chatIdOf(obj("""{"type":"group","groupInfo":{"groupId":3}}""")))
         assertNull(CoreJson.chatIdOf(obj("""{"type":"contactConnection","contactConnection":{"pccConnId":7}}""")))
     }
 

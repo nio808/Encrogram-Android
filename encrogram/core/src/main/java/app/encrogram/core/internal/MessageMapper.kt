@@ -1,6 +1,9 @@
 package app.encrogram.core.internal
 
+import app.encrogram.core.api.ChatKind
 import app.encrogram.core.api.ChatSummary
+import app.encrogram.core.api.MemberRole
+import app.encrogram.core.api.MessageSender
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.QuotePreview
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
@@ -12,25 +15,36 @@ import app.encrogram.core.api.SecuredMessage
  */
 internal object MessageMapper {
 
-    fun toMessage(i: CoreItem): SecuredMessage {
+    /**
+     * [myRole]: our role in the item's group (null for 1:1 chats and notes). Someone else's group message can be
+     * deleted for everyone only by a moderator or higher whose role is at least the sender's (Commands.hs:4079-4088).
+     */
+    fun toMessage(i: CoreItem, myRole: MemberRole? = null): SecuredMessage {
         val deleted = i.deleted
+        val event = i.event
+        val service = event != null
+        val sender = i.sender?.takeIf { i.group && !i.outgoing }
+        val moderate = !deleted && !service && i.group && !i.outgoing && i.shared && sender != null &&
+            myRole != null && myRole >= MemberRole.MODERATOR && myRole >= sender.role
         return SecuredMessage(
             chatId = i.chatId,
             messageId = i.itemId,
             outgoing = i.outgoing,
-            text = if (deleted) "" else i.text,
+            text = if (deleted || service) "" else i.text,
             timeMs = i.timeMs,
             status = i.status,
-            replyTo = if (deleted) null else i.quote?.let { QuotePreview(it.itemId, InputRules.preview(it.text), it.outgoing) },
+            replyTo = if (deleted || service) null else i.quote?.let { QuotePreview(it.itemId, InputRules.preview(it.text), it.outgoing) },
             edited = i.edited,
             deleted = deleted,
             // Notes have no shared message id (never sent); the core edits them locally with no time limit
             // (meta.editable: not deleted, not forwarded). "For everyone" has no meaning for a note.
-            canEdit = !deleted && i.outgoing && (i.shared || i.local) && i.editable && i.msgContentType == "text",
-            canDeleteForEveryone = !deleted && !i.local && i.outgoing && i.shared && i.deletable,
+            canEdit = !deleted && !service && i.outgoing && (i.shared || i.local) && i.editable && i.msgContentType == "text",
+            canDeleteForEveryone = moderate || (!deleted && !service && !i.local && i.outgoing && i.shared && i.deletable),
             forwarded = i.forwarded,
-            reactions = if (deleted) emptyList() else i.reactions,
+            reactions = if (deleted || service) emptyList() else i.reactions,
             expiresAtMs = i.expiresAtMs,
+            sender = sender?.let { MessageSender(it.memberId, it.displayName, it.role) },
+            event = event,
         )
     }
 
@@ -57,6 +71,36 @@ internal object MessageMapper {
     }
 
     /**
+     * A group or channel row. Invited: no preview of anything before joining (the UI shows the invitation), and no
+     * posting until [ChatSummary.invited] is accepted. Not ready while still connecting after accepting or joining.
+     */
+    fun groupSummary(chat: CoreGroupChat, archived: Boolean): ChatSummary {
+        val g = chat.group
+        val last = chat.lastItem?.takeIf { it.isMessage }
+        val time = last?.timeMs?.takeIf { it > 0 } ?: maxOf(g.activityTimeMs, chat.lastItem?.timeMs ?: 0L)
+        return ChatSummary(
+            chatId = g.chatId,
+            displayName = g.displayName,
+            lastMessageText = if (g.invited) null else last?.takeUnless { it.deleted }?.text,
+            lastMessageTimeMs = time,
+            unreadCount = chat.unreadCount,
+            verified = false,
+            ready = !CoreJson.groupConnecting(g),
+            lastMessageOutgoing = last?.outgoing == true,
+            lastMessageStatus = last?.takeIf { it.outgoing }?.status,
+            pinned = g.favorite,
+            muted = g.muted,
+            archived = archived,
+            kind = if (g.channel) ChatKind.CHANNEL else ChatKind.GROUP,
+            memberCount = g.memberCount,
+            myRole = g.myRole,
+            canPost = !g.invited && CoreJson.canPost(g),
+            lastMessageSender = last?.takeIf { !it.outgoing && !it.deleted }?.sender?.displayName,
+            invited = g.invited,
+        )
+    }
+
+    /**
      * The Saved Messages row ([SAVED_MESSAGES_CHAT_ID]): empty name (the UI shows its own localized one), always
      * ready, never verified, muted, archived or unread; its last message is ours and DELIVERED.
      */
@@ -79,11 +123,12 @@ internal object MessageMapper {
 
     /** A row after a new message in its chat (no reload). */
     fun withNewItem(row: ChatSummary, item: CoreItem): ChatSummary = row.copy(
-        lastMessageText = item.takeUnless { it.deleted }?.text,
+        lastMessageText = if (row.invited) null else item.takeUnless { it.deleted }?.text,
         lastMessageTimeMs = if (item.timeMs > 0) item.timeMs else row.lastMessageTimeMs,
         unreadCount = row.unreadCount + if (item.unread) 1 else 0,
         lastMessageOutgoing = item.outgoing,
         lastMessageStatus = if (item.outgoing) item.status else null,
+        lastMessageSender = item.takeIf { it.group && !it.outgoing && !it.deleted }?.sender?.displayName,
     )
 
     /** The contract's order: pinned first, then newest activity first (ties by id, so the order is stable). */

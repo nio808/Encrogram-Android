@@ -25,6 +25,27 @@ internal object ErrorMapper {
     const val OWN_LINK = "This is your own invite link. Notes to yourself go in Saved Messages."
     const val NOT_IN_SAVED = "This isn't available in Saved Messages."
 
+    // ---- groups ----
+    const val GROUP_ROLE = "Your role in this group doesn't allow this."
+    const val NOT_JOINED = "Join the group first."
+    const val NOT_A_MEMBER = "You're no longer a member of this group."
+    const val GROUP_CONNECTING = "This group is still connecting. Try again in a moment."
+    const val ONLY_ADMINS_POST = "Only admins can post here."
+    const val ONLY_ADMINS_ADD = "Only admins can add people."
+    const val CANT_MODERATE = "Only admins and moderators can delete other members' messages, and never those of someone with a higher role."
+    const val CONTACTS_ONLY = "This is only available in a chat with a contact."
+    const val NOT_A_CONTACT = "Only your connected Secured contacts can be added."
+    const val ALREADY_MEMBER = "This person is already in the group."
+    const val INVITATION_GONE = "This invitation is no longer available."
+    const val MEMBER_GONE = "This member is no longer in the group."
+    const val ALREADY_LEFT = "You already left this group."
+    const val ALREADY_JOINED = "You already joined this group."
+    const val DECLINE_INSTEAD = "You haven't joined this group. Decline the invitation instead."
+
+    /** Some of the people could not be added; the others were. Counts only, never names. */
+    fun addFailed(failed: Int, total: Int): SecuredError =
+        SecuredError(Kind.ENGINE, if (failed == total) "No one could be added. Try again." else "$failed of $total people couldn't be added. Try again for them.")
+
     enum class Op { START, PROFILE, INVITE, CONNECT, SEND, LOAD, READ, EDIT, DELETE, REACT, FORWARD, CHAT, VERIFY, OTHER }
 
     /** A refusal by our own rules or the protocol's (time limits, the reaction set). [message] is a fixed sentence. */
@@ -66,6 +87,15 @@ internal object ErrorMapper {
                     return SecuredError(Kind.ENGINE, "This name can't be used. Try a different name.")
                 "invalidChatItemUpdate" -> return notAllowed(CANT_EDIT)
                 "invalidChatItemDelete" -> return notAllowed(CANT_DELETE_FOR_EVERYONE)
+                // Group errors (ChatErrorType, Controller.hs:1465-1478).
+                "groupUserRole", "groupContactRole", "groupMemberInitialRole" -> return notAllowed(GROUP_ROLE)
+                "groupNotJoined" -> return notAllowed(NOT_JOINED)
+                "groupMemberUserRemoved" -> return notAllowed(NOT_A_MEMBER)
+                "groupMemberNotActive" -> return SecuredError(Kind.ENGINE, GROUP_CONNECTING)
+                "groupMemberNotFound" -> return SecuredError(Kind.ENGINE, MEMBER_GONE)
+                "groupDuplicateMember", "groupDuplicateMemberId" -> return notAllowed(ALREADY_MEMBER)
+                "groupCantResendInvitation" -> return SecuredError(Kind.ENGINE, INVITATION_GONE)
+                "contactIncognitoCantInvite", "groupIncognitoCantInvite" -> return notAllowed(GROUP_ROLE)
                 // throwCmdError: "reaction already added/removed", "too many reactions", "no shared item ID".
                 "commandError" -> if (op == Op.REACT) return notAllowed(CANT_REACT)
             }
@@ -73,6 +103,11 @@ internal object ErrorMapper {
                 "duplicateName" -> return SecuredError(Kind.ENGINE, "This name can't be used. Try a different name.")
                 "contactNotFound", "contactNotReady" -> return chatGone()
                 "chatItemNotFound" -> return messageGone()
+                // StoreError, Store/Shared.hs:98-112.
+                "groupNotFound", "groupWithoutUser" -> return chatGone()
+                "groupMemberNotFound" -> return SecuredError(Kind.ENGINE, MEMBER_GONE)
+                "groupInvitationNotFound" -> return SecuredError(Kind.ENGINE, INVITATION_GONE)
+                "groupAlreadyJoined" -> return notAllowed(ALREADY_JOINED)
                 "invalidQuote" -> return notAllowed(CANT_REPLY)
                 // encodeChatMessage: the whole message would be over maxEncodedMsgLength.
                 "largeMsg" -> return invalid(TOO_LONG)
@@ -144,6 +179,10 @@ internal object ErrorMapper {
     const val SERVER_COPY_UNREACHABLE =
         "The copy on our server could not be deleted, because this phone's secure key storage failed. Backup is off on this phone. " +
             "Anyone with your 12 words can still restore that copy until the server removes it after 400 days unused."
+    /** "Turn off" removed everything on this phone, but the server copy isn't provably this phone's, so it was kept (R6.3). */
+    const val SERVER_COPY_KEPT =
+        "Backup is off on this phone. The copy on our server was kept: another phone with the same 12 words made it, " +
+            "or this phone can't confirm it made it. Anyone with your 12 words can still restore that copy."
     /** "Turn off" stopped: the server delete failed and couldn't be queued, so nothing was changed. */
     const val SERVER_COPY_KEEP_ON =
         "The copy on our server could not be deleted. Check your internet connection and try again; backup is still on."

@@ -33,12 +33,44 @@ class RestoreRepairTest {
     }
 
     @Test
-    fun waitWhileASyncRuns() {
-        for (p in listOf(fresh, proven)) {
-            assertEquals(Action.WAIT, RestoreRepair.decide(stats("started"), true, p))
-            assertEquals(Action.WAIT, RestoreRepair.decide(stats("agreed"), true, p))
-            assertEquals(Action.WAIT, RestoreRepair.decide(stats("something-new"), true, p))
+    fun waitWhileOurSyncRuns() {
+        for (p in listOf(proven, RestoreRepair.syncAccepted(fresh, nowMs = 1_000))) {
+            assertEquals(Action.WAIT, RestoreRepair.decide(stats("started"), true, p, nowMs = 2_000))
+            assertEquals(Action.WAIT, RestoreRepair.decide(stats("agreed"), true, p, nowMs = 2_000))
         }
+        for (p in listOf(fresh, proven)) assertEquals(Action.WAIT, RestoreRepair.decide(stats("something-new"), true, p))
+    }
+
+    @Test
+    fun aRestoredSyncStateIsForcedAtTheFirstCheck() {
+        // R6.1: the backup itself held `started`/`agreed`. Plain /_sync is refused there and decrypt errors raise no
+        // event, so only a forced sync unblocks it; it is sent at the first check, ready or not.
+        for (state in listOf("started", "agreed")) {
+            assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats(state), true, fresh))
+            assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats(state), false, fresh))
+            assertEquals(Action.WAIT, RestoreRepair.decide(stats(state, supported = false), true, fresh))
+        }
+        // Seeing the stale state before our forced sync is not a sync under way.
+        assertEquals(fresh, RestoreRepair.observe(fresh, "started"))
+        assertEquals(fresh, RestoreRepair.observe(fresh, "agreed"))
+    }
+
+    @Test
+    fun stuckForHoursForcesOnceMore() {
+        val t0 = 1_700_000_000_000L
+        val forced = RestoreRepair.syncAccepted(fresh, nowMs = t0)
+        val later = t0 + RestoreRepair.REFORCE_AFTER_MS
+        assertEquals(Action.WAIT, RestoreRepair.decide(stats("started"), true, forced, nowMs = later - 1))
+        assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats("started"), true, forced, nowMs = later))
+        assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats("agreed"), true, forced, nowMs = later))
+        assertEquals(Action.WAIT, RestoreRepair.decide(stats("started", supported = false), true, forced, nowMs = later))
+        // The second force is the last one.
+        val again = RestoreRepair.syncAccepted(forced, nowMs = later)
+        assertTrue(again.reforced)
+        assertEquals(later, again.forcedAtMs)
+        assertEquals(Action.WAIT, RestoreRepair.decide(stats("started"), true, again, nowMs = later * 2))
+        // A list written before forcedAtMs existed never re-forces.
+        assertEquals(Action.WAIT, RestoreRepair.decide(stats("started"), true, proven, nowMs = later * 2))
     }
 
     @Test
@@ -47,15 +79,16 @@ class RestoreRepairTest {
         assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats("ok"), true, fresh))
         assertEquals(Action.FORCE_SYNC, RestoreRepair.decide(stats("ok"), false, fresh))
         // Never twice, never on top of a running sync, never on an agent that can't sync.
-        val forced = RestoreRepair.syncAccepted(fresh, forced = true)
+        val forced = RestoreRepair.syncAccepted(fresh, nowMs = 5)
         assertTrue(forced.forced && forced.syncing)
+        assertFalse(forced.reforced)
+        assertEquals(5L, forced.forcedAtMs)
         assertEquals(Action.WAIT, RestoreRepair.decide(stats("ok"), true, forced.copy(syncing = false)))
         assertEquals(Action.WAIT, RestoreRepair.decide(stats("ok"), true, fresh.copy(syncing = true)))
         assertEquals(Action.WAIT, RestoreRepair.decide(stats("ok", supported = false), true, fresh))
-        // A plain sync that was accepted doesn't count as the forced one, but it is under way.
-        val plain = RestoreRepair.syncAccepted(fresh, forced = false)
-        assertFalse(plain.forced)
-        assertTrue(plain.syncing)
+        // R6.1: any accepted sync of a restored connection, plain ones too, counts as the forced one.
+        val plain = RestoreRepair.syncAccepted(fresh.copy(proven = true), nowMs = 9)
+        assertTrue(plain.forced && plain.syncing)
     }
 
     @Test
@@ -71,7 +104,7 @@ class RestoreRepairTest {
 
     @Test
     fun aCompletedSyncIsProof() {
-        var p = RestoreRepair.syncAccepted(fresh, forced = true)      // reply: started
+        var p = RestoreRepair.syncAccepted(fresh, nowMs = 1)      // reply: started
         assertFalse(p.proven)
         p = RestoreRepair.observe(p, "started")
         assertFalse(p.proven)
@@ -85,22 +118,24 @@ class RestoreRepairTest {
     }
 
     @Test
-    fun aSyncStartedByTheContactAlsoCounts() {
-        // Their forced sync: we go straight to agreed (newRatchetKey), then ok when their next message decrypts.
-        val p = RestoreRepair.observe(RestoreRepair.observe(fresh, "agreed"), "ok")
-        assertTrue(p.proven)
+    fun aSyncByTheContactCountsOnlyAfterOurs() {
+        // Before our forced sync, `agreed` may be the backup's stale state (R6.1): no proof.
+        assertFalse(RestoreRepair.observe(RestoreRepair.observe(fresh, "agreed"), "ok").proven)
+        // After it, their sync (straight to agreed via newRatchetKey) finishing in ok is proof.
+        val ours = RestoreRepair.syncAccepted(fresh, nowMs = 1).copy(syncing = false)
+        assertTrue(RestoreRepair.observe(RestoreRepair.observe(ours, "agreed"), "ok").proven)
     }
 
     @Test
     fun aBrokenSyncCancelsTheProof() {
-        var p = RestoreRepair.observe(RestoreRepair.syncAccepted(fresh, forced = true), "agreed")
+        var p = RestoreRepair.observe(RestoreRepair.syncAccepted(fresh, nowMs = 1), "agreed")
         p = RestoreRepair.observe(p, "required")
         assertFalse(p.syncing)
         // Back to ok by a decrypted message alone: still not proven.
         p = RestoreRepair.observe(p, "ok")
         assertFalse(p.proven)
         // The plain sync for `required` runs and completes: proven.
-        p = RestoreRepair.observe(RestoreRepair.observe(RestoreRepair.syncAccepted(p, forced = false), "agreed"), "ok")
+        p = RestoreRepair.observe(RestoreRepair.observe(RestoreRepair.syncAccepted(p, nowMs = 2), "agreed"), "ok")
         assertTrue(p.proven)
     }
 
@@ -125,6 +160,25 @@ class RestoreRepairTest {
     fun switchedContactsLeaveWhenTheSwitchIsOver() {
         assertEquals(Action.WAIT, RestoreRepair.decide(stats("ok", switching = true), true, switched))
         assertEquals(Action.DONE, RestoreRepair.decide(stats("ok"), true, switched))
+    }
+
+    @Test
+    fun repairKeysForContactsAndMembers() {
+        val c = RepairKey.contact(12)
+        val m = RepairKey.member(3, 12)
+        assertFalse(c.isMember)
+        assertTrue(m.isMember)
+        assertEquals("12", c.encode())
+        assertEquals("#3:12", m.encode())
+        // Same number, different connection.
+        assertFalse(c == m)
+        assertEquals(c, RepairKey.decode("12"))
+        assertEquals(m, RepairKey.decode("#3:12"))
+        assertEquals(m.hashCode(), RepairKey.decode("#3:12").hashCode())
+        for (bad in listOf("", "x", "0", "-4", "#3", "#0:2", "#3:0", "#a:2", "#3:b")) assertNull(bad, RepairKey.decode(bad))
+        // Never a number in logs.
+        assertEquals("member", m.toString())
+        assertEquals("contact", c.toString())
     }
 
     @Test

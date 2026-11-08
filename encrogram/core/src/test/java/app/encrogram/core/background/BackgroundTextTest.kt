@@ -37,6 +37,23 @@ class BackgroundTextTest {
     }
 
     @Test
+    fun groupNotificationIdsNeverMeetContactIds() {
+        val base = app.encrogram.core.api.GROUP_CHAT_ID_BASE
+        // The old `chatId xor (chatId ushr 32)` folded group 3 onto contact 259 (3 xor 256): the kind is mixed in now.
+        for (g in listOf(1L, 3L, 256L, 0x3FFFFFFFL)) {
+            val id = NotificationText.notificationId(base + g)
+            assertTrue("groups use the negative half", id < -1)
+            assertNotEquals(NotificationText.SUMMARY_ID, id)
+            for (c in listOf(g, g xor 256L, 1L, 259L, Int.MAX_VALUE.toLong())) assertNotEquals(NotificationText.notificationId(c), id)
+        }
+        assertEquals(Int.MIN_VALUE + 3, NotificationText.notificationId(base + 3))
+        assertNotEquals(NotificationText.notificationId(base + 3), NotificationText.notificationId(base + 4))
+        // Contacts keep the ids they had.
+        assertEquals(259, NotificationText.notificationId(259L))
+        assertEquals(Int.MAX_VALUE, NotificationText.notificationId(Int.MAX_VALUE.toLong()))
+    }
+
+    @Test
     fun bootStartsOnlyWhenSavedFlagIsOnAndActionIsSystem() {
         assertTrue(SecuredBootReceiver.shouldStart(Intent.ACTION_BOOT_COMPLETED, true))
         assertTrue(SecuredBootReceiver.shouldStart(Intent.ACTION_MY_PACKAGE_REPLACED, true))

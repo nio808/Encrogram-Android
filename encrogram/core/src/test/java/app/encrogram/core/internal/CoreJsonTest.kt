@@ -61,11 +61,13 @@ class CoreJsonTest {
     }
 
     @Test
-    fun newChatItemsEventKeepsOnlyDirectChats() {
+    fun newChatItemsEventKeepsDirectChatsAndGroups() {
         val r = result(Samples.NEW_CHAT_ITEMS_EVENT)
         assertEquals("newChatItems", r.type)
         val items = CoreJson.parseChatItems(r.body)
-        assertEquals(1, items.size)
+        assertEquals(2, items.size)
+        // The group item has its own chat id range, never a contact id.
+        assertEquals(app.encrogram.core.api.GROUP_CHAT_ID_BASE + 3, items[1].chatId)
         val item = items[0]
         assertEquals(5L, item.chatId)
         assertEquals(42L, item.itemId)

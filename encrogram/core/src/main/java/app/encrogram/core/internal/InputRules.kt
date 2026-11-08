@@ -126,10 +126,11 @@ internal object InputRules {
 
     /**
      * The messages of a core page (items oldest first), cut to [want] the way the UI asked: the newest for
-     * "last" and "before", the oldest for "after", centred on the id for "around". Service items are dropped.
+     * "last" and "before", the oldest for "after", centred on the id for "around". Group service rows we know
+     * ([CoreItem.event]) stay, except in a text search; every other service item is dropped.
      */
     fun pageWindow(items: List<CoreItem>, page: MessagePage, want: Int): List<CoreItem> {
-        val msgs = items.filter { it.isMessage }
+        val msgs = if (page.search != null) items.filter { it.isMessage } else items.filter { it.shown }
         val around = page.aroundId
         return when {
             page.afterId != null -> msgs.filter { it.itemId != page.afterId }.take(want)

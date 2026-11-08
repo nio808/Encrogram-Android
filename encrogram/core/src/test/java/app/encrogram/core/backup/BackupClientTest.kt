@@ -91,10 +91,10 @@ class BackupClientTest {
     }
 
     @Test
-    fun differentTagMeansAnotherPhone() {
-        assertEquals(BackupClient.Check.OTHER_PHONE, BackupClient.tagDecision(BackupClient.Probe.Found(theirs), mine, skipCheck = false))
-        // No tag of our own next to an existing copy: it can't be proven ours, so it is not overwritten.
-        assertEquals(BackupClient.Check.OTHER_PHONE, BackupClient.tagDecision(BackupClient.Probe.Found(theirs), null, skipCheck = false))
+    fun aTagThatDoesntProveItMeansReadTheCounter() {
+        // R6.2 part B: another tag, or none stored, is settled by the copy's counter, never by uploading blindly.
+        assertEquals(BackupClient.Check.VERIFY, BackupClient.tagDecision(BackupClient.Probe.Found(theirs), mine, skipCheck = false))
+        assertEquals(BackupClient.Check.VERIFY, BackupClient.tagDecision(BackupClient.Probe.Found(theirs), null, skipCheck = false))
     }
 
     @Test
@@ -114,8 +114,8 @@ class BackupClientTest {
     }
 
     @Test
-    fun aCopyWithoutATagCantBeChecked() {
-        assertEquals(BackupClient.Check.CANT_CHECK, BackupClient.tagDecision(BackupClient.Probe.Found(null), mine, skipCheck = false))
+    fun aCopyWithoutATagIsCheckedByItsCounter() {
+        assertEquals(BackupClient.Check.VERIFY, BackupClient.tagDecision(BackupClient.Probe.Found(null), mine, skipCheck = false))
     }
 
     @Test
@@ -127,5 +127,47 @@ class BackupClientTest {
         assertNull(BackupClient.cleanTag("x".repeat(201)))
         assertTrue(BackupClient.sameTag("W/$mine", mine))
         assertFalse(BackupClient.sameTag(theirs, mine))
+    }
+
+    // ---- R6.2 part A: our own tag from the Date we send ----
+
+    @Test
+    fun theTagIsComputedFromTheDateHeaderAndLength() {
+        val sec = 1_793_527_200L
+        assertEquals("Sun, 01 Nov 2026 10:00:00 GMT", BackupClient.httpDate(sec))
+        assertEquals("\"6ae70da0-3e8\"", BackupClient.etagFor(sec, 1000))
+        // Two-digit day, English names and GMT whatever the device locale.
+        val old = java.util.Locale.getDefault()
+        try {
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar-EG"))
+            assertEquals("Thu, 05 Mar 2026 07:08:09 GMT", BackupClient.httpDate(1_772_694_489L))
+        } finally {
+            java.util.Locale.setDefault(old)
+        }
+        assertEquals("\"0-0\"", BackupClient.etagFor(0, 0))
+    }
+
+    // ---- R6.2 part B: the counter settles a tag that doesn't prove it ----
+
+    @Test
+    fun aCopyWithAHigherCounterIsAnotherPhones() {
+        assertEquals(BackupClient.Check.UPLOAD, BackupClient.counterDecision(serverCounter = 41, myCounter = 41))
+        assertEquals(BackupClient.Check.UPLOAD, BackupClient.counterDecision(serverCounter = 3, myCounter = 41))
+        assertEquals(BackupClient.Check.OTHER_PHONE, BackupClient.counterDecision(serverCounter = 42, myCounter = 41))
+    }
+
+    // ---- R6.3: delete only our own copy ----
+
+    @Test
+    fun deleteOnlyTheCopyWeUploadedLast() {
+        assertEquals(BackupClient.Del.DELETE, BackupClient.deleteDecision(BackupClient.Probe.Found(mine), mine))
+        assertEquals(BackupClient.Del.DELETE, BackupClient.deleteDecision(BackupClient.Probe.Found("W/$mine"), mine))
+        assertEquals(BackupClient.Del.GONE, BackupClient.deleteDecision(BackupClient.Probe.Missing, mine))
+        assertEquals(BackupClient.Del.GONE, BackupClient.deleteDecision(BackupClient.Probe.Missing, null))
+        assertEquals(BackupClient.Del.KEEP, BackupClient.deleteDecision(BackupClient.Probe.Found(theirs), mine))
+        assertEquals(BackupClient.Del.KEEP, BackupClient.deleteDecision(BackupClient.Probe.Found(mine), null))
+        assertEquals(BackupClient.Del.KEEP, BackupClient.deleteDecision(BackupClient.Probe.Found(null), mine))
+        val down = BackupClient.Probe.Failed(BackupClient.Failure.NETWORK, 0)
+        assertEquals(BackupClient.Del.RETRY, BackupClient.deleteDecision(down, mine))
     }
 }

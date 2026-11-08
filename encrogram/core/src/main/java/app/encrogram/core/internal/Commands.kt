@@ -5,11 +5,13 @@ import org.json.JSONObject
 import java.util.Locale
 
 /**
- * A chat in API commands (Commands.hs chatRefP / chatTypeP): `@<contactId>` for a contact, `*<noteFolderId>` for
- * the local note folder (Saved Messages). Only built through [contact] and [notes], so it is always one of the two.
+ * A chat in API commands (Commands.hs chatRefP / chatTypeP, :5927-5930): `@<contactId>` for a contact,
+ * `*<noteFolderId>` for the local note folder (Saved Messages), `#<groupId>` for a group (never with a member-support
+ * scope). Only built through [contact], [notes] and [group], so it is always one of the three.
  */
 internal class ChatRef private constructor(private val text: String) {
     val isNotes: Boolean get() = text.startsWith('*')
+    val isGroup: Boolean get() = text.startsWith('#')
     override fun toString(): String = text
     override fun equals(other: Any?): Boolean = other is ChatRef && other.text == text
     override fun hashCode(): Int = text.hashCode()
@@ -17,6 +19,10 @@ internal class ChatRef private constructor(private val text: String) {
     companion object {
         fun contact(contactId: Long): ChatRef = ChatRef("@$contactId")
         fun notes(noteFolderId: Long): ChatRef = ChatRef("*$noteFolderId")
+        fun group(groupId: Long): ChatRef {
+            require(groupId > 0) { "group id" }
+            return ChatRef("#$groupId")
+        }
     }
 }
 
@@ -157,11 +163,19 @@ internal object Commands {
      * APISendMessages to a contact -> `newChatItems`. With [quotedItemId] the message is a reply; the core copies
      * the quoted item's content into the message itself. Per-message ttl stays default: the contact's timer applies.
      */
-    fun sendText(contactId: Long, text: String, quotedItemId: Long? = null): String {
+    fun sendText(contactId: Long, text: String, quotedItemId: Long? = null): String =
+        sendText(ChatRef.contact(contactId), text, quotedItemId)
+
+    /**
+     * [sendText] to a contact or a group (sendRefP, Commands.hs:5931-5933: `#<groupId>` without scope or
+     * `as_group`, so a group message goes to every member as ours). Not for notes: they use [createNote].
+     */
+    fun sendText(chat: ChatRef, text: String, quotedItemId: Long? = null): String {
+        require(!chat.isNotes) { "notes use /_create" }
         val msgContent = JSONObject().put("type", "text").put("text", text)
         val composed = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
         if (quotedItemId != null) composed.put("quotedItemId", quotedItemId)
-        return "/_send @$contactId json " + asciiJson(JSONArray().put(composed).toString())
+        return "/_send $chat json " + asciiJson(JSONArray().put(composed).toString())
     }
 
     /**
@@ -199,10 +213,15 @@ internal object Commands {
     }
 
     /** APIChatItemReaction -> `chatItemReaction`. [emoji] must pass [InputRules.reactionAllowed]. */
-    fun reaction(contactId: Long, itemId: Long, add: Boolean, emoji: String): String {
+    fun reaction(contactId: Long, itemId: Long, add: Boolean, emoji: String): String =
+        reaction(ChatRef.contact(contactId), itemId, add, emoji)
+
+    /** [reaction] in a contact or group chat (`/_reaction <chatRef> <itemId> on|off <json>`, Commands.hs:5467). */
+    fun reaction(chat: ChatRef, itemId: Long, add: Boolean, emoji: String): String {
+        require(!chat.isNotes) { "no reactions in notes" }
         require(InputRules.reactionAllowed(emoji)) { "unknown reaction" }
         val reaction = JSONObject().put("type", "emoji").put("emoji", emoji)
-        return "/_reaction @$contactId $itemId ${if (add) "on" else "off"} " + asciiJson(reaction.toString())
+        return "/_reaction $chat $itemId ${if (add) "on" else "off"} " + asciiJson(reaction.toString())
     }
 
     /** APIForwardChatItems -> `newChatItems` for the destination (empty when nothing could be forwarded). */
@@ -219,7 +238,13 @@ internal object Commands {
     }
 
     /** APISetChatSettings -> `cmdOk`. [settings] is the WHOLE ChatSettings: build it with [CoreJson.chatSettingsUpdate]. */
-    fun chatSettings(contactId: Long, settings: JSONObject): String = "/_settings @$contactId " + asciiJson(settings.toString())
+    fun chatSettings(contactId: Long, settings: JSONObject): String = chatSettings(ChatRef.contact(contactId), settings)
+
+    /** [chatSettings] for a contact or a group (APISetChatSettings handles CTGroup, Commands.hs:1865-1873). */
+    fun chatSettings(chat: ChatRef, settings: JSONObject): String {
+        require(!chat.isNotes) { "the core refuses settings for notes" }
+        return "/_settings $chat " + asciiJson(settings.toString())
+    }
 
     /** APIClearChat -> `chatCleared`. Local only: nothing is sent to the contact. */
     fun clearChat(contactId: Long): String = clearChat(ChatRef.contact(contactId))
@@ -245,13 +270,90 @@ internal object Commands {
     }
 
     /** APIChatRead -> `cmdOk`. */
-    fun markRead(contactId: Long): String = "/_read chat @$contactId"
+    fun markRead(contactId: Long): String = markRead(ChatRef.contact(contactId))
+
+    /** [markRead] for a contact or a group (APIChatRead CTGroup without scope, Commands.hs:1225-1238). */
+    fun markRead(chat: ChatRef): String = "/_read chat $chat"
 
     /** APIDeleteChat for a contact, without notifying anyone. Used only for preset contact cards. */
     fun deleteContactQuietly(contactId: Long): String = "/_delete @$contactId full notify=off"
 
     /** APIDeleteChat for a pending connection (e.g. an invite we refuse to hand out). */
     fun deletePendingConnection(connId: Long): String = "/_delete :$connId full notify=off"
+
+    // ---- Groups (docs/groups-plan.md, first release). Sources: reference/simplex-chat at 7.0.0.12. -----------------
+
+    /**
+     * APINewGroup (`/_group <userId> <GroupProfile json>`, Commands.hs:5603; handler :2639-2644) -> `groupCreated
+     * {groupInfo}`. Build [profile] with [CoreJson.newGroupProfile]. Creates the group on this phone only; nothing
+     * is sent until members are added.
+     */
+    fun newGroup(userId: Long, profile: JSONObject): String = "/_group $userId " + asciiJson(profile.toString())
+
+    /**
+     * APIAddMember (`/_add #<groupId> <contactId> <role>`, Commands.hs:5508; handler :2742-2772) ->
+     * `sentGroupInvitation`. Needs admin (`max GRAdmin memRole`, :2751). Only [ROLE_MEMBER] or [ROLE_OBSERVER] here:
+     * the core refuses higher initial roles for links, and the first release adds people as members or observers.
+     */
+    fun addMember(groupId: Long, contactId: Long, role: String): String {
+        require(role == ROLE_MEMBER || role == ROLE_OBSERVER) { "initial role" }
+        return "/_add ${ChatRef.group(groupId)} $contactId $role"
+    }
+
+    /** APIJoinGroup (`/_join #<groupId>`, Commands.hs:5509) -> `userAcceptedGroupSent`. Accepts an invitation. */
+    fun joinGroup(groupId: Long): String = "/_join ${ChatRef.group(groupId)}"
+
+    /** APIListMembers (`/_members #<groupId>`, Commands.hs:5516; handler :3170) -> `groupMembers {group {groupInfo, members}}`. */
+    fun listMembers(groupId: Long): String = "/_members ${ChatRef.group(groupId)}"
+
+    /**
+     * APILeaveGroup (`/_leave #<groupId>`, Commands.hs:5515; handler :3125-3145) -> `leftMemberUser`. Tells the
+     * members, deletes the member connections and keeps the chat (status left).
+     */
+    fun leaveGroup(groupId: Long): String = "/_leave ${ChatRef.group(groupId)}"
+
+    /**
+     * APIDeleteChat for a group (Commands.hs:5478; handler :1336-1366) -> `groupDeletedUser`. The core ignores the mode
+     * word here: it deletes for everyone exactly when we are an active owner (`doSendDel = memberActive membership &&
+     * isOwner`, :1348), and refuses anyone else who is still a current member (CEGroupUserRole, :1339-1341). So a phone-only delete must
+     * leave first. [forEveryone] only documents the caller's intent in the command line.
+     */
+    fun deleteGroup(groupId: Long, forEveryone: Boolean): String =
+        "/_delete ${ChatRef.group(groupId)} full notify=${if (forEveryone) "on" else "off"}"
+
+    /**
+     * APIDeleteMemberChatItem (`/_delete member item #<groupId> <itemIds>`, Commands.hs:5464; handler :901-907,
+     * :4069-4088) -> `chatItemsDeleted`. Moderator or higher, and never above our own role. With fullDelete on the
+     * rows become "moderated" placeholders (Store/Messages.hs:2833-2850 updateGroupChatItemModerated).
+     */
+    fun deleteMemberItems(groupId: Long, itemIds: List<Long>): String {
+        require(itemIds.isNotEmpty()) { "no items" }
+        return "/_delete member item ${ChatRef.group(groupId)} ${itemIds.joinToString(",")}"
+    }
+
+    /**
+     * APIGroupMemberInfo (`/_info #<groupId> <groupMemberId>`, Commands.hs:5557) -> `groupMemberInfo {groupInfo,
+     * member, connectionStats_?}` (Controller.hs:790). For the restore repair of member connections.
+     */
+    fun groupMemberInfo(groupId: Long, groupMemberId: Long): String = "/_info ${ChatRef.group(groupId)} $groupMemberId"
+
+    /**
+     * APISyncGroupMemberRatchet (`/_sync #<groupId> <groupMemberId>[ force=on]`, Commands.hs:5572) ->
+     * `groupMemberRatchetSyncStarted {groupInfo, member, connectionStats}` (Controller.hs:797). Same agent rules as
+     * [syncRatchet]: [force] only for the restore repair.
+     */
+    fun syncGroupMember(groupId: Long, groupMemberId: Long, force: Boolean = false): String =
+        "/_sync ${ChatRef.group(groupId)} $groupMemberId" + if (force) " force=on" else ""
+
+    /**
+     * APISwitchGroupMember (`/_switch #<groupId> <groupMemberId>`, Commands.hs:5568) -> `groupMemberSwitchStarted`
+     * (Controller.hs:793); progress arrives as `groupMemberSwitch` events (Controller.hs:926).
+     */
+    fun switchGroupMember(groupId: Long, groupMemberId: Long): String = "/_switch ${ChatRef.group(groupId)} $groupMemberId"
+
+    /** Role words of the core's memberRole parser (Commands.hs:5914-5921). */
+    const val ROLE_MEMBER = "member"
+    const val ROLE_OBSERVER = "observer"
 
     // ---- 12-word backup (docs/recovery-phrase-plan.md). Sources: reference/simplex-chat at 7.0.0.12. ----------------
 
