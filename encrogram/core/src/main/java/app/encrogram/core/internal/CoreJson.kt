@@ -124,6 +124,12 @@ internal data class CoreItem(
      * history copy, Library/Internal.hs:1428). Only compared, never logged.
      */
     val sharedMsgId: String? = null,
+    /** The item's file (CIFile), for image, video, voice and file content; null otherwise and when deleted (media phase 1). */
+    val file: app.encrogram.core.internal.media.CoreFile? = null,
+    /** msgContent.image: the preview data URL that travelled in the message (image and video), untrusted. Never logged. */
+    val preview: String? = null,
+    /** msgContent.duration in whole seconds (video and voice). */
+    val durationSeconds: Int? = null,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -225,6 +231,8 @@ internal data class CoreQuote(
     val outgoing: Boolean,
     val authorId: String? = null,
     val sharedMsgId: String? = null,
+    /** The quoted message's content type tag (text, image, video, voice, file, link...), when known. */
+    val msgContentType: String? = null,
 )
 
 /** One entry of chatItemsDeleted: [replacement] is the item as it is now when it was only marked deleted. */

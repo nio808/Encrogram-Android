@@ -10,7 +10,7 @@ package app.encrogram.core.api
  *
  * v2 (docs/v2-plan.md): one profile, one-time invites, 1:1 text chats with reply, edit, delete,
  * reactions, forward, search, disappearing messages and chat flags; groups, roles and group links (step 6).
- * Files and voice come with media (step 5).
+ * Photos, GIFs, video, voice and files: see the media section below and SecuredMedia.kt (docs/media-plan.md).
  * Changes caused by our own actions and by the peer arrive the same way: through [SecuredListener].
  */
 interface SecuredEngine {
@@ -155,6 +155,42 @@ interface SecuredEngine {
     /** Leaves the group; the chat stays until deleted. */
     fun leaveGroup(chatId: Long, callback: SecuredCallback<Unit>) = notYet(callback)
 
+    // ---- media (docs/media-plan.md). Handles are (chatId, messageId); nothing here names a server or protocol. ----
+    // File events never reach onMessageReceived (one message, one notification): states arrive as onMessageChanged,
+    // progress as onMediaProgress.
+
+    /** Strips metadata, makes the preview and stores the file encrypted, off the main thread. Errors: TOO_LARGE, UNSUPPORTED, STORAGE. */
+    fun prepareMedia(input: MediaInput, callback: SecuredCallback<PreparedMedia>) = notYet(callback)
+
+    /** Gives back a prepared file that won't be sent (its encrypted copy is deleted). */
+    fun discardMedia(prepared: PreparedMedia) {}
+
+    fun sendMedia(chatId: Long, prepared: PreparedMedia, callback: SecuredCallback<SecuredMessage>) =
+        sendMedia(chatId, prepared, "", null, callback)
+
+    /**
+     * Sends [prepared] once, with [caption] (up to 1024 characters, may be empty) in the same message; the UI shows the
+     * caption as its own bubble. Returns the message (media UPLOADING). Saved Messages: NOT_ALLOWED in v1.
+     */
+    fun sendMedia(chatId: Long, prepared: PreparedMedia, caption: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) =
+        notYet(callback)
+
+    /** Tap to download. Before the file can be checked it is queued (DOWNLOADING, 0 bytes). */
+    fun acceptMedia(chatId: Long, messageId: Long, callback: SecuredCallback<Unit>) = notYet(callback)
+
+    /** Incoming: stops the download, back to WAITING. Outgoing: stops the upload (FAILED, CANCELLED). */
+    fun cancelMedia(chatId: Long, messageId: Long, callback: SecuredCallback<Unit>) = notYet(callback)
+
+    /** The plain bytes in memory (photos, GIFs, voice, small video). Over 16 MB: Kind.TOO_LARGE, use [openMediaForPlayback]. */
+    fun readMediaBytes(chatId: Long, messageId: Long, callback: SecuredCallback<ByteArray>) = notYet(callback)
+
+    /** Random access to a readable file of any size. Close it (or [releasePlayback]) when the player closes. */
+    fun openMediaForPlayback(chatId: Long, messageId: Long, callback: SecuredCallback<MediaPlayback>) = notYet(callback)
+
+    fun releasePlayback(playback: MediaPlayback) {
+        playback.close()
+    }
+
     // ---- network ----------------------------------------------------------------------------------------------
 
     /** False while the phone has no usable network; screens then say "Waiting for network…" like Telegram's. */
@@ -236,6 +272,11 @@ interface SecuredListener {
     fun onBackupStateChanged() {}
     /** [SecuredEngine.isOnline] changed. */
     fun onConnectionChanged(online: Boolean) {}
+    /**
+     * A file is moving: live progress for one message's media, throttled (about 4 a second, always the final value).
+     * Never sent together with onMessageChanged per step: a cell updates its own progress ring, the list doesn't rebuild.
+     */
+    fun onMediaProgress(chatId: Long, messageId: Long, transferredBytes: Long, totalBytes: Long) {}
 }
 
 fun interface SecuredCallback<T> {
@@ -249,7 +290,8 @@ sealed class SecuredResult<out T> {
 
 /** A user-readable failure. [message] is safe to show; it never contains message text or keys. */
 data class SecuredError(val kind: Kind, val message: String) {
-    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN }
+    /** Media: [TOO_LARGE] (over 100 MB, or over 16 MB for readMediaBytes), [UNSUPPORTED] (send it as a file), [STORAGE] (phone full). */
+    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN, TOO_LARGE, UNSUPPORTED, STORAGE }
 }
 
 data class SecuredProfile(val displayName: String)
@@ -287,6 +329,8 @@ data class ChatSummary @JvmOverloads constructor(
     val lastEvent: GroupEvent? = null,
     /** Groups: you are no longer a member (removed, left, or the group was deleted). The chat stays until deleted. */
     val gone: Boolean = false,
+    /** The last message carries media: the UI shows "Photo", "Video"... then [lastMessageText] (the caption, or a file's name). */
+    val lastMessageMedia: MediaKind? = null,
 )
 
 data class SecuredMessage @JvmOverloads constructor(
@@ -310,9 +354,17 @@ data class SecuredMessage @JvmOverloads constructor(
     val sender: MessageSender? = null,
     /** Groups: a service row ("X joined") instead of a message; [text] is empty. */
     val event: GroupEvent? = null,
+    /** Photo, GIF, video, voice or file; [text] is then its caption (may be empty). Null for text, service rows and deleted messages. */
+    val media: SecuredMedia? = null,
 )
 
-data class QuotePreview(val messageId: Long?, val text: String, val outgoing: Boolean)
+/** [mediaKind]: the quoted message carries media (the UI shows "Photo"... when [text] is empty). */
+data class QuotePreview @JvmOverloads constructor(
+    val messageId: Long?,
+    val text: String,
+    val outgoing: Boolean,
+    val mediaKind: MediaKind? = null,
+)
 
 data class ReactionCount(val emoji: String, val count: Int, val mine: Boolean)
 

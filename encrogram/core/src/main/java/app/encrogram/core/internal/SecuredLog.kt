@@ -38,7 +38,15 @@ internal object SecuredLog {
         BACKUP_ENABLED, BACKUP_DISABLED, BACKUP_STARTED, BACKUP_EXPORTED, BACKUP_UPLOADED, BACKUP_FAILED,
         BACKUP_LOOKUP, BACKUP_LOOKUP_FAILED, BACKUP_IO_FAILED, VAULT_FAILED, PHRASE_SHOWN, PHRASE_REFUSED,
         RESTORE_STARTED, RESTORE_DONE, RESTORE_FAILED, RESTORE_WIPED, RATCHET_SYNC, QUEUE_SWITCH, RESTORE_REPAIR,
+        // Media (docs/media-plan.md). Tags are fixed words (a kind, a verdict, a state); never a name, path, key,
+        // server, description or preview.
+        MEDIA_PREPARED, MEDIA_PREPARE_FAILED, MEDIA_SENT, MEDIA_DESCR, MEDIA_ACCEPTED, MEDIA_CANCELLED, MEDIA_EVENT,
+        MEDIA_DONE, MEDIA_FAILED, MEDIA_READ_FAILED, MEDIA_WIPED, MEDIA_IO_FAILED, MEDIA_CATCHUP,
     }
+
+    /** Tests only: receives every line that would be written, even while [enabled] is off (the canary test reads it). */
+    @Volatile
+    internal var testSink: ((String) -> Unit)? = null
 
     fun i(ev: Ev, tag: String? = null, count: Int? = null) = write(Log.INFO, ev, tag, count)
 
@@ -50,10 +58,13 @@ internal object SecuredLog {
     fun crash(ev: Ev, t: Throwable) = write(Log.ERROR, ev, t.javaClass.simpleName, null)
 
     private fun write(priority: Int, ev: Ev, tag: String?, count: Int?) {
-        if (!enabled) return
+        val sink = testSink
+        if (!enabled && sink == null) return
         val sb = StringBuilder(ev.name)
         sanitizeTag(tag)?.let { sb.append(" kind=").append(it) }
         if (count != null) sb.append(" n=").append(count)
+        sink?.invoke(sb.toString())
+        if (!enabled) return
         try {
             Log.println(priority, TAG, sb.toString())
         } catch (_: Throwable) {
