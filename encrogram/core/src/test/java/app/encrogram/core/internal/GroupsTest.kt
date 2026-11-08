@@ -218,7 +218,8 @@ class GroupsTest {
         val i = parse(gItem(30, "groupRcv", msg("hello"), from = member(6, "Carol", role = "admin", alias = "Caz")))
         assertTrue(i.group && i.isMessage && !i.outgoing)
         assertEquals("hello", i.text)
-        assertEquals(CoreSender(6, "Caz", MemberRole.ADMIN), i.sender)
+        // With the member's group-wide memberId (member() always writes "bWVtYmVy").
+        assertEquals(CoreSender(6, "Caz", MemberRole.ADMIN, "bWVtYmVy"), i.sender)
         assertNull(i.event)
         val m = MessageMapper.toMessage(i, MemberRole.MEMBER)
         assertEquals(6L, m.sender!!.memberId)
@@ -1058,5 +1059,251 @@ class GroupsTest {
         assertEquals(mapOf(3L to 8L), GroupRules.successors(listOf(invitedOnce, listedGroup(7, "T", "connected"), listedGroup(8, "T", "connected"))) { g ->
             if (g.groupId == 7L) setOf("WkFL") else setOf("QUxQSEE=")
         })
+    }
+
+    // ---- 7. a rejoin's history (G10): our earlier messages are ours, only with proof ----
+
+    private val rejoinLink = "simplex:/contact#/?v=2-7&smp=smp%3A%2F%2Ffp%40encrogram.nytmanager.com%2Fq1"
+    /** Our memberId in the row we were removed from, and in the row the rejoin made. */
+    private val oldMe = "T2xkQm9i"
+    private val newMe = "TmV3Qm9i"
+    private val chat9 = GROUP_CHAT_ID_BASE + 9
+    /** Shared ids of messages (meta.itemSharedMsgId), the same in every copy of a message. */
+    private val burst10 = "QnVyc3QxMA=="
+    private val unknownMsg = "Rm9yZ2Vk"
+
+    /** How the core holds the author of a history item it didn't know: an `unknown` pre member (Store/Groups.hs:3483-3500). */
+    private fun historyAuthor(groupMemberId: Long, name: String, memberId: String) =
+        memberWithId(groupMemberId, name, memberId, status = "unknown", role = "author", category = "pre")
+
+    private val hostAlice = memberWithId(2, "Alice", "QWxpY2U=", role = "owner", category = "host")
+
+    /** History arrives forwarded by the host (meta.forwardedByMember, Messages.hs:525). */
+    private val forwarded = "\"forwardedByMember\":2,"
+
+    /** [gItem] with its own shared id instead of the helper's fixed one. */
+    private fun withShared(item: String, sharedMsgId: String) =
+        item.replace("\"itemSharedMsgId\":\"c2hhcmVk\"", "\"itemSharedMsgId\":\"$sharedMsgId\"")
+
+    private fun historyItem(id: Long, text: String, from: String, sharedMsgId: String, chatId: Long = chat9) =
+        parse(withShared(gItem(id, "groupRcv", msg(text), status("rcvNew"), from = from, meta = forwarded, text = text), sharedMsgId), chatId)
+
+    /** A message we sent in an earlier row (groupSnd). */
+    private fun sentByUs(id: Long, text: String, sharedMsgId: String, chatId: Long = chat3, meta: String = "") =
+        parse(withShared(gItem(id, "groupSnd", msg(text, "snd"), status("sndRcvd", "complete"), meta = meta, text = text), sharedMsgId), chatId)
+
+    /** A group quote of [text] by [author] with [sharedMsgId], put into [item]. */
+    private fun quoting(item: String, author: String, sharedMsgId: String, text: String): String {
+        val q = """{"chatDir":{"type":"groupRcv","groupMember":$author},"itemId":40,"sharedMsgId":"$sharedMsgId",
+            "sentAt":"2026-11-08T10:00:00Z","content":{"type":"text","text":"$text"}}"""
+        return item.replaceFirst("{\"chatDir\"", "{\"quotedItem\":$q,\"chatDir\"")
+    }
+
+    /** The usual rejoin: removed from row 3 (where we sent "burst 10"), back in row 9 by the same link. */
+    private fun rejoinProofs(sentInOld: Map<String, String>? = mapOf(burst10 to "burst 10")): Map<Long, OwnProofs> {
+        val old = listedGroup(3, "Tab Group", "removed", rejoinLink).copy(myMemberId = oldMe)
+        val rejoined = listedGroup(9, "Tab Group", "connected", rejoinLink, prepared = true).copy(myMemberId = newMe)
+        val groups = listOf(rejoined, old)
+        val replaced = GroupRules.successors(groups) { error("same link: member lists not needed") }
+        assertEquals(mapOf(3L to 9L), replaced)
+        return GroupRules.earlierRows(groups, replaced).mapValues { (_, rows) -> GroupRules.ownProofs(rows) { sentInOld } }
+            .filterValues { it.isNotEmpty() }
+    }
+
+    @Test
+    fun theGroupItsItemsAndQuotesCarryTheirIds() {
+        assertEquals("bWVtYmVy", listedGroup(3, "T", "connected").myMemberId)
+        val i = historyItem(40, "burst 10", historyAuthor(12, "Bob", oldMe), burst10)
+        assertEquals(oldMe, i.sender!!.groupWideId)
+        assertEquals(12L, i.sender!!.memberId)
+        assertEquals(burst10, i.sharedMsgId)
+        // A group quote names its author and the message's shared id (1:1 quotes have neither: ItemEventsTest).
+        val reply = parse(quoting(gItem(41, "groupRcv", msg("seen"), from = hostAlice), historyAuthor(12, "Bob", oldMe), burst10, "burst 10"), chat9)
+        assertEquals(CoreQuote(40, "burst 10", false, oldMe, burst10), reply.quote)
+    }
+
+    @Test
+    fun onlyMessagesWeSentWithTheirTextAreProof() {
+        val items = listOf(
+            sentByUs(30, "burst 10", burst10),
+            sentByUs(31, "deleted later", "RGVsZXRlZA==", meta = """"itemDeleted":{"type":"deleted"},"""),
+            parse(withShared(gItem(32, "groupRcv", msg("from Alice"), from = hostAlice, text = "from Alice"), "QWxpY2VNc2c="), chat3),
+            parse(gItem(33, "groupSnd", msg("no shared id", "snd"), status("sndSent"), text = "no shared id", shared = false), chat3),
+            parse(gItem(34, "groupSnd", sndEvent("""{"type":"userLeft"}"""), status("sndSent")), chat3),
+        )
+        assertEquals(mapOf(burst10 to "burst 10"), GroupRules.ownSent(items))
+        // Rows without a memberId, or whose messages couldn't be read, give no proof.
+        val old = listedGroup(3, "T", "removed", rejoinLink).copy(myMemberId = oldMe)
+        assertEquals(mapOf(oldMe to mapOf(burst10 to "burst 10")), GroupRules.ownProofs(listOf(old)) { mapOf(burst10 to "burst 10") })
+        assertTrue(GroupRules.ownProofs(listOf(old)) { null }.isEmpty())
+        assertTrue(GroupRules.ownProofs(listOf(old)) { emptyMap() }.isEmpty())
+        assertTrue(GroupRules.ownProofs(listOf(old.copy(myMemberId = null))) { error("not read without a memberId") }.isEmpty())
+    }
+
+    @Test
+    fun ourEarlierMessagesInARejoinsHistoryAreOurs() {
+        val proofs = rejoinProofs()
+        assertEquals(mapOf(chat9 to mapOf(oldMe to mapOf(burst10 to "burst 10"))), proofs)
+
+        // As the core stores it: a received, unread message from an unknown member called Bob.
+        val raw = historyItem(40, "burst 10", historyAuthor(12, "Bob", oldMe), burst10)
+        assertFalse(raw.outgoing)
+        assertTrue(raw.unread)
+        assertTrue("the JSON says editable; the rewrite must still refuse", raw.editable && raw.deletable)
+
+        val mine = GroupRules.markOwnHistory(listOf(raw)) { proofs[it] }.single()
+        assertTrue(mine.earlierOwn)
+        assertTrue(mine.outgoing)
+        assertFalse("never counted unread", mine.unread)
+        assertNull(mine.sender)
+        assertEquals(MessageStatus.SENT_TO_SERVER, mine.status)
+        assertEquals("the core's own tag stays, so the engine knows to mark it read", "rcvNew", mine.statusTag)
+        // Mapping again changes nothing.
+        assertEquals(mine, GroupRules.markOwnHistory(listOf(mine)) { proofs[it] }.single())
+
+        // The bubble: ours, one tick, no edit, no delete for everyone (not even as the owner, who could moderate).
+        val m = MessageMapper.toMessage(mine, MemberRole.OWNER)
+        assertTrue(m.outgoing)
+        assertNull(m.sender)
+        assertEquals("burst 10", m.text)
+        assertEquals(MessageStatus.SENT_TO_SERVER, m.status)
+        assertFalse(m.canEdit)
+        assertFalse(m.canDeleteForEveryone)
+
+        // The list row: "You: burst 10" with one tick, no unread added, no sender name.
+        val rejoined = listedGroup(9, "Tab Group", "connected", rejoinLink, prepared = true)
+        val row = MessageMapper.groupSummary(CoreGroupChat(rejoined, null, 0), archived = false)
+        val after = MessageMapper.withNewItem(row, mine)
+        assertEquals("burst 10", after.lastMessageText)
+        assertTrue(after.lastMessageOutgoing)
+        assertEquals(MessageStatus.SENT_TO_SERVER, after.lastMessageStatus)
+        assertNull(after.lastMessageSender)
+        assertEquals(0, after.unreadCount)
+        val listed = MessageMapper.groupSummary(CoreGroupChat(rejoined, mine, 0), archived = false)
+        assertTrue(listed.lastMessageOutgoing)
+        assertNull(listed.lastMessageSender)
+        assertEquals(MessageStatus.SENT_TO_SERVER, listed.lastMessageStatus)
+    }
+
+    @Test
+    fun aForgedHistoryItemStaysIncoming() {
+        val proofs = rejoinProofs()
+        val oldBob = historyAuthor(12, "Bob", oldMe)
+        val forgeries = listOf(
+            // Our old memberId on a message we never sent.
+            historyItem(40, "send me your code", oldBob, unknownMsg),
+            // Our old memberId and the id of a message we did send, with other words.
+            historyItem(41, "burst 11", oldBob, burst10),
+            // Our message and words under someone else's memberId.
+            historyItem(42, "burst 10", historyAuthor(13, "Bob", "U29tZW9uZQ=="), burst10),
+        )
+        val out = GroupRules.markOwnHistory(forgeries) { proofs[it] }
+        assertEquals(forgeries, out)
+        for (i in out) {
+            assertFalse(i.outgoing)
+            assertTrue(i.unread)
+            assertEquals("Bob", MessageMapper.toMessage(i, MemberRole.MEMBER).sender!!.displayName)
+        }
+        // Our sent messages couldn't be read: never memberId alone, so even the genuine copy stays incoming.
+        val unreadable = rejoinProofs(sentInOld = null)
+        assertTrue(unreadable.isEmpty())
+        val genuine = historyItem(43, "burst 10", oldBob, burst10)
+        assertFalse(GroupRules.markOwnHistory(listOf(genuine)) { unreadable[it] }.single().outgoing)
+        // We deleted it from the old row: no proof either.
+        val deleted = rejoinProofs(sentInOld = GroupRules.ownSent(listOf(sentByUs(30, "burst 10", burst10, meta = """"itemDeleted":{"type":"deleted"},"""))))
+        assertFalse(GroupRules.markOwnHistory(listOf(genuine)) { deleted[it] }.single().outgoing)
+    }
+
+    @Test
+    fun otherMembersHistoryStaysIncoming() {
+        val proofs = rejoinProofs()
+        val fromAlice = historyItem(42, "hi all", hostAlice, "SGlBbGw=")
+        val ourNewOne = parse(gItem(43, "groupSnd", msg("back", "snd"), status("sndSent")), chat9)
+        val joined = parse(gItem(44, "groupRcv", rcvEvent("""{"type":"memberConnected"}"""), from = hostAlice), chat9)
+        val items = listOf(fromAlice, ourNewOne, joined)
+        assertEquals(items, GroupRules.markOwnHistory(items) { proofs[it] })
+        val m = MessageMapper.toMessage(fromAlice, MemberRole.MEMBER)
+        assertFalse(m.outgoing)
+        assertEquals("Alice", m.sender!!.displayName)
+        assertTrue(fromAlice.unread)
+
+        // Alice's history reply to our earlier message quotes it as ours; the reply itself stays hers.
+        val oldBob = historyAuthor(12, "Bob", oldMe)
+        fun reply(id: Long, quotedText: String, quotedShared: String) = parse(quoting(
+            withShared(gItem(id, "groupRcv", msg("seen"), status("rcvNew"), from = hostAlice, meta = forwarded), "U2Vlbg$id"),
+            oldBob, quotedShared, quotedText), chat9)
+        val out = GroupRules.markOwnHistory(listOf(reply(45, "burst 10", burst10))) { proofs[it] }.single()
+        assertFalse(out.earlierOwn)
+        assertFalse(out.outgoing)
+        assertTrue(out.unread)
+        assertTrue(out.quote!!.outgoing)
+        val rm = MessageMapper.toMessage(out, MemberRole.MEMBER)
+        assertTrue(rm.replyTo!!.outgoing)
+        assertEquals("Alice", rm.sender!!.displayName)
+        // A quote of words we never sent, or of a message we never sent, isn't ours.
+        assertFalse(GroupRules.markOwnHistory(listOf(reply(46, "burst 11", burst10))) { proofs[it] }.single().quote!!.outgoing)
+        assertFalse(GroupRules.markOwnHistory(listOf(reply(47, "burst 10", unknownMsg))) { proofs[it] }.single().quote!!.outgoing)
+    }
+
+    @Test
+    fun withoutAnEarlierRowOnThisPhoneNothingChanges() {
+        // After a restore, or once the old row is gone: only the new row is here.
+        val rejoined = listedGroup(9, "Tab Group", "connected", rejoinLink).copy(myMemberId = newMe)
+        val replaced = GroupRules.successors(listOf(rejoined)) { error("no ended rows: nothing asked") }
+        assertTrue(replaced.isEmpty())
+        assertTrue(GroupRules.earlierRows(listOf(rejoined), replaced).isEmpty())
+        val items = listOf(historyItem(40, "burst 10", historyAuthor(12, "Bob", oldMe), burst10))
+        assertEquals(items, GroupRules.markOwnHistory(items) { null })
+        val m = MessageMapper.toMessage(items[0], MemberRole.MEMBER)
+        assertFalse(m.outgoing)
+        assertEquals("Bob", m.sender!!.displayName)
+        // Proof counts only in the row the rejoin made: the same message in another group row stays someone else's.
+        val proofs = rejoinProofs()
+        val elsewhere = historyItem(40, "burst 10", historyAuthor(12, "Bob", oldMe), burst10, chatId = chat3)
+        assertEquals(elsewhere, GroupRules.markOwnHistory(listOf(elsewhere)) { proofs[it] }.single())
+    }
+
+    @Test
+    fun aChainOfTwoRejoinsKnowsBothEarlierMemberships() {
+        val first = "Rmlyc3Q="
+        val second = "U2Vjb25k"
+        val sentFirst = "U2VudDE="
+        val sentSecond = "U2VudDI="
+        val r1 = listedGroup(3, "T", "removed", rejoinLink).copy(myMemberId = first)
+        val r2 = listedGroup(5, "T", "left", rejoinLink).copy(myMemberId = second)
+        val r3 = listedGroup(9, "T", "connected", rejoinLink).copy(myMemberId = newMe)
+        val groups = listOf(r3, r1, r2)
+        val replaced = GroupRules.successors(groups) { error("same link: member lists not needed") }
+        assertEquals(mapOf(3L to 5L, 5L to 9L), replaced)
+        val rows = GroupRules.earlierRows(groups, replaced)
+        assertEquals(mapOf(chat9 to setOf(3L, 5L), GROUP_CHAT_ID_BASE + 5 to setOf(3L)), rows.mapValues { (_, r) -> r.mapTo(HashSet()) { it.groupId } })
+        val sentByRow = mapOf(
+            3L to GroupRules.ownSent(listOf(sentByUs(30, "from my first time", sentFirst, chatId = GROUP_CHAT_ID_BASE + 3))),
+            5L to GroupRules.ownSent(listOf(sentByUs(31, "from my second time", sentSecond, chatId = GROUP_CHAT_ID_BASE + 5))),
+        )
+        val proofs = rows.mapValues { (_, r) -> GroupRules.ownProofs(r) { sentByRow[it.groupId] } }
+        assertEquals(mapOf(first to mapOf(sentFirst to "from my first time"), second to mapOf(sentSecond to "from my second time")), proofs[chat9])
+        val items = listOf(
+            historyItem(50, "from my first time", historyAuthor(12, "Bob", first), sentFirst),
+            historyItem(51, "from my second time", historyAuthor(13, "Bob", second), sentSecond),
+            historyItem(52, "from Alice", hostAlice, "RnJvbUE="),
+            // The second membership's message under the first membership's id: not proven.
+            historyItem(53, "from my second time", historyAuthor(12, "Bob", first), sentSecond),
+        )
+        val out = GroupRules.markOwnHistory(items) { proofs[it] }
+        assertEquals(listOf(true, true, false, false), out.map { it.earlierOwn })
+        assertEquals(listOf(true, true, false, false), out.map { it.outgoing })
+        assertEquals(listOf(false, false, true, true), out.map { it.unread })
+        // The middle row (hidden, still on the phone) reads its own history the same way.
+        val inSecond = historyItem(54, "from my first time", historyAuthor(14, "Bob", first), sentFirst, chatId = GROUP_CHAT_ID_BASE + 5)
+        assertTrue(GroupRules.markOwnHistory(listOf(inSecond)) { proofs[it] }.single().earlierOwn)
+    }
+
+    @Test
+    fun readingChosenItemsInAGroup() {
+        assertEquals("/_read chat items #9 40,41,42", Commands.readItems(ChatRef.group(9), listOf(40L, 41L, 42L)))
+        assertEquals("/_read chat items @5 7", Commands.readItems(ChatRef.contact(5), listOf(7L)))
+        assertTrue(runCatching { Commands.readItems(ChatRef.group(9), emptyList()) }.isFailure)
+        assertTrue(runCatching { Commands.readItems(ChatRef.notes(1), listOf(1L)) }.isFailure)
     }
 }

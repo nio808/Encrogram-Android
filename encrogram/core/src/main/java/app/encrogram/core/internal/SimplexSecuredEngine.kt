@@ -113,6 +113,16 @@ internal class SimplexSecuredEngine(
      * They stay in [chatCache] and [groupCache], so their history can still be opened and deleted.
      */
     private var hiddenChats: Set<Long> = emptySet()
+    /**
+     * Per group row a rejoin made (chat id): proof of what we sent from its earlier rows ([GroupRules.ownProofs]: our
+     * earlier memberIds and the messages each sent), so our earlier messages in the history it received read as ours
+     * ([localView]) and nothing else does. Set by every list load.
+     */
+    private var earlierProofs: Map<Long, OwnProofs> = emptyMap()
+    /** Our own sent messages per ended group row (groupId -> [GroupRules.ownSent]), read once: those rows don't change. */
+    private val ownSentCache = HashMap<Long, Map<String, String>>()
+    /** Rows already searched for our own unread history ([sweepOwnHistory]), with the proofs searched with. */
+    private val ownHistorySwept = HashMap<Long, OwnProofs>()
     /** The other members' memberIds per groupId ([CoreJson.otherMemberIds]), with the member count they were read at. */
     private val memberIdCache = HashMap<Long, Pair<Int, Set<String>>>()
     private var receiver: Receiver? = null
@@ -263,7 +273,7 @@ internal class SimplexSecuredEngine(
         when (val r = send(cmd)) {
             is CoreReply.Result ->
                 if (r.type == "apiChat") {
-                    val items = InputRules.pageWindow(withLinkJoins(CoreJson.parseChatItemsOfChat(r.body)), page, want)
+                    val items = InputRules.pageWindow(localView(CoreJson.parseChatItemsOfChat(r.body)), page, want)
                     val role = roleIn(chatId)
                     ok(callback, items.map { MessageMapper.toMessage(it, role) })
                 } else {
@@ -383,7 +393,8 @@ internal class SimplexSecuredEngine(
         }
         when (val r = send(Commands.sendText(ref, text, replyToId))) {
             is CoreReply.Result -> {
-                val item = if (r.type == "newChatItems") CoreJson.parseChatItems(r.body).firstOrNull { it.chatId == chatId } else null
+                // localView: a reply to one of our earlier messages in a rejoin's history quotes it as ours.
+                val item = if (r.type == "newChatItems") localView(CoreJson.parseChatItems(r.body)).firstOrNull { it.chatId == chatId } else null
                 if (item == null) return@post err(callback, unexpected(r))
                 ok(callback, MessageMapper.toMessage(item, roleIn(chatId)))
                 applyNewItems(listOf(item))
@@ -1354,6 +1365,9 @@ internal class SimplexSecuredEngine(
         timedChats.clear()
         groupCache.clear()
         hiddenChats = emptySet()
+        earlierProofs = emptyMap()
+        ownSentCache.clear()
+        ownHistorySwept.clear()
         memberIdCache.clear()
         noteFolderId = null
         publishChats()
@@ -2332,6 +2346,9 @@ internal class SimplexSecuredEngine(
         val others = ArrayList<Long>()
         for (id in ids) {
             val item = itemOrErr(chatId, id, callback) ?: return
+            // Our own message from an earlier membership (a rejoin's history): the core holds it as received, so a
+            // broadcast delete is refused (Commands.hs:889) and moderating it would delete it for others as an admin.
+            if (item.earlierOwn) return refuse(callback, "delete_history", ErrorMapper.CANT_DELETE_FOR_EVERYONE)
             if (item.outgoing) {
                 own.add(id)
             } else {
@@ -2458,7 +2475,8 @@ internal class SimplexSecuredEngine(
                     err(callback, unexpected(r))
                     return null
                 }
-                CoreJson.parseChatItemsOfChat(r.body).firstOrNull { it.itemId == itemId && it.isMessage }?.let { return it }
+                // As the chat shows it: our own earlier messages in a rejoin's history are ours, and not editable.
+                localView(CoreJson.parseChatItemsOfChat(r.body)).firstOrNull { it.itemId == itemId && it.isMessage }?.let { return it }
                 err(callback, ErrorMapper.messageGone())
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.LOAD))
@@ -2895,6 +2913,9 @@ internal class SimplexSecuredEngine(
         timedChats.clear()
         groupCache.clear()
         hiddenChats = emptySet()
+        earlierProofs = emptyMap()
+        ownSentCache.clear()
+        ownHistorySwept.clear()
         memberIdCache.clear()
         previewCache.clear()
         refreshWindowOpen = false
@@ -2986,11 +3007,19 @@ internal class SimplexSecuredEngine(
             is CoreReply.Error -> SecuredLog.w(Ev.EVENT_ERROR, reply.error.tag)
             is CoreReply.Result -> when (reply.type) {
                 "newChatItems" -> {
-                    val items = withLinkJoins(CoreJson.parseChatItems(reply.body))
+                    val parsed = CoreJson.parseChatItems(reply.body)
+                    // A group row we don't know yet (a join that just came up): load the list first (applyNewItems
+                    // would do it anyway), so a rejoin is recognised before its history is mapped.
+                    if (parsed.any { it.group && it.chatId !in chatCache }) refreshChats(notify = true)
+                    val items = localView(parsed)
+                    // Our own earlier messages in a rejoin's history: read in the core before the row counts them.
+                    markOwnHistoryRead(items)
                     applyNewItems(items)
                     // Incoming messages, and service rows in either direction ("You left" comes from our own command
                     // as an event). Notes are always ours (outgoing) and never notify; the chat id check keeps it so.
-                    val incoming = items.filter { it.chatId != SAVED_MESSAGES_CHAT_ID && ((it.isMessage && !it.outgoing) || it.event != null) }
+                    // Our own earlier messages from a rejoin's history go to an open chat too; being outgoing, they
+                    // never notify (SecuredService.notifies).
+                    val incoming = items.filter { it.chatId != SAVED_MESSAGES_CHAT_ID && ((it.isMessage && (!it.outgoing || it.earlierOwn)) || it.event != null) }
                         .map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
                     if (incoming.isNotEmpty()) main.post { for (m in incoming) for (l in listeners) l.onMessageReceived(m) }
                 }
@@ -3106,7 +3135,7 @@ internal class SimplexSecuredEngine(
             val r = send(Commands.getChat(chat, LOOKBACK_COUNT, beforeId = before))
             // Not cached: the next reload tries again.
             if (r !is CoreReply.Result || r.type != "apiChat") return newest
-            val page = withLinkJoins(CoreJson.parseChatItemsOfChat(r.body))
+            val page = localView(CoreJson.parseChatItemsOfChat(r.body))
             CoreJson.newestShown(page)?.let {
                 previewCache[chatId] = newest.itemId to it
                 return it
@@ -3142,6 +3171,69 @@ internal class SimplexSecuredEngine(
         refreshOwed = false
         refreshChats(notify = true)
         main.postDelayed({ post { refreshWindowEnded() } }, REFRESH_WINDOW_MS)
+    }
+
+    /**
+     * Items as this phone shows them, on every path that maps items (a chat page and search, new items, edits and
+     * reactions, the list's last item, single-item checks): link joins worded ([withLinkJoins]) and our own earlier
+     * messages in a rejoin's history made ours when proven ([GroupRules.markOwnHistory] with [earlierProofs]).
+     */
+    private fun localView(items: List<CoreItem>): List<CoreItem> =
+        GroupRules.markOwnHistory(withLinkJoins(items)) { earlierProofs[it] }
+
+    /**
+     * Our own sent messages in an ended group row ([GroupRules.ownSent] over its newest [OWN_SENT_READ] items: a rejoin's
+     * history is the group's newest 100), read once and kept. Null when the core couldn't give them: nothing from that
+     * row is then treated as ours (never memberId alone), and the next list load asks again.
+     */
+    private fun ownSentOf(g: CoreGroup): Map<String, String>? {
+        ownSentCache[g.groupId]?.let { return it }
+        val r = send(Commands.getChat(ChatRef.group(g.groupId), OWN_SENT_READ))
+        if (r !is CoreReply.Result || r.type != "apiChat") {
+            SecuredLog.w(Ev.GROUP_ACTION, "own_sent_unreadable")
+            return null
+        }
+        val sent = GroupRules.ownSent(CoreJson.parseChatItemsOfChat(r.body))
+        ownSentCache[g.groupId] = sent
+        SecuredLog.i(Ev.GROUP_ACTION, "own_sent_read", sent.size)
+        return sent
+    }
+
+    /**
+     * Marks our own earlier messages from a rejoin's history ([CoreItem.earlierOwn]) read in the core while it still
+     * counts them unread (rcvNew), so no unread count, here or in the core, includes them. Returns how many were
+     * marked, or null when the core refused one of the commands (the next list load looks again).
+     */
+    private fun markOwnHistoryRead(items: List<CoreItem>): Int? {
+        val byChat = items.filter { it.earlierOwn && it.statusTag == "rcvNew" }.groupBy { it.chatId }
+        if (byChat.isEmpty()) return 0
+        var marked = 0
+        var failed = false
+        for ((chatId, list) in byChat) {
+            val groupId = CoreJson.groupIdFromChatId(chatId) ?: continue
+            for (ids in list.map { it.itemId }.distinct().chunked(READ_ITEMS_CHUNK)) {
+                if (isResult(send(Commands.readItems(ChatRef.group(groupId), ids)), "itemsReadForChat")) marked += ids.size else failed = true
+            }
+        }
+        SecuredLog.i(Ev.GROUP_ACTION, if (failed) "own_history_read_failed" else "own_history_read", marked)
+        return if (failed) null else marked
+    }
+
+    /**
+     * Once per rejoined row and proof, while the core counts unread items there: our own earlier messages that arrived
+     * while no listener ran (before the engine was running, or before the rejoin was recognised) are marked read
+     * ([markOwnHistoryRead]). History is at most 100 messages, so the newest [OWN_HISTORY_SWEEP] items cover it right
+     * after a join. Returns how many it marked, to take off the row's count.
+     */
+    private fun sweepOwnHistory(g: CoreGroup, unread: Int): Int {
+        val proofs = earlierProofs[g.chatId] ?: return 0
+        if (unread <= 0 || ownHistorySwept[g.chatId] == proofs) return 0
+        val r = send(Commands.getChat(ChatRef.group(g.groupId), OWN_HISTORY_SWEEP))
+        // Not remembered: the next list load looks again.
+        if (r !is CoreReply.Result || r.type != "apiChat") return 0
+        val marked = markOwnHistoryRead(GroupRules.markOwnHistory(CoreJson.parseChatItemsOfChat(r.body)) { earlierProofs[it] }) ?: return 0
+        ownHistorySwept[g.chatId] = proofs
+        return marked
     }
 
     /**
@@ -3182,19 +3274,29 @@ internal class SimplexSecuredEngine(
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
         }
+        // One row per group, like Telegram: a rejoin's new row replaces the old left or removed one. Worked out before the
+        // rows are built, so our own earlier messages in a rejoin's history already read as ours in the preview.
+        val replaced = rejoins(groups.map { it.group })
+        val hidden = replaced.keys.mapTo(HashSet()) { CoreJson.groupChatId(it) }
+        if (hidden != hiddenChats) SecuredLog.i(Ev.GROUP_ACTION, "rejoin_rows_hidden", hidden.size)
+        hiddenChats = hidden
+        // Proof of what we sent before, from the earlier rows (each read once, ownSentOf).
+        val earlierRows = GroupRules.earlierRows(groups.map { it.group }, replaced)
+        ownSentCache.keys.retainAll(earlierRows.values.flatMapTo(HashSet()) { rows -> rows.map { it.groupId } })
+        earlierProofs = earlierRows.mapValues { (_, rows) -> GroupRules.ownProofs(rows) { ownSentOf(it) } }.filterValues { it.isNotEmpty() }
+        ownHistorySwept.keys.retainAll(earlierProofs.keys)
         for (listed in groups) {
             val id = listed.group.chatId
             groupCache[id] = listed.group
             // Invited: nothing is previewed before joining, so no look-back.
-            val newest = listed.lastItem?.let { withLinkJoins(listOf(it)).single() }
-            val chat = listed.copy(lastItem = if (listed.group.invited) newest else lastShown(id, ChatRef.group(listed.group.groupId), newest))
+            val newest = listed.lastItem?.let { localView(listOf(it)).single() }
+            // The look-back may come from its cache, made before a rejoin was recognised: mapped again (a no-op otherwise).
+            val last = if (listed.group.invited) newest else lastShown(id, ChatRef.group(listed.group.groupId), newest)?.let { localView(listOf(it)).single() }
+            val unread = listed.unreadCount - sweepOwnHistory(listed.group, listed.unreadCount)
+            val chat = listed.copy(lastItem = last, unreadCount = unread.coerceAtLeast(0))
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
         }
-        // One row per group, like Telegram: a rejoin's new row replaces the old left or removed one.
-        val hidden = rejoinedRows(groups.map { it.group })
-        if (hidden != hiddenChats) SecuredLog.i(Ev.GROUP_ACTION, "rejoin_rows_hidden", hidden.size)
-        hiddenChats = hidden
         // Saved Messages: the user's note folder (the core creates one with every user).
         val notes = CoreJson.parseNoteChat(r.body)
         noteFolderId = notes?.folder?.noteFolderId
@@ -3293,7 +3395,7 @@ internal class SimplexSecuredEngine(
     }
 
     private fun emitChanged(items: List<CoreItem>) {
-        val messages = withLinkJoins(items).filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
+        val messages = localView(items).filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
         if (messages.isEmpty()) return
         markChanged()
         main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
@@ -3305,14 +3407,13 @@ internal class SimplexSecuredEngine(
     }
 
     /**
-     * The chat ids of old group rows that a rejoin replaced ([GroupRules.successors]). Asks the core for member lists
-     * only when an ended membership and a newer row share a name, and again only when that row's member count changes.
+     * Old group rows that a rejoin replaced, old groupId -> newer groupId ([GroupRules.successors]). Asks the core for
+     * member lists only when an ended membership and a newer row share a name, and again only when that row's member
+     * count changes.
      */
-    private fun rejoinedRows(groups: List<CoreGroup>): Set<Long> {
+    private fun rejoins(groups: List<CoreGroup>): Map<Long, Long> {
         memberIdCache.keys.retainAll(groups.mapTo(HashSet()) { it.groupId })
-        val replaced = GroupRules.successors(groups) { memberIdsOf(it) }
-        if (replaced.isEmpty()) return emptySet()
-        return replaced.keys.mapTo(HashSet()) { CoreJson.groupChatId(it) }
+        return GroupRules.successors(groups) { memberIdsOf(it) }
     }
 
     private fun memberIdsOf(g: CoreGroup): Set<String>? {
@@ -3440,6 +3541,12 @@ internal class SimplexSecuredEngine(
         const val LOOKBACK_PAGES = 3
         /** [refreshSoon]: at most one event-driven list reload per this long. */
         const val REFRESH_WINDOW_MS = 500L
+        /** [sweepOwnHistory]: newest items searched (a rejoin's history is at most 100, Library/Internal.hs:1320). */
+        const val OWN_HISTORY_SWEEP = 200
+        /** [ownSentOf]: newest items of an ended row read for our own sent messages (history: the newest 100). */
+        const val OWN_SENT_READ = 200
+        /** [markOwnHistoryRead]: item ids per `/_read chat items` command. */
+        const val READ_ITEMS_CHUNK = 100
         /** Members who joined through our group links ([withLinkJoins]), next to the databases. */
         const val LINK_JOINS_FILE = "link_joins"
         /** [applyNetwork]: reconnect once the default network has stayed the same this long. */

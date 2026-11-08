@@ -112,6 +112,18 @@ internal data class CoreItem(
      * the new member but come from the member who let them in) never can.
      */
     val connectedOf: Long? = null,
+    /**
+     * Our own message from an earlier membership of this group, in the history the group sent us when we joined again
+     * ([GroupRules.markOwnHistory]). The core holds it as a received item from a member it doesn't know, so it is
+     * shown as ours ([outgoing], one tick, never unread) but can't be edited or deleted for everyone. [statusTag] stays
+     * the core's own (rcvNew until it is marked read there).
+     */
+    val earlierOwn: Boolean = false,
+    /**
+     * meta.itemSharedMsgId: the message's id shared by every copy of it (the sender's item, each member's, and a
+     * history copy, Library/Internal.hs:1428). Only compared, never logged.
+     */
+    val sharedMsgId: String? = null,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -120,8 +132,12 @@ internal data class CoreItem(
     val shown: Boolean get() = isMessage || event != null
 }
 
-/** chatDir groupRcv's member (Messages.hs:308-313): the core's groupMemberId, the name we show and the current role. */
-internal data class CoreSender(val memberId: Long, val displayName: String, val role: MemberRole)
+/**
+ * chatDir groupRcv's member (Messages.hs:308-313): the core's groupMemberId, the name we show and the current role.
+ * [groupWideId]: the member's group-wide memberId (GroupMember.memberId, Types.hs:1118), the same in every member's
+ * copy of the group; for a history item it is the author's id as the sender of the history forwarded it.
+ */
+internal data class CoreSender(val memberId: Long, val displayName: String, val role: MemberRole, val groupWideId: String? = null)
 
 /**
  * A group as the chat list needs it (GroupInfo, Types.hs:477-503). [myStatus] is membership.memberStatus as the core
@@ -146,6 +162,11 @@ internal data class CoreGroup(
      * scheme and host don't matter; null when we didn't join by link. The link itself is never kept.
      */
     val linkKey: String? = null,
+    /**
+     * membership.memberId: our own group-wide memberId in this row (random per membership, Types.hs:1118). A rejoin
+     * gets a new one, so the history it receives carries this row's id on our earlier messages ([GroupRules.markOwnHistory]).
+     */
+    val myMemberId: String? = null,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
@@ -193,8 +214,18 @@ internal data class CoreNoteFolder(val noteFolderId: Long, val favorite: Boolean
 /** The note folder's row in `apiChats`, with its newest item. */
 internal data class CoreNoteChat(val folder: CoreNoteFolder, val lastItem: CoreItem?)
 
-/** chatItem.quotedItem: [itemId] is null when the quoted message is not stored on this device. */
-internal data class CoreQuote(val itemId: Long?, val text: String, val outgoing: Boolean)
+/**
+ * chatItem.quotedItem: [itemId] is null when the quoted message is not stored on this device. [authorId]: the quoted
+ * group member's group-wide memberId (chatDir groupRcv), else null. [sharedMsgId]: the quoted message's shared id
+ * (CIQuote.sharedMsgId, Messages.hs:611), when known.
+ */
+internal data class CoreQuote(
+    val itemId: Long?,
+    val text: String,
+    val outgoing: Boolean,
+    val authorId: String? = null,
+    val sharedMsgId: String? = null,
+)
 
 /** One entry of chatItemsDeleted: [replacement] is the item as it is now when it was only marked deleted. */
 internal data class CoreDeletion(val chatId: Long, val itemId: Long, val replacement: CoreItem?)
@@ -541,6 +572,7 @@ internal object CoreJson {
             event = event,
             linkJoinOf = linkJoinOf,
             connectedOf = connectedOf,
+            sharedMsgId = meta.str("itemSharedMsgId")?.ifEmpty { null },
         )
     }
 
@@ -758,6 +790,7 @@ internal object CoreJson {
             activityTimeMs = ts,
             profileName = profile?.str("displayName").orEmpty(),
             linkKey = joinLinkKey(g),
+            myMemberId = membership?.str("memberId")?.ifEmpty { null },
         )
     }
 
@@ -774,10 +807,10 @@ internal object CoreJson {
         return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    /** chatDir groupRcv's GroupMember -> the sender we show. */
+    /** chatDir groupRcv's GroupMember -> the sender we show (with its group-wide memberId). */
     fun parseSender(m: JSONObject?): CoreSender? {
         if (m == null || !present(m, "groupMemberId")) return null
-        return CoreSender(m.optLong("groupMemberId"), memberName(m), memberRole(m.str("memberRole")))
+        return CoreSender(m.optLong("groupMemberId"), memberName(m), memberRole(m.str("memberRole")), m.str("memberId")?.ifEmpty { null })
     }
 
     /** A member's name as we show it: our local alias, else their profile name, else the core's local name. */
@@ -905,15 +938,23 @@ internal object CoreJson {
         return Triple(g, m, "$dir.$phase")
     }
 
-    /** CIQuote {chatDir, itemId?, sharedMsgId?, sentAt, content: MsgContent}. */
+    /**
+     * CIQuote {chatDir, itemId?, sharedMsgId?, sentAt, content: MsgContent}. A group quote's chatDir is groupRcv with the
+     * quoted member (JCIGroupRcv, Messages.hs:664), the same shape as an item's.
+     */
     private fun parseQuote(q: JSONObject?): CoreQuote? {
         if (q == null) return null
         val itemId = if (present(q, "itemId")) q.optLong("itemId") else null
-        val outgoing = when (tagOf(q.opt("chatDir"))) {
+        val dir = tagOf(q.opt("chatDir"))
+        val outgoing = when (dir) {
             "directSnd", "groupSnd", "localSnd" -> true
             else -> false
         }
-        return CoreQuote(itemId, q.optJSONObject("content")?.str("text").orEmpty(), outgoing)
+        // Group quotes only: what [GroupRules.markOwnHistory] needs to prove a quoted message is ours.
+        val group = dir == "groupRcv"
+        val author = if (group) q.optJSONObject("chatDir")?.optJSONObject("groupMember")?.str("memberId")?.ifEmpty { null } else null
+        val shared = if (group) q.str("sharedMsgId")?.ifEmpty { null } else null
+        return CoreQuote(itemId, q.optJSONObject("content")?.str("text").orEmpty(), outgoing, author, shared)
     }
 
     /** reactions: [{reaction: {type: "emoji", emoji}, userReacted, totalReacted}]; only the known eight. */

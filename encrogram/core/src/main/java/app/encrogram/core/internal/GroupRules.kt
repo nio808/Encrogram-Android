@@ -2,12 +2,16 @@ package app.encrogram.core.internal
 
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MemberStatus
+import app.encrogram.core.api.MessageStatus
+
+/** Per earlier memberId of ours: the messages that membership sent, shared id -> text ([GroupRules.ownProofs]). */
+internal typealias OwnProofs = Map<String, Map<String, String>>
 
 /**
  * The core's own rules for roles, removal and group links, checked before anything is sent so the UI gets a
  * readable refusal instead of a core error. Pure logic. Each returns the refusal text, or null when allowed.
- * Also which group rows are one group after a rejoin ([successors]).
- * Sources: reference/simplex-chat 7.0.0.12, Library/Commands.hs.
+ * Also which group rows are one group after a rejoin ([successors]) and which of a rejoin's history is provably ours
+ * ([markOwnHistory]). Sources: reference/simplex-chat 7.0.0.12, Library/Commands.hs.
  */
 internal object GroupRules {
 
@@ -80,6 +84,107 @@ internal object GroupRules {
             }
         }
         return out
+    }
+
+    /**
+     * The earlier rows of each row a rejoin made: every older row that [successors] leads to it, along the whole chain
+     * (removed, back, removed, back again: both earlier rows). Result: chat id of the row -> those rows; rows without
+     * one are absent. Only rows on this phone count: after a restore without the old rows, nothing is known.
+     */
+    fun earlierRows(groups: List<CoreGroup>, successors: Map<Long, Long>): Map<Long, List<CoreGroup>> {
+        if (successors.isEmpty()) return emptyMap()
+        val byId = groups.associateBy { it.groupId }
+        val older = HashMap<Long, MutableList<Long>>()
+        for ((old, newer) in successors) older.getOrPut(newer) { ArrayList() }.add(old)
+        val out = HashMap<Long, List<CoreGroup>>()
+        for (newer in older.keys) {
+            val rows = ArrayList<CoreGroup>()
+            // successors only ever points to a higher groupId, so the walk ends; [seen] keeps it linear anyway.
+            val seen = HashSet<Long>()
+            val todo = ArrayList(older[newer].orEmpty())
+            var next = 0
+            while (next < todo.size) {
+                val o = todo[next++]
+                if (!seen.add(o)) continue
+                byId[o]?.let { rows.add(it) }
+                older[o]?.let { todo.addAll(it) }
+            }
+            if (rows.isNotEmpty()) out[CoreJson.groupChatId(newer)] = rows
+        }
+        return out
+    }
+
+    /**
+     * Our own sent messages among a row's items, by shared id -> text: what proves a history copy is ours. Only messages
+     * we sent to the group (groupSnd) that still have their text; deleted ones prove nothing.
+     */
+    fun ownSent(items: List<CoreItem>): Map<String, String> {
+        val out = HashMap<String, String>()
+        for (i in items) {
+            val id = i.sharedMsgId ?: continue
+            if (i.group && i.outgoing && !i.local && !i.earlierOwn && i.isMessage && !i.deleted && i.text.isNotEmpty()) out[id] = i.text
+        }
+        return out
+    }
+
+    /**
+     * The proof for one rejoined row: for each earlier row whose memberId and own sent messages ([ownSent], from
+     * [sentOf]; null when they couldn't be read) are known, that memberId -> its messages. Rows without either add
+     * nothing, so their history stays someone else's.
+     */
+    fun ownProofs(rows: List<CoreGroup>, sentOf: (CoreGroup) -> Map<String, String>?): OwnProofs {
+        val out = HashMap<String, Map<String, String>>()
+        for (row in rows) {
+            val me = row.myMemberId ?: continue
+            val sent = sentOf(row)?.takeIf { it.isNotEmpty() } ?: continue
+            out[me] = (out[me].orEmpty()) + sent
+        }
+        return out
+    }
+
+    /**
+     * A rejoin's history (Library/Internal.hs:1316-1329 sendHistory): the member who let us back in sends up to 100
+     * earlier messages, each as x.grp.msg.forward naming its author by group-wide memberId (FwdMember, :1418) and keeping
+     * the message's shared id (:1428). Ours carry the memberId of our earlier membership, which the new row doesn't know,
+     * so the core makes an `unknown` member with our name for them (Subscriber.hs:3871-3887, Store/Groups.hs:1204-1213)
+     * and stores each as a received, unread message with that shared id (Subscriber.hs:2195-2198, Messages.hs:1080-1086).
+     *
+     * A memberId alone proves nothing: every member knows ours, and whoever forwards chooses the author. So a message is
+     * ours only when all three hold ([earlier] for its chat, [ownProofs]): its sender's group-wide id is one of our
+     * earlier ids, its shared id is one of the messages we sent as that member (kept in that earlier row), and its text
+     * is exactly what we sent. A forger can then only replay our own words. Anything unproven stays as the core has it.
+     *
+     * Ours becomes: outgoing, no sender, never unread, SENT_TO_SERVER (one tick: the copy proves it reached our server
+     * and the member who sent the history, not that everyone got it), and neither editable nor deletable for everyone
+     * (the core holds it as a received item and refuses both: Commands.hs:816 for edits, :859-861 and :889 for broadcast
+     * deletes). A quote reads as ours under the same proof (author id, shared id and quoted text).
+     */
+    fun markOwnHistory(items: List<CoreItem>, earlier: (chatId: Long) -> OwnProofs?): List<CoreItem> = items.map { i ->
+        if (!i.group) return@map i
+        val proofs = earlier(i.chatId)?.takeIf { it.isNotEmpty() } ?: return@map i
+        val quote = i.quote?.let { q -> if (!q.outgoing && proven(proofs, q.authorId, q.sharedMsgId, q.text)) q.copy(outgoing = true) else q }
+        if (i.isMessage && !i.outgoing && !i.deleted && proven(proofs, i.sender?.groupWideId, i.sharedMsgId, i.text)) {
+            i.copy(
+                outgoing = true,
+                status = MessageStatus.SENT_TO_SERVER,
+                unread = false,
+                editable = false,
+                deletable = false,
+                sender = null,
+                quote = quote,
+                earlierOwn = true,
+            )
+        } else if (quote !== i.quote) {
+            i.copy(quote = quote)
+        } else {
+            i
+        }
+    }
+
+    /** [memberId] is one of our earlier ids and that membership sent exactly [text] as [sharedMsgId]. */
+    private fun proven(proofs: OwnProofs, memberId: String?, sharedMsgId: String?, text: String): Boolean {
+        if (memberId == null || sharedMsgId == null || text.isEmpty()) return false
+        return proofs[memberId]?.get(sharedMsgId) == text
     }
 
     private fun sameGroup(a: CoreGroup, b: CoreGroup, memberIds: (CoreGroup) -> Set<String>?): Boolean {

@@ -291,6 +291,17 @@ internal object Commands {
     /** [markRead] for a contact or a group (APIChatRead CTGroup without scope, Commands.hs:1225-1238). */
     fun markRead(chat: ChatRef): String = "/_read chat $chat"
 
+    /**
+     * APIChatItemsRead (`/_read chat items <chatRef> <id,id,...>`, Commands.hs:5476; handler :1254-1276) ->
+     * `itemsReadForChat`. Marks only these received items read (rcvNew -> rcvRead, Store/Messages.hs:2169-2192); the
+     * chat's unread count is counted from those statuses (Store/Messages.hs:920-924), so it drops with them.
+     */
+    fun readItems(chat: ChatRef, itemIds: List<Long>): String {
+        require(!chat.isNotes) { "notes are never unread" }
+        require(itemIds.isNotEmpty()) { "no items" }
+        return "/_read chat items $chat ${itemIds.joinToString(",")}"
+    }
+
     /** APIDeleteChat for a contact, without notifying anyone. Used only for preset contact cards. */
     fun deleteContactQuietly(contactId: Long): String = "/_delete @$contactId full notify=off"
 
