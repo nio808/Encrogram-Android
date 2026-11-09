@@ -58,6 +58,7 @@ internal object ErrorMapper {
     const val ALREADY_JOINING = "You're already joining this group. It appears in your chats once it connects."
     const val UNSUPPORTED_GROUP_LINK = "This link is for a kind of channel Encrogram doesn't support."
     const val ONLY_OWNERS_PHOTO = "Only the group's owner can change its photo."
+    const val ONLY_OWNERS_TIMER = "Only the group's owner can change disappearing messages."
 
     // ---- the database key lost, and "Reset Secured" (b3) ----
     const val KEY_LOST = "Secured's key on this phone can't be read, so its data can't be opened. If restarting the phone doesn't help, " +

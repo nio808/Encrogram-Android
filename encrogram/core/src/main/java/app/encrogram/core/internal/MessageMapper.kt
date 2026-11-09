@@ -128,6 +128,7 @@ internal object MessageMapper {
             pinned = g.favorite,
             muted = g.muted,
             archived = archived,
+            disappearingTtlSeconds = g.timedTtlSeconds,
             kind = if (g.channel) ChatKind.CHANNEL else ChatKind.GROUP,
             // A deleted group has nobody in it; the core's count still holds the others' rows (CoreGroup.deleted).
             memberCount = if (g.deleted) 0 else g.memberCount,

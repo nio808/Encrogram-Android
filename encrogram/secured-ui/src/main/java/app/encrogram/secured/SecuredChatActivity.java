@@ -733,9 +733,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         more.setContentDescription(tg(org.telegram.messenger.R.string.AccDescrMoreOptions));
         if (!notes) {
             muteSubItem = more.addSubItem(MENU_MUTE, org.telegram.messenger.R.drawable.msg_mute, context.getString(R.string.sec_list_mute), chatResources);
-            if (!groupChat) {
-                // Contact-only for now (docs/groups-plan.md): groups have no single peer to verify or time out.
+            // Groups: the timer is a group setting, so only the owner changes it (members get NOT_ALLOWED from the engine).
+            if (!groupChat || isOwnerOrChannel(true)) {
                 more.addSubItem(MENU_DISAPPEAR, org.telegram.messenger.R.drawable.msg_autodelete, context.getString(R.string.secchat_disappear), chatResources);
+            }
+            if (!groupChat) {
+                // Contact-only (docs/groups-plan.md): groups have no single peer to verify.
                 more.addSubItem(MENU_VERIFY, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.secchat_verify_menu), chatResources);
             }
         }
@@ -2780,6 +2783,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private void openDisappearing() {
         final ChatSummary s = summary();
         if (s == null) return;
+        if (groupChat) {
+            // The group's own timer for every member: no "on your side" note, the header's timer icon confirms it.
+            SecuredChatSheets.showGroupDisappearing(this, s.getKind() == ChatKind.CHANNEL, s.getDisappearingTtlSeconds(),
+                    ttl -> chatAction(new ChatAction.SetDisappearing(ttl == 0 ? null : Integer.valueOf(ttl)), this::updateHeader));
+            return;
+        }
         SecuredChatSheets.showDisappearing(this, name, s.getDisappearingTtlSeconds(), ttl -> chatAction(
                 new ChatAction.SetDisappearing(ttl == 0 ? null : Integer.valueOf(ttl)), () -> {
                     final Context c = getContext();

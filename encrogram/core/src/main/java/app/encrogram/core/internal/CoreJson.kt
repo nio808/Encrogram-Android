@@ -216,6 +216,8 @@ internal data class CoreGroup(
     val invitedByContactId: Long? = null,
     /** groupProfile.image ([Avatars]): untrusted, never logged. */
     val avatar: MediaPreview? = null,
+    /** The group's disappearing-message timer in seconds while it is on ([CoreJson.groupTimedTtl]), else null. */
+    val timedTtlSeconds: Int? = null,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
@@ -532,6 +534,26 @@ internal object CoreJson {
     fun groupProfileUpdate(groupProfile: JSONObject, image: String?): JSONObject? {
         val p = groupProfile.deepCopy()
         if (!setImage(p, image)) return null
+        if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
+        return p
+    }
+
+    /**
+     * The GroupProfile for `/_group_profile` with the group's disappearing-message timer set: groupPreferences
+     * timedMessages (TimedMessagesGroupPreference {enable, ttl}, Preferences.hs:675-678) on with [ttlSeconds], or off
+     * (null). Like [groupProfileUpdate], every other field and preference is copied as it is. Null when the timer is
+     * already that (a profile without timedMessages has it off, the core's default).
+     */
+    fun groupTimerUpdate(groupProfile: JSONObject, ttlSeconds: Int?): JSONObject? {
+        val p = groupProfile.deepCopy()
+        val prefs = p.optJSONObject("groupPreferences") ?: JSONObject().also { p.put("groupPreferences", it) }
+        val current = prefs.optJSONObject("timedMessages")
+        val on = current?.str("enable") == "on"
+        val currentTtl = if (on && current != null && current.has("ttl") && !current.isNull("ttl")) current.optInt("ttl", 0) else null
+        if (if (ttlSeconds == null) !on else on && currentTtl == ttlSeconds) return null
+        val timed = JSONObject().put("enable", if (ttlSeconds == null) "off" else "on")
+        if (ttlSeconds != null) timed.put("ttl", ttlSeconds)
+        prefs.put("timedMessages", timed)
         if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
         return p
     }
@@ -989,7 +1011,19 @@ internal object CoreJson {
             invitedByContactId = membership?.optJSONObject("invitedBy")?.takeIf { tagOf(it) == "contact" }
                 ?.optLong("byContactId", 0L)?.takeIf { it > 0 },
             avatar = Avatars.of(profile?.str("image")),
+            timedTtlSeconds = groupTimedTtl(g),
         )
+    }
+
+    /**
+     * The group's disappearing-message timer as the core applies it to every member's messages: fullGroupPreferences
+     * timedMessages {enable, ttl} (groupTimedTTL, Messages.hs:594-597), the ttl while enable is "on"; null when off, and
+     * when on without a ttl (the core then sets no timer).
+     */
+    fun groupTimedTtl(groupInfo: JSONObject): Int? {
+        val timed = groupInfo.optJSONObject("fullGroupPreferences")?.optJSONObject("timedMessages") ?: return null
+        if (timed.str("enable") != "on" || !timed.has("ttl") || timed.isNull("ttl")) return null
+        return timed.optInt("ttl", 0).takeIf { it > 0 }
     }
 
     /**

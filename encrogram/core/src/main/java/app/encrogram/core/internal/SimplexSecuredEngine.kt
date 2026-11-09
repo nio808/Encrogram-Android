@@ -60,20 +60,20 @@ import app.encrogram.core.internal.media.prep.MediaPreparer
 import app.encrogram.core.internal.media.prep.android.AndroidImageCodec
 import app.encrogram.core.internal.media.prep.android.AndroidVideoTool
 import app.encrogram.core.internal.media.prep.android.ContentInputOpener
-import chat.simplex.common.platform.chatCloseStore
-import chat.simplex.common.platform.chatMigrateInit
-import chat.simplex.common.platform.chatRecvMsgWait
-import chat.simplex.common.platform.chatSendCmdRetry
 import org.json.JSONObject
 import java.io.File
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.FutureTask
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
  * [SecuredEngine] over the embedded SimpleX chat core.
@@ -83,6 +83,9 @@ import java.util.concurrent.TimeUnit
  *    list cache, so none of them race;
  *  - one receive thread ("encrogram-secured-recv") blocks in chat_recv_msg_wait and hands each event to the
  *    engine thread;
+ *  - one network thread ("encrogram-secured-net") runs only the native call of the commands that reach a relay before
+ *    the core answers (connect, invites, joins, group links, adding members: [sendNetAsync]); their checks before and
+ *    everything after stay on the engine thread;
  *  - every callback and listener call is posted to the Android main thread.
  *
  * Fail closed: the engine reaches RUNNING only after the relay configuration has been applied and read back.
@@ -93,10 +96,27 @@ import java.util.concurrent.TimeUnit
  * A listener added with [addListener] immediately receives the current state via onStateChanged (and, when the
  * state is FAILED, the failure via onError), so a screen opened later still learns why Secured is not running.
  */
-internal class SimplexSecuredEngine(
+internal class SimplexSecuredEngine internal constructor(
     private val appContext: Context,
     private val config: RelayConfig,
+    /** The core's controller calls (A11): JNI in production, a scripted fake in tests. */
+    private val native: NativeApi,
+    /** Android's main thread in production: every callback and listener call, and the timers. */
+    private val main: MainThread,
+    /** The one engine thread. */
+    private val executor: ExecutorService,
+    /** A6: the network-bound commands' native calls ([sendNetAsync]), so they never hold the engine thread. */
+    private val netExecutor: ExecutorService,
+    /** The database passphrase ([DbKeyStore.obtain]); throws [DbKeyStore.KeyFailure]. */
+    private val databaseKey: (databaseExists: Boolean) -> String,
 ) : SecuredEngine {
+
+    /** Production wiring ([app.encrogram.core.api.SecuredEngines]). */
+    constructor(appContext: Context, config: RelayConfig) : this(
+        appContext, config, JniNativeApi, HandlerMainThread(),
+        daemonThread("encrogram-secured-engine"), daemonThread("encrogram-secured-net"),
+        { exists -> DbKeyStore(appContext).obtain(exists) },
+    )
 
     private class StartFailure(val error: SecuredError, val logTag: String) : Exception(logTag)
 
@@ -106,10 +126,6 @@ internal class SimplexSecuredEngine(
         lateinit var thread: Thread
     }
 
-    private val main = Handler(Looper.getMainLooper())
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "encrogram-secured-engine").apply { isDaemon = true }
-    }
     private val listeners = CopyOnWriteArrayList<SecuredListener>()
 
     @Volatile private var state = EngineState.NOT_STARTED
@@ -128,7 +144,7 @@ internal class SimplexSecuredEngine(
     private val lastItemIds = HashMap<Long, Long>()
     /** Newest item each cached row's unread count already includes, so a queued event after a reload isn't counted twice. */
     private val counted = CountedItems()
-    /** Chats where disappearing messages are on for both sides (marking read starts received timers). */
+    /** Chats where disappearing messages are on (contacts: for both sides); marking read starts received timers. */
     private val timedChats = HashSet<Long>()
     /** The local note folder behind Saved Messages ([SAVED_MESSAGES_CHAT_ID]), from the last chat list load. */
     private var noteFolderId: Long? = null
@@ -159,7 +175,7 @@ internal class SimplexSecuredEngine(
 
     // ---- the phone's network ([NetworkWatch]): engine thread, except [online] ----
     /** Reports network changes to the core, so it reconnects as soon as the network is back (like the official app). */
-    private val network = NetworkWatch(appContext, main) { info -> post { applyNetwork(info) } }
+    private val network = NetworkWatch(appContext, Handler(Looper.getMainLooper())) { info -> post { applyNetwork(info) } }
     /** The watch is registered: from opening the store until [stopOnEngine]. */
     private var watchingNetwork = false
     /** The last network the watch reported; sent again to each newly opened store. */
@@ -427,13 +443,18 @@ internal class SimplexSecuredEngine(
 
     override fun createInvite(callback: SecuredCallback<SecuredInvite>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        when (val r = sendNet(Commands.addContact(userId))) {
+        sendNetAsync(Commands.addContact(userId), callback) { r -> inviteCreated(r, callback) }
+    }
+
+    /** Engine thread: the core's answer to `/_connect` (a new invitation). */
+    private fun inviteCreated(r: CoreReply, callback: SecuredCallback<SecuredInvite>) {
+        when (r) {
             is CoreReply.Result -> {
-                if (r.type != "invitation") return@post err(callback, unexpected(r))
+                if (r.type != "invitation") return err(callback, unexpected(r))
                 val created = CoreJson.parseInvitation(r.body)
                 // Prefer the short https link on our SMP host; the long simplex: form is the fallback.
                 val link = created.shortLink ?: created.fullLink
-                    ?: return@post err(callback, ErrorMapper.engine("invitation.no_link"))
+                    ?: return err(callback, ErrorMapper.engine("invitation.no_link"))
                 when (LinkChecker.check(link, config.allowedHosts, config.smpServers)) {
                     // On our relay the short link drops the relay's port and key hash (?p=..&c=..): checkLink and
                     // connect put them back for our relays. Kept full unless the short form checks the same way.
@@ -483,7 +504,12 @@ internal class SimplexSecuredEngine(
         // resolve here would only fail the same way inside /connect.
         // A `/g` link may only join a group: any other plan for it is refused (review #4).
         val groupInput = LinkChecker.isShortGroupLink(normalized)
-        val verdict = when (val plan = sendNet(Commands.connectPlan(userId, normalized))) {
+        sendNetAsync(Commands.connectPlan(userId, normalized), callback) { plan -> connectWithPlan(plan, normalized, groupInput, callback) }
+    }
+
+    /** Engine thread: [connect] after the core's `/_connect plan` answer. */
+    private fun connectWithPlan(plan: CoreReply, normalized: String, groupInput: Boolean, callback: SecuredCallback<Unit>) {
+        val verdict = when (plan) {
             is CoreReply.Result ->
                 if (plan.type == "connectionPlan") ConnectPlan.verdict(plan.body, config.allowedHosts, config.smpServers, groupInput)
                 else ConnectPlan.Verdict.Refuse(unexpected(plan), "plan_reply")
@@ -493,23 +519,25 @@ internal class SimplexSecuredEngine(
         when (verdict) {
             is ConnectPlan.Verdict.Refuse -> {
                 SecuredLog.i(Ev.CONNECT_REFUSED, verdict.logTag)
-                return@post err(callback, verdict.error)
+                return err(callback, verdict.error)
             }
-            is ConnectPlan.Verdict.JoinGroup -> return@post joinGroupLinkOnEngine(verdict, callback)
+            is ConnectPlan.Verdict.JoinGroup -> return joinGroupLinkOnEngine(verdict, callback)
             ConnectPlan.Verdict.Connect -> Unit
         }
-        when (val r = sendNet(Commands.connect(normalized))) {
-            is CoreReply.Result -> when (r.type) {
-                "sentConfirmation", "sentInvitation" -> {
-                    ok(callback, Unit)
-                    refreshChats(notify = true)
+        sendNetAsync(Commands.connect(normalized), callback) { r ->
+            when (r) {
+                is CoreReply.Result -> when (r.type) {
+                    "sentConfirmation", "sentInvitation" -> {
+                        ok(callback, Unit)
+                        refreshChats(notify = true)
+                    }
+                    "contactAlreadyExists" -> err(callback, SecuredError(SecuredError.Kind.INVALID_LINK, "You're already connected with this contact."))
+                    "connectionPlan" -> err(callback, ErrorMapper.fromConnectionPlan(CoreJson.connectionPlanTag(r.body)))
+                    else -> err(callback, unexpected(r))
                 }
-                "contactAlreadyExists" -> err(callback, SecuredError(SecuredError.Kind.INVALID_LINK, "You're already connected with this contact."))
-                "connectionPlan" -> err(callback, ErrorMapper.fromConnectionPlan(CoreJson.connectionPlanTag(r.body)))
-                else -> err(callback, unexpected(r))
+                is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
+                CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
             }
-            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
-            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
 
@@ -618,11 +646,11 @@ internal class SimplexSecuredEngine(
                     media.onChatRemoved(chatId)
                 }
             is ChatAction.SetDisappearing -> {
-                if (group) return@post refuse(callback, "disappearing_group", ErrorMapper.CONTACTS_ONLY)
                 val ttl = action.ttlSeconds
                 if (ttl != null && !InputRules.ttlAllowed(ttl)) {
                     return@post err(callback, ErrorMapper.invalid("Choose a timer between 1 second and 1 year."))
                 }
+                if (group) return@post setGroupTimerOnEngine(chatId, ttl, callback)
                 foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
                 val contact = contactOrErr(chatId, callback) ?: return@post
                 chatCommand("disappearing", Commands.setContactPrefs(chatId, CoreJson.contactPrefsUpdate(contact, ttl)), "contactPrefsUpdated", callback)
@@ -855,21 +883,24 @@ internal class SimplexSecuredEngine(
         foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
         if (ids.any { foreignRefusal(it) != null }) return@post refuseForeign(callback, ErrorMapper.FOREIGN_RELAY_ADD)
         val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
-        var failed = 0
-        for (id in ids) {
-            when (val r = send(Commands.addMember(g.groupId, id, role))) {
-                is CoreReply.Result -> if (r.type != "sentGroupInvitation") {
-                    SecuredLog.w(Ev.CMD_UNEXPECTED_REPLY, r.type)
-                    failed++
+        // Each invitation creates a queue on our relay (A6: the network thread, one after the other, no retry as before).
+        onNetThread(ids.map { Commands.addMember(g.groupId, it, role) }, retry = false, callback) { replies ->
+            var failed = 0
+            for (r in replies) {
+                when (r) {
+                    is CoreReply.Result -> if (r.type != "sentGroupInvitation") {
+                        SecuredLog.w(Ev.CMD_UNEXPECTED_REPLY, r.type)
+                        failed++
+                    }
+                    is CoreReply.Error -> if (r.error.detail != "groupDuplicateMember") failed++
+                    CoreReply.Invalid -> failed++
                 }
-                is CoreReply.Error -> if (r.error.detail != "groupDuplicateMember") failed++
-                CoreReply.Invalid -> failed++
             }
+            SecuredLog.i(Ev.GROUP_ACTION, "add", ids.size)
+            if (failed > 0) SecuredLog.w(Ev.GROUP_ACTION, "add_failed", failed)
+            refreshChats(notify = true)
+            if (failed == 0) ok(callback, Unit) else err(callback, ErrorMapper.addFailed(failed, ids.size))
         }
-        SecuredLog.i(Ev.GROUP_ACTION, "add", ids.size)
-        if (failed > 0) SecuredLog.w(Ev.GROUP_ACTION, "add_failed", failed)
-        refreshChats(notify = true)
-        if (failed == 0) ok(callback, Unit) else err(callback, ErrorMapper.addFailed(failed, ids.size))
     }
 
     /** `/_join #g`: accepts an invitation ([ChatSummary.invited]). Declining is chatAction(Delete). */
@@ -880,17 +911,19 @@ internal class SimplexSecuredEngine(
         // Joining answers the inviter's own queue (APIJoinGroup -> joinConnection): not when that contact is on a relay we don't run (b1).
         if (g.invitedByContactId?.let { foreignRefusal(it) } != null) return@post refuseForeign(callback, ErrorMapper.FOREIGN_RELAY_JOIN)
         val acceptedAt = System.currentTimeMillis()
-        when (val r = sendNet(Commands.joinGroup(g.groupId))) {
-            is CoreReply.Result -> {
-                if (r.type != "userAcceptedGroupSent") return@post err(callback, unexpected(r))
-                // The history the group sends once we're connected covers everything up to now (G11).
-                joinAcceptedAt[chatId] = acceptedAt
-                SecuredLog.i(Ev.GROUP_ACTION, "join")
-                refreshChats(notify = true)
-                ok(callback, Unit)
+        sendNetAsync(Commands.joinGroup(g.groupId), callback) { r ->
+            when (r) {
+                is CoreReply.Result -> {
+                    if (r.type != "userAcceptedGroupSent") return@sendNetAsync err(callback, unexpected(r))
+                    // The history the group sends once we're connected covers everything up to now (G11).
+                    joinAcceptedAt[chatId] = acceptedAt
+                    SecuredLog.i(Ev.GROUP_ACTION, "join")
+                    refreshChats(notify = true)
+                    ok(callback, Unit)
+                }
+                is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
+                CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
             }
-            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CHAT))
-            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
 
@@ -984,7 +1017,6 @@ internal class SimplexSecuredEngine(
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
         GroupRules.linkRefusal(g)?.let { return@post refuse(callback, "link_role", it) }
         val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
-        var created = false
         var link: CoreGroupLink? = when (val r = send(Commands.getGroupLink(g.groupId))) {
             // A link exists: never create a second one (the core would make an unused connection, then refuse).
             is CoreReply.Result ->
@@ -997,13 +1029,18 @@ internal class SimplexSecuredEngine(
             CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
         }
         if (link == null) {
-            link = when (val r = sendNet(Commands.createGroupLink(g.groupId, role))) {
-                is CoreReply.Result -> if (r.type == "groupLinkCreated") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
-                is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
-                CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+            // A new link is a new queue on our relay (A6: the network thread).
+            return@post sendNetAsync(Commands.createGroupLink(g.groupId, role), callback) { r ->
+                when (r) {
+                    is CoreReply.Result ->
+                        if (r.type == "groupLinkCreated") handOutGroupLink(g, CoreJson.parseGroupLink(r.body), role, created = true, callback)
+                        else err(callback, unexpected(r))
+                    is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+                    CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+                }
             }
-            created = true
-        } else if (CoreJson.roleWord(link.role) != role) {
+        }
+        if (CoreJson.roleWord(link.role) != role) {
             link = when (val r = send(Commands.setGroupLinkRole(g.groupId, role))) {
                 is CoreReply.Result -> if (r.type == "groupLink") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
                 is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
@@ -1011,7 +1048,15 @@ internal class SimplexSecuredEngine(
             }
             SecuredLog.i(Ev.GROUP_ACTION, "link_role_fixed")
         }
-        val l = link ?: return@post err(callback, ErrorMapper.engine("group_link.no_link"))
+        handOutGroupLink(g, link, role, created = false, callback)
+    }
+
+    /**
+     * Engine thread: [groupLink]'s last step. Both the link and its connection request must be on our relay, else the
+     * link is deleted and nothing is handed out; a channel link must let people in as observers only.
+     */
+    private fun handOutGroupLink(g: CoreGroup, link: CoreGroupLink?, role: String, created: Boolean, callback: SecuredCallback<SecuredInvite>) {
+        val l = link ?: return err(callback, ErrorMapper.engine("group_link.no_link"))
         val full = l.fullLink
         val approved = full != null && listOfNotNull(full, l.shortLink).all {
             LinkChecker.check(it, config.allowedHosts, config.smpServers) == LinkCheck.Approved
@@ -1019,11 +1064,11 @@ internal class SimplexSecuredEngine(
         if (!approved) {
             // Never hand out a link that would bring people to a server we don't run.
             SecuredLog.e(Ev.INVITE_REFUSED, "group_link")
-            sendNet(Commands.deleteGroupLink(g.groupId))
-            return@post err(callback, SecuredError(SecuredError.Kind.UNAPPROVED_RELAY, ErrorMapper.GROUP_LINK_ELSEWHERE))
+            return sendNetAsync(Commands.deleteGroupLink(g.groupId), callback) {
+                err(callback, SecuredError(SecuredError.Kind.UNAPPROVED_RELAY, ErrorMapper.GROUP_LINK_ELSEWHERE))
+            }
         }
-        // A channel link must let people in as observers only; never hand out one that doesn't.
-        if (CoreJson.roleWord(l.role) != role) return@post err(callback, ErrorMapper.engine("group_link.role"))
+        if (CoreJson.roleWord(l.role) != role) return err(callback, ErrorMapper.engine("group_link.role"))
         SecuredLog.i(Ev.GROUP_ACTION, if (created) "link_create" else "link_get")
         ok(callback, SecuredInvite(compactInvite(l.shortLink ?: full!!)))
     }
@@ -1036,16 +1081,18 @@ internal class SimplexSecuredEngine(
     override fun deleteGroupLink(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
-        when (val r = sendNet(Commands.deleteGroupLink(g.groupId))) {
-            is CoreReply.Result -> {
-                if (r.type != "groupLinkDeleted") return@post err(callback, unexpected(r))
-                SecuredLog.i(Ev.GROUP_ACTION, "link_delete")
-                ok(callback, Unit)
+        sendNetAsync(Commands.deleteGroupLink(g.groupId), callback) { r ->
+            when (r) {
+                is CoreReply.Result -> {
+                    if (r.type != "groupLinkDeleted") return@sendNetAsync err(callback, unexpected(r))
+                    SecuredLog.i(Ev.GROUP_ACTION, "link_delete")
+                    ok(callback, Unit)
+                }
+                is CoreReply.Error ->
+                    if (r.error.type == "errorStore" && r.error.detail == "groupLinkNotFound") ok(callback, Unit)
+                    else err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+                CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
             }
-            is CoreReply.Error ->
-                if (r.error.type == "errorStore" && r.error.detail == "groupLinkNotFound") ok(callback, Unit)
-                else err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
-            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
 
@@ -1055,17 +1102,19 @@ internal class SimplexSecuredEngine(
      * (groupLinkConnecting, a chat-list event) with the link's role, connecting, and later connected.
      */
     private fun joinGroupLinkOnEngine(join: ConnectPlan.Verdict.JoinGroup, callback: SecuredCallback<Unit>) {
-        when (val r = sendNet(Commands.connectResolved(userId, join.fullLink, join.shortLink))) {
-            is CoreReply.Result -> when (r.type) {
-                "sentInvitation" -> {
-                    SecuredLog.i(Ev.GROUP_ACTION, "join_link")
-                    ok(callback, Unit)
-                    refreshChats(notify = true)
+        sendNetAsync(Commands.connectResolved(userId, join.fullLink, join.shortLink), callback) { r ->
+            when (r) {
+                is CoreReply.Result -> when (r.type) {
+                    "sentInvitation" -> {
+                        SecuredLog.i(Ev.GROUP_ACTION, "join_link")
+                        ok(callback, Unit)
+                        refreshChats(notify = true)
+                    }
+                    else -> err(callback, unexpected(r))
                 }
-                else -> err(callback, unexpected(r))
+                is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
+                CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
             }
-            is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
-            CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
 
@@ -1089,6 +1138,24 @@ internal class SimplexSecuredEngine(
             val update = CoreJson.groupProfileUpdate(current, bytes?.let { Avatars.dataUrl(it) }) ?: return@post ok(callback, Unit)
             chatCommand(if (bytes == null) "group_photo_remove" else "group_photo_set", Commands.updateGroupProfile(g.groupId, update), "groupUpdated", callback)
         }
+    }
+
+    /**
+     * The group's disappearing messages: the owner sets the group preference timedMessages with `/_group_profile #g` (the
+     * profile as stored now, only that preference changed: [CoreJson.groupTimerUpdate]); the core then times every
+     * member's new messages (groupTimedTTL, Messages.hs:594-597). Anyone else gets NOT_ALLOWED (the core asserts the
+     * owner too, runUpdateGroupProfile :4020). Members see "group updated"; the list reload shows the new timer.
+     */
+    private fun setGroupTimerOnEngine(chatId: Long, ttl: Int?, callback: SecuredCallback<Unit>) {
+        val g = groupCache[chatId] ?: return err(callback, ErrorMapper.chatGone())
+        GroupRules.timerRefusal(g)?.let { return refuse(callback, "disappearing_group", it) }
+        // Every member gets the new profile (b1).
+        foreignRefusal(chatId)?.let { return refuseForeign(callback, it) }
+        val info = groupInfoOrErr(chatId, callback) ?: return
+        val current = info.optJSONObject("groupProfile")?.takeIf { !it.str("displayName").isNullOrEmpty() }
+            ?: return err(callback, ErrorMapper.engine("group_profile"))
+        val update = CoreJson.groupTimerUpdate(current, ttl) ?: return ok(callback, Unit)
+        chatCommand(if (ttl == null) "disappearing_group_off" else "disappearing_group", Commands.updateGroupProfile(g.groupId, update), "groupUpdated", callback)
     }
 
     /**
@@ -1516,7 +1583,7 @@ internal class SimplexSecuredEngine(
         }
         if (!vault.hasSecrets()) return failAttempt(callback, ErrorMapper.notAllowed(ErrorMapper.BACKUP_OFF), null, manual)
         val dbKey = try {
-            DbKeyStore(appContext).obtain(databaseExists = true)
+            databaseKey(true)
         } catch (f: DbKeyStore.KeyFailure) {
             return failAttempt(callback, SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE), "keystore", manual)
         }
@@ -1534,6 +1601,9 @@ internal class SimplexSecuredEngine(
         var failure: SecuredError? = null
         var failTag: String? = null
 
+        // A6: no network command runs while the chat is stopped for the export; one in flight finishes first.
+        val pause = netLock.writeLock()
+        pause.lock()
         // 1. Export needs a stopped chat (Commands.hs:610 checkChatStopped).
         send(Commands.STOP_CHAT)
         chatStarted = false
@@ -1569,15 +1639,19 @@ internal class SimplexSecuredEngine(
             SecuredLog.crash(Ev.BACKUP_FAILED, t)
             failTag = failTag ?: "export_internal"
         } finally {
-            // 4. Normal folders back, plaintext gone, chat running again.
-            val pathsBack = isResult(send(filePathsCommand(File(dir, "files"), temp, File(dir, "assets"))), "cmdOk")
-            zip.delete()
-            work.deleteRecursively()
-            if (!pathsBack || !resumeAfterPause()) {
-                archive?.fill(0)
-                archive = null
-                if (pathsBack) SecuredLog.e(Ev.BACKUP_FAILED, "resume") else SecuredLog.e(Ev.BACKUP_FAILED, "file_paths_back")
-                abortAfterPause(if (pathsBack) "resume" else "file_paths_back")
+            try {
+                // 4. Normal folders back, plaintext gone, chat running again.
+                val pathsBack = isResult(send(filePathsCommand(File(dir, "files"), temp, File(dir, "assets"))), "cmdOk")
+                zip.delete()
+                work.deleteRecursively()
+                if (!pathsBack || !resumeAfterPause()) {
+                    archive?.fill(0)
+                    archive = null
+                    if (pathsBack) SecuredLog.e(Ev.BACKUP_FAILED, "resume") else SecuredLog.e(Ev.BACKUP_FAILED, "file_paths_back")
+                    abortAfterPause(if (pathsBack) "resume" else "file_paths_back")
+                }
+            } finally {
+                pause.unlock()
             }
         }
         val bytes = archive
@@ -2521,6 +2595,7 @@ internal class SimplexSecuredEngine(
     private fun closeCtrlQuietly() {
         val c = ctrl
         if (c == 0L) return
+        endNetGeneration()
         media.onStop()
         closeQuietly(c)
         ctrl = 0L
@@ -2531,7 +2606,7 @@ internal class SimplexSecuredEngine(
     /** Through [CtrlGate.close]: waits for native file calls in flight, and none starts again until the next open. */
     private fun closeQuietly(c: Long) {
         try {
-            ctrlGate.close { chatCloseStore(c) }
+            ctrlGate.close { native.closeStore(c) }
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.STOPPED, t)
         }
@@ -3101,9 +3176,10 @@ internal class SimplexSecuredEngine(
         err(callback, ErrorMapper.notAllowed(message))
     }
 
-    /** After a read: received timed messages now have a deleteAt. Bounded to the unread ones. */
+    /** After a read: received timed messages now have a deleteAt. Bounded to the unread ones. Contacts and groups. */
     private fun reportStartedTimers(chatId: Long, unread: Int) {
-        val r = send(Commands.getChat(chatId, minOf(unread + 50, MAX_PAGE * 2)))
+        val ref = refOf(chatId) ?: return
+        val r = send(Commands.getChat(ref, minOf(unread + 50, MAX_PAGE * 2)))
         if (r !is CoreReply.Result || r.type != "apiChat") return
         val started = CoreJson.parseChatItemsOfChat(r.body).filter { it.isMessage && !it.outgoing && it.expiresAtMs != null }
         emitChanged(started)
@@ -3224,7 +3300,7 @@ internal class SimplexSecuredEngine(
 
     private fun loadNative() {
         try {
-            NativeCore.ensureLoaded()
+            native.load()
         } catch (f: NativeCore.LoadFailure) {
             val msg = if (f.reason == "unsupported_abi") {
                 "Secured needs a 64-bit ARM phone. It can't run on this device."
@@ -3245,7 +3321,7 @@ internal class SimplexSecuredEngine(
         val agentDb = File(prefix + "_agent.db")
         val busyStreak = DbKeyStore.BusyStreak(File(dir, KEYSTORE_BUSY_FILE))
         val key = try {
-            DbKeyStore(appContext).obtain(databaseExists = chatDb.exists() || agentDb.exists()).also { busyStreak.clear() }
+            databaseKey(chatDb.exists() || agentDb.exists()).also { busyStreak.clear() }
         } catch (failure: DbKeyStore.KeyFailure) {
             // A Keystore that stays "busy" across a reboot never passes: the key is lost after all (review of 4bce1db8, #2).
             val f = if (failure.reason == DbKeyStore.KEYSTORE_BUSY && busyStreak.record(DbKeyStore.bootId(appContext))) {
@@ -3291,7 +3367,7 @@ internal class SimplexSecuredEngine(
             // Never keep a half-open store (no file paths, or no local file encryption): close it so the next
             // start redoes the whole open.
             try {
-                ctrlGate.close { chatCloseStore(c) }
+                ctrlGate.close { native.closeStore(c) }
             } catch (e: Throwable) {
                 SecuredLog.crash(Ev.DB_OPEN_FAILED, e)
             }
@@ -3316,7 +3392,7 @@ internal class SimplexSecuredEngine(
         Commands.setFilePaths(files.absolutePath, temp.absolutePath, assets.absolutePath, File(dataDir, "remote_hosts").absolutePath)
 
     private fun migrateInit(prefix: String, key: String): Pair<String, Long> {
-        val out = chatMigrateInit(prefix, key, MIGRATION_CONFIRM)
+        val out = native.migrateInit(prefix, key, MIGRATION_CONFIRM)
         val tag = CoreJson.migrationResultTag(out.getOrNull(0) as? String)
         val c = (out.getOrNull(1) as? Long) ?: 0L
         SecuredLog.i(Ev.DB_OPEN, tag)
@@ -3507,6 +3583,8 @@ internal class SimplexSecuredEngine(
     }
 
     private fun stopOnEngine() {
+        // A6 first: the network command in flight finishes, and none issued before runs on this store again.
+        endNetGeneration()
         stopWatchingNetwork()
         if (ctrl == 0L) {
             if (state != EngineState.NOT_STARTED) setState(EngineState.NOT_STARTED)
@@ -3518,7 +3596,7 @@ internal class SimplexSecuredEngine(
         media.onStop()
         ctrlGate.close {
             try {
-                chatCloseStore(ctrl)
+                native.closeStore(ctrl)
             } catch (t: Throwable) {
                 SecuredLog.crash(Ev.STOPPED, t)
             }
@@ -3586,7 +3664,7 @@ internal class SimplexSecuredEngine(
         SecuredLog.i(Ev.RECEIVER_STARTED)
         while (r.running && ctrl == r.ctrl) {
             val raw = try {
-                chatRecvMsgWait(r.ctrl, RECV_WAIT_MICROS)
+                native.recvMsgWait(r.ctrl, RECV_WAIT_MICROS)
             } catch (t: Throwable) {
                 SecuredLog.crash(Ev.RECEIVER_ERROR, t)
                 try {
@@ -3988,6 +4066,7 @@ internal class SimplexSecuredEngine(
             val unread = listed.unreadCount - sweepHistory(listed.group, listed.unreadCount)
             val chat = listed.copy(lastItem = last, unreadCount = unread.coerceAtLeast(0))
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id), ForeignRelays.chatMarked(marks, id))
+            if (listed.group.timedTtlSeconds != null) timedChats.add(id)
             counted.loaded(id, listed.lastItem?.itemId)
             chat.lastItem?.takeIf { it.shown }?.let {
                 lastItemIds[id] = it.itemId
@@ -4193,14 +4272,15 @@ internal class SimplexSecuredEngine(
     // =============================================================================================================
 
     /**
-     * Runs one engine command on the engine thread. Logs only reply/error type tags; an error whose detail is in
-     * [expected] is an answer the caller asked for, not a failure, and isn't logged as CMD_ERROR.
+     * Runs one engine command, on the engine thread (or the network thread, [sendOnNet]). Logs only reply/error type
+     * tags; an error whose detail is in [expected] is an answer the caller asked for, not a failure, and isn't logged as
+     * CMD_ERROR.
      */
     private fun send(cmd: String, expected: Set<String> = emptySet(), retryNum: Int = 0): CoreReply {
         val c = ctrl
-        if (c == 0L) return CoreReply.Error(CoreError("error", "chatNotStarted", null))
+        if (c == 0L) return NO_CHAT
         val raw = try {
-            chatSendCmdRetry(c, cmd, retryNum)
+            native.sendCmd(c, cmd, retryNum)
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.CMD_INVALID_REPLY, t)
             return CoreReply.Invalid
@@ -4214,15 +4294,95 @@ internal class SimplexSecuredEngine(
         return reply
     }
 
-    /** [send] for a command that reaches a relay before it answers: a timeout or network error is retried once ([NetRetry]). */
-    private fun sendNet(cmd: String): CoreReply = NetRetry.run({ prepareRetry() }) { n -> send(cmd, retryNum = n) }
+    // ---- A6: commands that reach a relay before the core answers, on the network thread --------------------------
+    //
+    // Their native call can take the core's interactive TCP timeout (15 s), then once more 1.5x ([NetRetry]); on the
+    // engine thread that froze every Secured screen and held back arriving messages. The core runs commands from any
+    // thread at once (the official app sends them from Dispatchers.IO, SimpleXAPI.kt:842-851) and locks per entity only
+    // (withEntityLock waits just while the chat-wide lock is held, Library/Internal.hs:124-160; APIAddContact and
+    // APIConnect take no chat lock, Commands.hs:2066, 2337; addMember, joinGroup and the group link commands only their
+    // group's, :2744, 2774, 3241, 3265). So only the native call moves (the CtrlGate pattern of the media code): every
+    // check before it and every cache update, callback and listener call after it stay on the engine thread.
 
     /**
-     * Before [NetRetry]'s one retry (review of 4bce1db8, #1). This task holds the engine thread, so a network change the
-     * watch reported meanwhile is still queued behind it, and [online] is what it was. So read the network now: with
-     * none usable there is no retry (the core waits for the network anyway). Else take it as the current one here (the
-     * queued report then changes nothing) and reconnect at once, so the retry goes out on a fresh connection instead of
-     * the one that just timed out. A reconnect a network switch queued is this one (its generation moves on).
+     * The network thread's native calls versus the store's close and the backup's pause: each call holds the read lock
+     * and runs only while its [netGen] is the current one; [endNetGeneration] takes the write lock.
+     */
+    private val netLock = ReentrantReadWriteLock()
+
+    /** The store generation network commands are issued in: bumped before every stop or close of the store. */
+    @Volatile private var netGen = 0L
+
+    /**
+     * Engine thread, before a stop or a close of the store: waits for the network call in flight (at most one attempt),
+     * and no network command issued before this runs its native call or its [sendNetAsync] continuation afterwards.
+     */
+    private fun endNetGeneration() {
+        netLock.write { netGen++ }
+    }
+
+    /**
+     * Engine thread, RUNNING: [cmd] with [NetRetry]'s one retry on the network thread, then [then] with the reply back
+     * on the engine thread. When the store it was issued for was stopped or closed meanwhile, [callback] gets
+     * NOT_RUNNING instead and [then] never runs: no cache update, callback or listener call from an old store.
+     */
+    private fun <T> sendNetAsync(cmd: String, callback: SecuredCallback<T>, then: (CoreReply) -> Unit) =
+        onNetThread(listOf(cmd), retry = true, callback) { then(it.single()) }
+
+    /** [sendNetAsync] for several commands, one after the other; [retry] false: one attempt each (no [NetRetry]). */
+    private fun <T> onNetThread(cmds: List<String>, retry: Boolean, callback: SecuredCallback<T>, then: (List<CoreReply>) -> Unit) {
+        val gen = netGen
+        val task = Runnable {
+            try {
+                val replies = cmds.map { cmd ->
+                    if (retry) NetRetry.run({ retryAllowed(gen) }) { n -> sendOnNet(gen, cmd, n) } else sendOnNet(gen, cmd, 0)
+                }
+                post(callback) {
+                    if (gen != netGen || state != EngineState.RUNNING || ctrl == 0L) return@post err(callback, ErrorMapper.notRunning(state))
+                    then(replies)
+                }
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.TASK_CRASHED, t)
+                err(callback, ErrorMapper.engine("internal"))
+            }
+        }
+        try {
+            netExecutor.execute(task)
+        } catch (e: RejectedExecutionException) {
+            err(callback, ErrorMapper.engine("internal"))
+        }
+    }
+
+    /** Network thread: one attempt, under the read lock, and only on the store [gen] was issued for (else [NO_CHAT]). */
+    private fun sendOnNet(gen: Long, cmd: String, retryNum: Int): CoreReply = netLock.read {
+        if (gen != netGen) NO_CHAT else send(cmd, retryNum = retryNum)
+    }
+
+    /**
+     * Network thread, between [NetRetry]'s attempts (no lock held, so a stop waiting for the write lock can't deadlock
+     * with it): [prepareRetry] on the engine thread, while [gen] is still the current store and the engine runs.
+     */
+    private fun retryAllowed(gen: Long): Boolean {
+        val answer = FutureTask<Boolean> { gen == netGen && state == EngineState.RUNNING && ctrl != 0L && prepareRetry() }
+        try {
+            executor.execute(answer)
+        } catch (e: RejectedExecutionException) {
+            return false
+        }
+        return try {
+            answer.get()
+        } catch (e: Exception) {
+            SecuredLog.crash(Ev.CMD_RETRY, e)
+            false
+        }
+    }
+
+    /**
+     * Engine thread, before [NetRetry]'s one retry (review of 4bce1db8, #1). A network change the watch reported may
+     * still be queued, and [online] may be what it was, so read the network now: with none usable there is no retry
+     * (the core waits for the network anyway). Else take it as the current one here (the queued report then changes
+     * nothing) and reconnect at once, so the retry goes out on a fresh connection instead of the one that just timed
+     * out. A reconnect a network switch queued is this one (its generation moves on).
      */
     private fun prepareRetry(): Boolean {
         val now = if (watchingNetwork) network.now() else null
@@ -4334,6 +4494,14 @@ internal class SimplexSecuredEngine(
     }
 
     private companion object {
+        /** No controller, or a network command whose store was closed meanwhile ([sendOnNet]). */
+        val NO_CHAT = CoreReply.Error(CoreError("error", "chatNotStarted", null))
+
+        /** One named daemon thread (the engine thread, the network thread). */
+        fun daemonThread(name: String): ExecutorService = Executors.newSingleThreadExecutor { r ->
+            Thread(r, name).apply { isDaemon = true }
+        }
+
         const val DATA_DIR = "encrogram-secured"
         const val DB_PREFIX = "secured"
         const val LOCKDOWN_MARKER = "first_run_lockdown"

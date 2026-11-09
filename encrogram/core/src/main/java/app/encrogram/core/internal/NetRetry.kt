@@ -6,9 +6,9 @@ package app.encrogram.core.internal
  * dialog. The retry runs with the core's retry number 1, which lengthens its timeouts 1.5x (simplexmq Client.hs
  * netTimeoutInt). Sends are asynchronous in the core and never come here.
  *
- * One retry only (review of 4bce1db8, #1): the whole chain holds the engine thread, so network changes and events wait
- * behind it. [run]'s `beforeRetry` lets the engine read the network now and reconnect first, so the retry doesn't go
- * out on the connection that just timed out.
+ * One retry only (review of 4bce1db8, #1): the whole chain holds the user waiting. It runs on the engine's network
+ * thread (A6), so the engine thread stays free meanwhile. [run]'s `beforeRetry` lets the engine read the network now and
+ * reconnect first, so the retry doesn't go out on the connection that just timed out.
  */
 internal object NetRetry {
 

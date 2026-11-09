@@ -41,9 +41,21 @@ final class SecuredChatSheets {
     static void showDisappearing(BaseFragment fragment, String name, Integer current, IntConsumer onPick) {
         final Context context = fragment.getParentActivity();
         if (context == null) return;
+        showTimerSheet(fragment, context.getString(R.string.secchat_disappear_note, name), current, onPick);
+    }
+
+    /** A group's or channel's timer, set by its owner for every member: Telegram's own wording for it. */
+    static void showGroupDisappearing(BaseFragment fragment, boolean channel, Integer current, IntConsumer onPick) {
+        showTimerSheet(fragment, org.telegram.messenger.LocaleController.getString(channel
+                ? org.telegram.messenger.R.string.AutoDeleteAlertChannelInfo : org.telegram.messenger.R.string.AutoDeleteAlertGroupInfo), current, onPick);
+    }
+
+    private static void showTimerSheet(BaseFragment fragment, CharSequence note, Integer current, IntConsumer onPick) {
+        final Context context = fragment.getParentActivity();
+        if (context == null) return;
         final LinearLayout box = column(context);
         box.addView(Kit.text(context, context.getString(R.string.secchat_disappear), 20, Kit.color(Theme.key_windowBackgroundWhiteBlackText), true));
-        box.addView(Kit.text(context, context.getString(R.string.secchat_disappear_note, name), 14, Kit.color(Theme.key_windowBackgroundWhiteGrayText), false),
+        box.addView(Kit.text(context, note, 14, Kit.color(Theme.key_windowBackgroundWhiteGrayText), false),
                 LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 8, 0, 8));
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, SecuredResourcesProvider.get());
         builder.setCustomView(box);
