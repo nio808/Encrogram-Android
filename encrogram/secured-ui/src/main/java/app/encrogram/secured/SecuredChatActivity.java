@@ -3248,6 +3248,15 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (jumpButton == null || listView == null) return;
         final int last = layoutManager.findLastVisibleItemPosition();
         if (!hasNewer && !listView.canScrollVertically(1)) unreadBelow = 0;
+        if (unreadBelow > 0 && !hasNewer && last != RecyclerView.NO_POSITION) {
+            // As in Telegram, the count drops as unread messages scroll into view: at most the received ones still below.
+            int below = 0;
+            for (int p = last + 1; p < rows.size() && below < unreadBelow; p++) {
+                final Row r = rows.get(p);
+                if (r.message != null && !r.caption && !r.message.getOutgoing()) below++;
+            }
+            unreadBelow = below;
+        }
         if (jumpCounter != null) {
             jumpCounter.setText(unreadBelow > 99 ? "99+" : String.valueOf(unreadBelow));
             jumpCounter.setVisibility(unreadBelow > 0 ? View.VISIBLE : View.GONE);
