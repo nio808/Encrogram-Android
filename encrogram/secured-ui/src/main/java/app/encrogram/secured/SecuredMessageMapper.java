@@ -43,9 +43,10 @@ import app.encrogram.core.api.SecuredMessage;
  * <li>no reactions, fwd_from, reply_to header, reply markup, views, replies, via-bot, effect, ttl, grouped id,
  * rich message or summary fields (Telegram's reaction layout loads icons from its CDN, fwd_from triggers user
  * lookups, views queue a network request);</li>
- * <li>entities are only {@code TL_messageEntityUrl} (found locally with Android's Linkify) and
- * {@code TL_messageEntityItalic} (our own "Forwarded" and "Message deleted" labels). Never custom emoji,
- * mention, hashtag or bot command entities;</li>
+ * <li>entities are only {@code TL_messageEntityUrl} (found locally with Android's Linkify),
+ * {@code TL_messageEntityItalic} (our own "Forwarded" and "Message deleted" labels) and {@code TL_messageEntityBold}
+ * (group mentions the engine reported for the message, {@link MentionText}). Never custom emoji, Telegram mention,
+ * hashtag or bot command entities: a mention is bold text, nothing to tap;</li>
  * <li>peer, sender and dialog id are the sentinel {@link #SENTINEL_ID};</li>
  * <li>the subclass {@link SecuredMessageObject} switches off the big animated emoji sticker lookup, the
  * emoji-to-Lottie replacement, avatars and the share button, and removes Telegram's own link spans (mention,
@@ -181,6 +182,7 @@ public final class SecuredMessageMapper {
                 entities.add(italic(prefix.length(), text.length()));
             } else {
                 addUrlEntities(body, prefix.length(), entities);
+                addMentionEntities(body, prefix.length(), m.getMentions(), entities);
             }
         }
         msg.message = body;
@@ -287,6 +289,28 @@ public final class SecuredMessageMapper {
             msg.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
             msg.unread = true;
         }
+    }
+
+    /** Group mentions (RD2): bold, never Telegram's mention entity, and never over a link. */
+    private static void addMentionEntities(String body, int from, java.util.Map<String, Long> mentions, ArrayList<TLRPC.MessageEntity> out) {
+        if (mentions == null || mentions.isEmpty()) return;
+        final int urls = out.size();
+        for (int[] r : MentionText.ranges(body, from, mentions.keySet())) {
+            boolean overlaps = false;
+            for (int i = 0; i < urls; i++) {
+                final TLRPC.MessageEntity e = out.get(i);
+                if (r[0] < e.offset + e.length && e.offset < r[1]) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (overlaps) continue;
+            final TLRPC.TL_messageEntityBold b = new TLRPC.TL_messageEntityBold();
+            b.offset = r[0];
+            b.length = r[1] - r[0];
+            out.add(b);
+        }
+        java.util.Collections.sort(out, (a, b) -> Integer.compare(a.offset, b.offset));
     }
 
     private static TLRPC.TL_messageEntityItalic italic(int offset, int length) {
@@ -698,8 +722,9 @@ public final class SecuredMessageMapper {
                 && o.summary_from_language == null && o.restriction_reason.isEmpty(), label + ": no Telegram-only fields");
         check(failures, (o.flags & TLRPC.MESSAGE_FLAG_HAS_VIEWS) == 0, label + ": no views (no views request)");
         for (TLRPC.MessageEntity e : o.entities) {
-            check(failures, e instanceof TLRPC.TL_messageEntityUrl || e instanceof TLRPC.TL_messageEntityItalic,
-                    label + ": only URL and italic entities");
+            check(failures, e instanceof TLRPC.TL_messageEntityUrl || e instanceof TLRPC.TL_messageEntityItalic
+                            || e instanceof TLRPC.TL_messageEntityBold,
+                    label + ": only URL, italic and bold (mention) entities");
         }
         if (mo.messageText instanceof Spanned) {
             final Spanned s = (Spanned) mo.messageText;

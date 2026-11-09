@@ -83,6 +83,7 @@ import java.util.Calendar;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -94,6 +95,7 @@ import app.encrogram.core.api.MemberRole;
 import app.encrogram.core.api.MessageSender;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
+import app.encrogram.core.api.GroupMember;
 import app.encrogram.core.api.ItemAction;
 import app.encrogram.core.api.LinkCheck;
 import app.encrogram.core.api.MediaKind;
@@ -107,6 +109,7 @@ import app.encrogram.core.api.SecuredEngine;
 import app.encrogram.core.api.SecuredEngineKt;
 import app.encrogram.core.api.SecuredError;
 import app.encrogram.core.api.SecuredListener;
+import app.encrogram.core.api.SecuredMentions;
 import app.encrogram.core.api.SecuredMessage;
 import app.encrogram.core.api.SecuredProfile;
 import app.encrogram.core.api.SecuredResult;
@@ -262,6 +265,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private ImageView micButton;
     private SecuredVoiceOverlay voiceOverlay;
     private SecuredVoiceRecorder voice;
+    // Group mentions (RD2): the "@" picker, the names inserted in the composer, and mentions of you to jump to.
+    private SecuredMentionPicker mentionPicker;
+    private final LinkedHashMap<String, Long> mentionMap = new LinkedHashMap<>();
+    private int mentionStart = -1;
+    private boolean insertingMention;
+    private FrameLayout mentionButton;
+    private TextView mentionCounter;
+    private final ArrayList<Long> unreadMentions = new ArrayList<>();
     /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
     private final HashMap<Long, long[]> liveProgress = new HashMap<>();
 
@@ -308,6 +319,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 unreadBelow++;
             }
             upsertMessage(message, true);
+            if (message.getMentionsMe() && !message.getOutgoing()) onMentionArrived(message.getMessageId());
             if (!message.getOutgoing() && engine != null && isVisibleToUser()) {
                 engine.markRead(chatId);
             }
@@ -513,6 +525,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
         final FrameLayout listFrame = new FrameLayout(context);
         buildList(context, listFrame);
+        if (groupChat) {
+            mentionPicker = new SecuredMentionPicker(context, SecuredResourcesProvider.get(), this::insertMention);
+            listFrame.addView(mentionPicker, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 0, Gravity.BOTTOM, 8, 0, 8, 4));
+            loadMembers();
+        }
         column.addView(listFrame, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0, 1f));
         column.addView(buildReplyStrip(context), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 8, 4, 8, 0));
         composerView = buildComposer(context);
@@ -718,6 +735,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 updateVisibleParts();
                 updateFloatingDate();
                 updateJumpButton(true);
+                updateMentionButton();
                 checkLoadOlder();
                 checkLoadNewer();
             }
@@ -759,6 +777,26 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         jumpCounter.setVisibility(View.GONE);
         jumpButton.setClipChildren(false);
         jumpButton.addView(jumpCounter, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 20, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 0, -10, 0, 0));
+
+        // Telegram's "@" button above the go-down button: jumps to the next message that mentions you.
+        mentionButton = new FrameLayout(context);
+        mentionButton.setBackground(Theme.createSimpleSelectorCircleDrawable(dp(42), chatResources.getColor(Theme.key_chat_goDownButton), chatResources.getColor(Theme.key_listSelector)));
+        final ImageView mentionIcon = new ImageView(context);
+        mentionIcon.setScaleType(ImageView.ScaleType.CENTER);
+        mentionIcon.setImageResource(org.telegram.messenger.R.drawable.mentionbutton);
+        mentionIcon.setColorFilter(new PorterDuffColorFilter(chatResources.getColor(Theme.key_chat_messagePanelIcons), PorterDuff.Mode.SRC_IN));
+        mentionButton.addView(mentionIcon, LayoutHelper.createFrame(42, 42, Gravity.CENTER));
+        mentionButton.setContentDescription(context.getString(R.string.secmention_next));
+        mentionButton.setOnClickListener(v -> jumpToMention());
+        mentionButton.setVisibility(View.GONE);
+        mentionButton.setClipChildren(false);
+        mentionCounter = Kit.text(context, "", 13, chatResources.getColor(Theme.key_chat_goDownButtonCounter), true);
+        mentionCounter.setGravity(Gravity.CENTER);
+        mentionCounter.setMinWidth(dp(20));
+        mentionCounter.setPadding(dp(6), 0, dp(6), 0);
+        mentionCounter.setBackground(Kit.roundRect(chatResources.getColor(Theme.key_chat_goDownButtonCounterBackground), 10));
+        mentionButton.addView(mentionCounter, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 20, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 0, -10, 0, 0));
+        listFrame.addView(mentionButton, LayoutHelper.createFrame(42, 42, Gravity.BOTTOM | Gravity.RIGHT, 0, 0, 10, 10));
     }
 
     // ---- header ----------------------------------------------------------------------------------------------
@@ -906,7 +944,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         if (joinButton != null) joinButton.setAlpha(joining ? 0.5f : 1f);
         composerView.setVisibility(!searching && canPost ? View.VISIBLE : View.GONE);
-        if (composerView.getVisibility() != View.VISIBLE) hideEmojiPanel();
+        if (composerView.getVisibility() != View.VISIBLE) {
+            hideEmojiPanel();
+            hideMentions();
+        }
         if (invitedBar != null) invitedBar.setVisibility(!searching && invited ? View.VISIBLE : View.GONE);
         final boolean removed = isRemovedOrLeft();
         if (cantPostBar != null) cantPostBar.setVisibility(!searching && !canPost && !invited && !removed ? View.VISIBLE : View.GONE);
@@ -1136,6 +1177,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             public void afterTextChanged(Editable s) {
                 updateSendVisibility(s.toString().trim().length() > 0);
                 updateMicVisibility();
+                checkMention(s);
             }
         });
         return row;
@@ -1211,6 +1253,142 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         input.requestFocus();
         AndroidUtilities.showKeyboard(input);
+    }
+
+    // ---- group mentions (RD2) -----------------------------------------------------------------------------------
+
+    private void loadMembers() {
+        if (engine == null || !groupChat) return;
+        try {
+            engine.members(chatId, result -> {
+                if (destroyed || mentionPicker == null || !(result instanceof SecuredResult.Ok)) return;
+                mentionPicker.setMembers(((SecuredResult.Ok<List<GroupMember>>) result).getValue());
+                if (mentionStart >= 0 && input != null) checkMention(input.getText());
+            });
+        } catch (Throwable ignored) {
+            // No list: the picker simply doesn't open.
+        }
+    }
+
+    /** "@" at the start of a word before the cursor opens the member list, filtered by what follows it. */
+    private void checkMention(Editable s) {
+        if (mentionPicker == null || insertingMention || input == null || s == null) return;
+        MentionText.prune(s.toString(), mentionMap);
+        if (editing != null || mentionMap.size() >= SecuredMentions.MAX_MENTIONS) {
+            hideMentions();
+            return;
+        }
+        final int cursor = input.getSelectionEnd();
+        if (cursor <= 0 || cursor > s.length() || cursor != input.getSelectionStart()) {
+            hideMentions();
+            return;
+        }
+        int i = cursor - 1;
+        while (i >= 0) {
+            final char c = s.charAt(i);
+            if (c == '@') break;
+            if (Character.isWhitespace(c) || cursor - i > 32) {
+                i = -1;
+                break;
+            }
+            i--;
+        }
+        if (i < 0 || (i > 0 && !Character.isWhitespace(s.charAt(i - 1)))) {
+            hideMentions();
+            return;
+        }
+        final String query = s.subSequence(i + 1, cursor).toString();
+        if (query.indexOf('\'') >= 0) {
+            hideMentions();
+            return;
+        }
+        final boolean opening = mentionStart < 0;
+        mentionStart = i;
+        if (opening) loadMembers();
+        if (!mentionPicker.show(query)) mentionStart = -1;
+    }
+
+    /** Replaces "@query" with the member's token (as the core reads it) and remembers whom it names. */
+    private void insertMention(GroupMember member) {
+        if (input == null || member == null) return;
+        final Editable s = input.getText();
+        final int cursor = input.getSelectionEnd();
+        if (s == null || mentionStart < 0 || mentionStart >= s.length() || s.charAt(mentionStart) != '@' || cursor < mentionStart) {
+            hideMentions();
+            return;
+        }
+        // The same member twice keeps one name; another member with the same name gets "_1", like the official app.
+        String key = null;
+        for (java.util.Map.Entry<String, Long> e : mentionMap.entrySet()) {
+            if (e.getValue() == member.getMemberId()) key = e.getKey();
+        }
+        final SecuredMentions.MentionToken token = key != null ? SecuredMentions.token(key)
+                : SecuredMentions.token(member.getDisplayName(), mentionMap.keySet());
+        final String inserted = token.getText() + " ";
+        insertingMention = true;
+        try {
+            s.replace(mentionStart, cursor, inserted);
+        } finally {
+            insertingMention = false;
+        }
+        mentionMap.put(token.getKey(), member.getMemberId());
+        final int at = Math.min(s.length(), mentionStart + inserted.length());
+        input.setSelection(at, at);
+        hideMentions();
+    }
+
+    private void hideMentions() {
+        mentionStart = -1;
+        if (mentionPicker != null) mentionPicker.hide();
+    }
+
+    /** A message that mentions you: flashed when it is in view, otherwise kept for the "@" button. */
+    private void onMentionArrived(long messageId) {
+        if (!unreadMentions.contains(messageId) && (hasNewer || !isAtBottom() || !isVisibleToUser())) {
+            unreadMentions.add(messageId);
+        } else {
+            flash(messageId);
+        }
+        updateMentionButton();
+    }
+
+    private void jumpToMention() {
+        if (unreadMentions.isEmpty()) return;
+        final long id = unreadMentions.remove(0);
+        goTo(id);
+        updateMentionButton();
+    }
+
+    /** Shows the "@" button while mentions of you wait below, above the go-down button when that shows. */
+    private void updateMentionButton() {
+        if (mentionButton == null) return;
+        if (!unreadMentions.isEmpty() && layoutManager != null) {
+            // Mentions now on screen are seen.
+            final int first = layoutManager.findFirstVisibleItemPosition();
+            final int last = layoutManager.findLastVisibleItemPosition();
+            if (first != RecyclerView.NO_POSITION) {
+                for (int p = first; p <= last && p < rows.size(); p++) {
+                    final Row r = rows.get(p);
+                    if (r.message != null) unreadMentions.remove(r.message.getMessageId());
+                }
+            }
+        }
+        final boolean show = !searching && !unreadMentions.isEmpty();
+        mentionButton.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (!show) return;
+        mentionButton.setTranslationY(jumpShown ? -dp(52) : 0);
+        mentionCounter.setText(unreadMentions.size() > 99 ? "99+" : String.valueOf(unreadMentions.size()));
+    }
+
+    /** Telegram's highlight flash on one bubble. */
+    private void flash(long messageId) {
+        highlightId = messageId;
+        setHighlighted(messageId, true);
+        AndroidUtilities.runOnUIThread(() -> {
+            if (destroyed || highlightId != messageId) return;
+            highlightId = Long.MIN_VALUE;
+            setHighlighted(messageId, false);
+        }, 1500);
     }
 
     // ---- emoji panel (MU11) ------------------------------------------------------------------------------------
@@ -1366,21 +1544,33 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         final SecuredMessage replyTarget = replyingTo;
         final Long replyId = replyTarget != null ? replyTarget.getMessageId() : null;
+        // Mentions still in the text (the engine sends at most SecuredMentions.MAX_MENTIONS of them).
+        MentionText.prune(text, mentionMap);
+        final HashMap<String, Long> mentions = groupChat && !mentionMap.isEmpty() ? new HashMap<>(mentionMap) : null;
         input.setText("");
+        mentionMap.clear();
+        hideMentions();
         cancelStrip();
+        final app.encrogram.core.api.SecuredCallback<SecuredMessage> done = result -> {
+            if (destroyed) return;
+            if (result instanceof SecuredResult.Ok) {
+                upsertMessage(((SecuredResult.Ok<SecuredMessage>) result).getValue(), true);
+            } else {
+                // Fail closed with a readable reason, and give the text (and the reply) back so nothing is lost.
+                restoreDraft(text, replyTarget);
+                if (mentions != null) mentionMap.putAll(mentions);
+                showToast(((SecuredResult.Err) result).getError());
+            }
+        };
         try {
-            engine.sendMessage(chatId, text, replyId, result -> {
-                if (destroyed) return;
-                if (result instanceof SecuredResult.Ok) {
-                    upsertMessage(((SecuredResult.Ok<SecuredMessage>) result).getValue(), true);
-                } else {
-                    // Fail closed with a readable reason, and give the text (and the reply) back so nothing is lost.
-                    restoreDraft(text, replyTarget);
-                    showToast(((SecuredResult.Err) result).getError());
-                }
-            });
+            if (mentions != null) {
+                engine.sendMessage(chatId, text, replyId, mentions, done);
+            } else {
+                engine.sendMessage(chatId, text, replyId, done);
+            }
         } catch (Throwable t) {
             restoreDraft(text, replyTarget);
+            if (mentions != null) mentionMap.putAll(mentions);
             showToast(null);
         }
     }
@@ -2396,6 +2586,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (avatarContainer != null) avatarContainer.setVisibility(View.GONE);
         if (composerView != null) composerView.setVisibility(View.GONE);
         hideEmojiPanel();
+        hideMentions();
+        if (mentionButton != null) mentionButton.setVisibility(View.GONE);
         if (groupChat) updateBottomBars();
         if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
@@ -2975,6 +3167,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 || last != RecyclerView.NO_POSITION && last < rows.size() - 2 && listView.canScrollVertically(1));
         if (show == jumpShown) return;
         jumpShown = show;
+        updateMentionButton();
         jumpButton.animate().cancel();
         if (show) {
             jumpButton.setVisibility(View.VISIBLE);
@@ -3084,6 +3277,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     public boolean onBackPressed(boolean invoked) {
         if (voice != null && voice.isActive()) {
             if (invoked) voice.onLockedCancel();
+            return false;
+        }
+        if (mentionPicker != null && mentionPicker.isShowing()) {
+            if (invoked) hideMentions();
             return false;
         }
         if (emojiShown) {

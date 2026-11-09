@@ -18,4 +18,7 @@
     <string name="secvoice_failed">The microphone couldn\'t record. Try again.</string>
     <string name="secvoice_not_ready">The recorder wasn\'t ready yet, so nothing was recorded. Try again.</string>
     <string name="secvoice_stopped">Recording stopped and deleted.</string>
+
+    <!-- Group mentions -->
+    <string name="secmention_next">Next mention of you</string>
 </resources>
