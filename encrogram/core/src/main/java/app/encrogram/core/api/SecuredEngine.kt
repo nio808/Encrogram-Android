@@ -356,6 +356,11 @@ data class SecuredMessage @JvmOverloads constructor(
     val event: GroupEvent? = null,
     /** Photo, GIF, video, voice or file; [text] is then its caption (may be empty). Null for text, service rows and deleted messages. */
     val media: SecuredMedia? = null,
+    /**
+     * Groups: one of the earlier messages the group sent when you joined. Shown like any other message, but never
+     * notifies and never counts as unread (it was already read in the engine).
+     */
+    val history: Boolean = false,
 ) {
     /** Ids and status only: text and quotes are user content and must never reach a log. */
     override fun toString() = "SecuredMessage($chatId/$messageId, $status${media?.let { ", $it" } ?: ""})"

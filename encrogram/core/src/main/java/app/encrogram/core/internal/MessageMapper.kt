@@ -51,6 +51,7 @@ internal object MessageMapper {
             sender = sender?.let { MessageSender(it.memberId, it.displayName, it.role) },
             event = event,
             media = if (deleted || service) null else MediaMapper.map(i),
+            history = i.history,
         )
     }
 

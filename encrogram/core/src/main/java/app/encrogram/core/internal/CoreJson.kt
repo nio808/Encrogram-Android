@@ -133,6 +133,17 @@ internal data class CoreItem(
     val preview: String? = null,
     /** msgContent.duration in whole seconds (video and voice). */
     val durationSeconds: Int? = null,
+    /**
+     * meta.forwardedByMember is set: another member passed this group message on to us (x.grp.msg.forward). That is
+     * how a join's history arrives, and also how live messages from members not yet connected to us arrive.
+     */
+    val relayed: Boolean = false,
+    /**
+     * Part of the history the group sent when we joined (G11, [GroupRules.beforeJoin]): relayed and sent before our
+     * membership began. Never [unread], never notifies; shown like any other message. [statusTag] stays the core's
+     * (rcvNew until the engine marks it read there).
+     */
+    val history: Boolean = false,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -179,6 +190,8 @@ internal data class CoreGroup(
      * gets a new one, so the history it receives carries this row's id on our earlier messages ([GroupRules.markOwnHistory]).
      */
     val myMemberId: String? = null,
+    /** membership.createdAt: when this membership began on this phone (invitation received or link join accepted), 0 if unknown. */
+    val joinedAtMs: Long = 0,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
@@ -508,8 +521,12 @@ internal object CoreJson {
         if (aChatItem == null) return null
         val info = aChatItem.optJSONObject("chatInfo")
         val chatId = chatIdOf(info) ?: return null
-        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info), joinedByLink(groupInfoOf(info)))
+        val group = groupInfoOf(info)
+        return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info), joinedByLink(group), joinedAtMs(group))
     }
+
+    /** membership.createdAt of a GroupInfo (when our membership began on this phone), 0 when absent. */
+    fun joinedAtMs(groupInfo: JSONObject?): Long = timeMs(groupInfo?.optJSONObject("membership")?.str("createdAt"))
 
     /**
      * We joined this group through its link: the GroupInfo keeps the link we used (viaGroupLinkUri, Types.hs:500, set by
@@ -522,8 +539,9 @@ internal object CoreJson {
     /**
      * [peerName]: the contact's name in a direct chat, used only for our own sent invitation row. [joinedByLink]: we
      * joined this group by its link ([joinedByLink]), so our own join row reads "You joined via invite link".
+     * [joinedAtMs]: the group's membership.createdAt ([joinedAtMs]), for [CoreItem.history]; 0 outside groups.
      */
-    fun parseChatItem(chatId: Long, item: JSONObject?, peerName: String? = null, joinedByLink: Boolean = false): CoreItem? {
+    fun parseChatItem(chatId: Long, item: JSONObject?, peerName: String? = null, joinedByLink: Boolean = false, joinedAtMs: Long = 0L): CoreItem? {
         if (item == null) return null
         val meta = item.optJSONObject("meta") ?: return null
         if (!meta.has("itemId")) return null
@@ -566,17 +584,21 @@ internal object CoreJson {
         val statusTag = tagOf(status)
         val timed = meta.optJSONObject("itemTimed")
         val expiresAt = timeMs(timed?.str("deleteAt")).takeIf { it > 0 }
+        val itemTs = timeMs(meta.str("itemTs"))
+        // Relayed by another member (Subscriber.hs:3895-3898 saveGroupFwdRcvMsg -> chat_items.forwarded_by_group_member_id).
+        val relayed = group && dir == "groupRcv" && present(meta, "forwardedByMember")
+        val history = relayed && isMessage && GroupRules.beforeJoin(itemTs, joinedAtMs)
         return CoreItem(
             chatId = chatId,
             itemId = meta.optLong("itemId"),
             outgoing = outgoing,
             isMessage = isMessage,
             text = text,
-            timeMs = timeMs(meta.str("itemTs")),
+            timeMs = itemTs,
             statusTag = statusTag,
             status = if (local) MessageStatus.DELIVERED else
                 FileStatusMapper.cappedStatus(StatusMapper.map(statusTag, outgoing, status?.str("sndProgress"), group), file, outgoing),
-            unread = !local && !outgoing && statusTag == "rcvNew",
+            unread = !local && !outgoing && statusTag == "rcvNew" && !history,
             msgContentType = tagOf(msgContent),
             quote = if (deleted) null else parseQuote(item.optJSONObject("quotedItem")),
             edited = meta.optBoolean("itemEdited", false),
@@ -596,6 +618,8 @@ internal object CoreJson {
             file = file,
             preview = if (mediaMsg && (msgType == "image" || msgType == "video")) MediaJson.preview(msgContent) else null,
             durationSeconds = if (mediaMsg && (msgType == "video" || msgType == "voice")) MediaJson.duration(msgContent) else null,
+            relayed = relayed,
+            history = history,
         )
     }
 
@@ -814,6 +838,7 @@ internal object CoreJson {
             profileName = profile?.str("displayName").orEmpty(),
             linkKey = joinLinkKey(g),
             myMemberId = membership?.str("memberId")?.ifEmpty { null },
+            joinedAtMs = timeMs(membership?.str("createdAt")),
         )
     }
 
@@ -918,7 +943,7 @@ internal object CoreJson {
             var last: CoreItem? = null
             if (items != null) {
                 for (j in 0 until items.length()) {
-                    val it = parseChatItem(group.chatId, items.optJSONObject(j), joinedByLink = viaLink) ?: continue
+                    val it = parseChatItem(group.chatId, items.optJSONObject(j), joinedByLink = viaLink, joinedAtMs = group.joinedAtMs) ?: continue
                     if (last == null || it.itemId > last.itemId) last = it
                 }
             }
@@ -1083,10 +1108,12 @@ internal object CoreJson {
         val info = chat.optJSONObject("chatInfo")
         val chatId = chatIdOf(info) ?: return emptyList()
         val peer = peerNameOf(info)
-        val viaLink = joinedByLink(groupInfoOf(info))
+        val group = groupInfoOf(info)
+        val viaLink = joinedByLink(group)
+        val joinedAt = joinedAtMs(group)
         val items = chat.optJSONArray("chatItems") ?: return emptyList()
         val out = ArrayList<CoreItem>(items.length())
-        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j), peer, viaLink)?.let { out.add(it) }
+        for (j in 0 until items.length()) parseChatItem(chatId, items.optJSONObject(j), peer, viaLink, joinedAt)?.let { out.add(it) }
         out.sortBy { it.itemId }
         val linkJoiners = out.mapNotNullTo(HashSet()) { it.linkJoinOf }
         return if (linkJoiners.isEmpty()) out else markLinkJoins(out) { _, memberId -> memberId in linkJoiners }

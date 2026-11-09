@@ -102,10 +102,11 @@ class SecuredService : Service() {
          * Incoming messages notify, in 1:1 chats and groups alike (same hidden text, NotificationText). Of the service
          * rows only an invitation to you does: the INVITED row in the inviter's 1:1 chat (rcvGroupInvitation). In a
          * group, INVITED means "X was invited" (memberAdded, invitedViaGroupLink) and, like "X joined", never notifies
-         * (review #5). Our own rows (sent invitations, "You left") are outgoing.
+         * (review #5). Our own rows (sent invitations, "You left") are outgoing. A group's history, sent when we joined,
+         * never notifies (G11, [SecuredMessage.history]).
          */
         fun notifies(message: SecuredMessage): Boolean {
-            if (message.outgoing) return false
+            if (message.outgoing || message.history) return false
             val event = message.event ?: return true
             return event.kind == GroupEvent.Kind.INVITED && !isGroupChatId(message.chatId)
         }

@@ -181,6 +181,44 @@ internal object GroupRules {
         }
     }
 
+    /**
+     * G11, research/group-history.md. A join's history (Library/Internal.hs:1316-1329 sendHistory) reaches us as
+     * x.grp.msg.forward from the member who let us in, each message keeping its original time: the core stores it with
+     * item_ts = the forward's fwdBrokerTs = the original item's itemTs (:1418-1419; Subscriber.hs:3871, :2153-2198) and
+     * forwarded_by_group_member_id set ([CoreItem.relayed]). The core has no history marker. So a relayed message is
+     * history when it was sent before our membership began ([joinedAtMs]: membership.createdAt, or the moment we
+     * accepted an invitation on this phone) by more than [HISTORY_MARGIN_MS] (clock skew between the phone and the
+     * relays). A live message relayed for someone not yet connected to us was sent after we joined, so it never
+     * qualifies; when in doubt (no time, no join time) it is not history and notifies.
+     */
+    fun beforeJoin(itemTsMs: Long, joinedAtMs: Long): Boolean =
+        itemTsMs > 0 && joinedAtMs > 0 && itemTsMs < joinedAtMs - HISTORY_MARGIN_MS
+
+    /**
+     * [CoreItem.history] again with a later join time than the parser had: [acceptedAt] gives, per group chat id, when
+     * we accepted its invitation on this phone (membership.createdAt is when the invitation arrived, possibly days
+     * earlier, and the history covers everything up to our join). Never clears the flag.
+     */
+    fun markJoinHistory(items: List<CoreItem>, acceptedAt: (chatId: Long) -> Long?): List<CoreItem> = items.map { i ->
+        if (i.history || !i.relayed || !i.isMessage || !i.group) return@map i
+        val at = acceptedAt(i.chatId) ?: return@map i
+        if (beforeJoin(i.timeMs, at)) i.copy(history = true, unread = false) else i
+    }
+
+    /**
+     * A group joined recently enough that its history may still sit unread in the core ([HISTORY_SWEEP_WINDOW_MS]),
+     * e.g. when the app stopped between the core storing it and the engine hearing of it. A join time in the future
+     * (phone clock moved back) counts as recent.
+     */
+    fun joinHistorySweepDue(joinedAtMs: Long, nowMs: Long): Boolean =
+        joinedAtMs > 0 && nowMs - joinedAtMs < HISTORY_SWEEP_WINDOW_MS
+
+    /** Clock skew allowed between this phone and the relays' timestamps (G11). */
+    const val HISTORY_MARGIN_MS = 2 * 60 * 1000L
+
+    /** History arrives right after a join; later than this the sweep isn't worth a page read per group. */
+    const val HISTORY_SWEEP_WINDOW_MS = 7L * 24 * 60 * 60 * 1000
+
     /** [memberId] is one of our earlier ids and that membership sent exactly [text] as [sharedMsgId]. */
     private fun proven(proofs: OwnProofs, memberId: String?, sharedMsgId: String?, text: String): Boolean {
         if (memberId == null || sharedMsgId == null || text.isEmpty()) return false
