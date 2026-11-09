@@ -66,6 +66,15 @@ interface SecuredEngine {
     fun sendMessage(chatId: Long, text: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>)
 
     /**
+     * [sendMessage] with group mentions: [mentions] maps each [SecuredMentions.MentionToken.key] in [text] to the member's
+     * [GroupMember.memberId]. Only keys that still appear as mentions in the text are sent, each member once, at most
+     * [SecuredMentions.MAX_MENTIONS]; outside groups they are ignored. If the core refuses the mentions, the text goes
+     * without them.
+     */
+    fun sendMessage(chatId: Long, text: String, replyToId: Long?, mentions: Map<String, Long>, callback: SecuredCallback<SecuredMessage>) =
+        sendMessage(chatId, text, replyToId, callback)
+
+    /**
      * Acts on messages of one chat. Results arrive through the listener: [SecuredListener.onMessageChanged] for
      * edits, reactions and "marked deleted", [SecuredListener.onMessagesRemoved] for deletes,
      * [SecuredListener.onMessageReceived] for the forwarded copy in the target chat.
@@ -361,6 +370,13 @@ data class SecuredMessage @JvmOverloads constructor(
      * notifies and never counts as unread (it was already read in the engine).
      */
     val history: Boolean = false,
+    /** Groups: each `@name` in [text] that names a member -> that member's [GroupMember.memberId] (members known on this phone). */
+    val mentions: Map<String, Long> = emptyMap(),
+    /**
+     * Groups: someone else's message that mentions you or replies to one of your messages. It notifies even in a muted
+     * group, as in SimpleX and Telegram; the UI may highlight it.
+     */
+    val mentionsMe: Boolean = false,
 ) {
     /** Ids and status only: text and quotes are user content and must never reach a log. */
     override fun toString() = "SecuredMessage($chatId/$messageId, $status${media?.let { ", $it" } ?: ""})"
@@ -399,6 +415,7 @@ sealed class ItemAction {
 
 sealed class ChatAction {
     data class SetPinned(val pinned: Boolean) : ChatAction()
+    /** Muting a group still lets messages that mention you notify ([SecuredMessage.mentionsMe]). */
     data class SetMuted(val muted: Boolean) : ChatAction()
     /** Local only. */
     data class SetArchived(val archived: Boolean) : ChatAction()

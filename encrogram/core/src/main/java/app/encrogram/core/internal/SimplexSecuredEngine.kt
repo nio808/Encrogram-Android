@@ -26,6 +26,7 @@ import app.encrogram.core.api.SecuredEngine
 import app.encrogram.core.api.SecuredError
 import app.encrogram.core.api.SecuredInvite
 import app.encrogram.core.api.SecuredListener
+import app.encrogram.core.api.SecuredMentions
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredProfile
 import app.encrogram.core.api.SecuredResult
@@ -441,7 +442,16 @@ internal class SimplexSecuredEngine(
     override fun sendText(chatId: Long, text: String, callback: SecuredCallback<SecuredMessage>) =
         sendMessage(chatId, text, null, callback)
 
-    override fun sendMessage(chatId: Long, text: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) = post(callback) {
+    override fun sendMessage(chatId: Long, text: String, replyToId: Long?, callback: SecuredCallback<SecuredMessage>) =
+        sendMessage(chatId, text, replyToId, emptyMap(), callback)
+
+    override fun sendMessage(
+        chatId: Long,
+        text: String,
+        replyToId: Long?,
+        mentions: Map<String, Long>,
+        callback: SecuredCallback<SecuredMessage>,
+    ) = post(callback) {
         if (!ensureRunning(callback)) return@post
         if (text.isBlank()) return@post err(callback, ErrorMapper.invalid("The message is empty."))
         if (!InputRules.textFits(text)) return@post err(callback, ErrorMapper.invalid(ErrorMapper.TOO_LONG))
@@ -457,7 +467,15 @@ internal class SimplexSecuredEngine(
                 return@post err(callback, ErrorMapper.invalid("This reply is too long. Shorten it, or send it without the quote."))
             }
         }
-        when (val r = send(Commands.sendText(ref, text, replyToId))) {
+        // Only names the core reads as mentions in the text, each member once, at most 3 (getCIMentions).
+        val wanted = if (ref.isGroup) SecuredMentions.forSend(text, mentions) else emptyMap()
+        var reply = send(Commands.sendText(ref, text, replyToId, wanted))
+        if (wanted.isNotEmpty() && reply is CoreReply.Error && reply.error.type == "errorStore" && reply.error.detail in MENTION_REFUSALS) {
+            // The core checks mentions before anything is sent (Commands.hs:716-718): the text still goes, without them.
+            SecuredLog.w(Ev.ITEM_ACTION, "mentions_dropped", wanted.size)
+            reply = send(Commands.sendText(ref, text, replyToId))
+        }
+        when (val r = reply) {
             is CoreReply.Result -> {
                 // localView: a reply to one of our earlier messages in a rejoin's history quotes it as ours.
                 val item = if (r.type == "newChatItems") localView(CoreJson.parseChatItems(r.body)).firstOrNull { it.chatId == chatId } else null
@@ -501,8 +519,9 @@ internal class SimplexSecuredEngine(
         when (action) {
             is ChatAction.SetPinned ->
                 updateChatSettings(chatId, "pin", callback) { it.put("favorite", action.pinned) }
+            // A muted group still notifies mentions of us (MsgFilter "mentions", the official app's first mute step).
             is ChatAction.SetMuted ->
-                updateChatSettings(chatId, "mute", callback) { it.put("enableNtfs", if (action.muted) "none" else "all") }
+                updateChatSettings(chatId, "mute", callback) { it.put("enableNtfs", if (!action.muted) "all" else if (group) "mentions" else "none") }
             is ChatAction.SetArchived -> setArchivedOnEngine(chatId, action.archived, callback)
             ChatAction.ClearHistory -> {
                 val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
@@ -3756,6 +3775,8 @@ internal class SimplexSecuredEngine(
         const val AUTO_SYNC_GAP_MS = 10L * 60 * 1000
         /** A guard re-check runs this long after the guard ends (R6.6). */
         const val SYNC_RECHECK_SLACK_MS = 2_000L
+        /** Store errors of a send whose mentions the core refused (SEInvalidMention; a member gone, SEGroupMemberNotFound). */
+        val MENTION_REFUSALS = setOf("invalidMention", "groupMemberNotFound")
         /** `/u` before any profile exists (ChatErrorType CENoActiveUser). */
         val NO_USER_YET = setOf("noActiveUser")
 

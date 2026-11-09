@@ -69,7 +69,7 @@ class SecuredService : Service() {
         if (!notifies(message)) return
         val config = SecuredBackground.config ?: return
         if (SecuredBackground.isChatOnScreen(message.chatId)) return
-        if (e.chats().firstOrNull { it.chatId == message.chatId }?.muted == true) return
+        if (e.chats().firstOrNull { it.chatId == message.chatId }?.muted == true && !notifiesWhenMuted(message)) return
         SecuredNotifier.onIncoming(applicationContext, config, message.chatId)
     }
 
@@ -110,5 +110,8 @@ class SecuredService : Service() {
             val event = message.event ?: return true
             return event.kind == GroupEvent.Kind.INVITED && !isGroupChatId(message.chatId)
         }
+
+        /** In a muted group, a message that mentions you (or replies to you) still notifies, as in SimpleX and Telegram. */
+        fun notifiesWhenMuted(message: SecuredMessage): Boolean = message.mentionsMe && isGroupChatId(message.chatId)
     }
 }

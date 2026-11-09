@@ -52,6 +52,8 @@ internal object MessageMapper {
             event = event,
             media = if (deleted || service) null else MediaMapper.map(i),
             history = i.history,
+            mentions = if (deleted || service) emptyMap() else i.mentions,
+            mentionsMe = i.mentionsMe && !i.outgoing && !deleted,
         )
     }
 

@@ -144,6 +144,13 @@ internal data class CoreItem(
      * (rcvNew until the engine marks it read there).
      */
     val history: Boolean = false,
+    /**
+     * ChatItem.mentions {name: CIMention {memberId, memberRef?}} (Messages.hs:272-285): each name in the text -> the
+     * mentioned member's groupMemberId on this phone, when the core knows them. Names are user content: never logged.
+     */
+    val mentions: Map<String, Long> = emptyMap(),
+    /** meta.userMention: someone else's group message that mentions us or replies to one of our messages (Messages.hs:521). */
+    val mentionsMe: Boolean = false,
 ) {
     /** In a group chat ([GROUP_CHAT_ID_BASE] + groupId). */
     val group: Boolean get() = isGroupChatId(chatId)
@@ -620,7 +627,20 @@ internal object CoreJson {
             durationSeconds = if (mediaMsg && (msgType == "video" || msgType == "voice")) MediaJson.duration(msgContent) else null,
             relayed = relayed,
             history = history,
+            mentions = if (group && isMessage && !deleted) parseMentions(item.optJSONObject("mentions")) else emptyMap(),
+            mentionsMe = group && isMessage && !outgoing && !deleted && meta.optBoolean("userMention", false),
         )
+    }
+
+    /** ChatItem.mentions -> name -> memberRef.groupMemberId, for members known on this phone. */
+    private fun parseMentions(m: JSONObject?): Map<String, Long> {
+        if (m == null || m.length() == 0) return emptyMap()
+        val out = LinkedHashMap<String, Long>()
+        for (name in m.keys()) {
+            val id = m.optJSONObject(name)?.optJSONObject("memberRef")?.optLong("groupMemberId", 0L) ?: 0L
+            if (name.isNotEmpty() && id > 0) out[name] = id
+        }
+        return out
     }
 
     /** The core's order of a chat's items (Store/Messages.hs: item_ts, then chat_item_id). */

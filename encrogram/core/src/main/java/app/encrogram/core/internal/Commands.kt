@@ -1,6 +1,7 @@
 package app.encrogram.core.internal
 
 import app.encrogram.core.api.MemberRole
+import app.encrogram.core.api.SecuredMentions
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -185,11 +186,17 @@ internal object Commands {
     /**
      * [sendText] to a contact or a group (sendRefP, Commands.hs:5931-5933: `#<groupId>` without scope or
      * `as_group`, so a group message goes to every member as ours). Not for notes: they use [createNote].
+     * [mentions]: ComposedMessage.mentions {name: groupMemberId} (Controller.hs:1282-1288), groups only (the core
+     * refuses any for a contact, Commands.hs:708 assertNoMentions); reduce it with SecuredMentions.forSend first.
      */
-    fun sendText(chat: ChatRef, text: String, quotedItemId: Long? = null): String {
+    fun sendText(chat: ChatRef, text: String, quotedItemId: Long? = null, mentions: Map<String, Long> = emptyMap()): String {
         require(!chat.isNotes) { "notes use /_create" }
+        require(mentions.isEmpty() || chat.isGroup) { "mentions are for groups" }
+        require(mentions.size <= SecuredMentions.MAX_MENTIONS && mentions.values.all { it > 0 }) { "mentions" }
         val msgContent = JSONObject().put("type", "text").put("text", text)
-        val composed = JSONObject().put("msgContent", msgContent).put("mentions", JSONObject())
+        val m = JSONObject()
+        for ((name, memberId) in mentions) m.put(name, memberId)
+        val composed = JSONObject().put("msgContent", msgContent).put("mentions", m)
         if (quotedItemId != null) composed.put("quotedItemId", quotedItemId)
         return "/_send $chat json " + asciiJson(JSONArray().put(composed).toString())
     }
