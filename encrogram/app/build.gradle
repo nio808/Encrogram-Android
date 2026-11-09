@@ -39,6 +39,7 @@ dependencies {
     implementation project(':encrogram-secured-ui')
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+    testImplementation 'junit:junit:4.13.2'
 }
 
 android {
@@ -85,12 +86,16 @@ android {
                 keyPassword RELEASE_KEY_PASSWORD
             }
         }
-        // Release: still upstream's dummy key; the build is blocked until our own API ID and release key exist.
+        // Release: our own key only. With no key configured nothing is set here and the guard below blocks release tasks
+        // (never fall back to upstream's public test key).
         release {
-            storeFile file("../../TMessagesProj/config/release.keystore")
-            storePassword RELEASE_STORE_PASSWORD
-            keyAlias RELEASE_KEY_ALIAS
-            keyPassword RELEASE_KEY_PASSWORD
+            def relKey = (localProps.getProperty('ENCROGRAM_RELEASE_STORE_FILE') ?: '').trim()
+            if (relKey) {
+                storeFile file(relKey)
+                storePassword((localProps.getProperty('ENCROGRAM_RELEASE_STORE_PASSWORD') ?: '').trim())
+                keyAlias((localProps.getProperty('ENCROGRAM_RELEASE_KEY_ALIAS') ?: '').trim())
+                keyPassword((localProps.getProperty('ENCROGRAM_RELEASE_KEY_PASSWORD') ?: '').trim())
+            }
         }
     }
 
@@ -189,6 +194,21 @@ if (!missingApiKeys.isEmpty()) {
         if (rel != null) {
             throw new GradleException("Release build blocked: ${missingApiKeys.join(', ')} missing from " +
                     "encrogram/local.properties. Register our own Telegram API ID first (AGENTS.md rule 6).")
+        }
+    }
+}
+
+// A1: releases must be signed with our own key, never upstream's public test key. Values are never printed.
+def missingReleaseKeys = ['ENCROGRAM_RELEASE_STORE_FILE', 'ENCROGRAM_RELEASE_STORE_PASSWORD',
+        'ENCROGRAM_RELEASE_KEY_ALIAS', 'ENCROGRAM_RELEASE_KEY_PASSWORD'].findAll {
+    !(localProps.getProperty(it) ?: '').trim()
+}
+if (!missingReleaseKeys.isEmpty()) {
+    gradle.taskGraph.whenReady { graph ->
+        def rel = graph.allTasks.find { it.project == project && it.name.toLowerCase().contains('release') }
+        if (rel != null) {
+            throw new GradleException("Release build blocked: ${missingReleaseKeys.join(', ')} missing from " +
+                    "encrogram/local.properties. Release builds need our own signing key (never upstream's test key).")
         }
     }
 }

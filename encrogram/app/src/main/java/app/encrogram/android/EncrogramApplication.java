@@ -45,6 +45,14 @@ public class EncrogramApplication extends ApplicationLoader {
         }
 
         super.onCreate();
+
+        if (BuildConfig.DEBUG) {
+            // A13: log slow or leaky work in debug builds only.
+            android.os.StrictMode.setThreadPolicy(new android.os.StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads().detectDiskWrites().detectNetwork().penaltyLog().build());
+            android.os.StrictMode.setVmPolicy(new android.os.StrictMode.VmPolicy.Builder()
+                    .detectLeakedClosableObjects().penaltyLog().build());
+        }
     }
 
     /** Tap intent of a Secured notification: only the local chat id, no text. Same CLEAR_TOP style as Telegram's own. */

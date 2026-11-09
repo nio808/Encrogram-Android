@@ -19,19 +19,11 @@ import app.encrogram.secured.SecuredUi;
  */
 public class SecuredLinkActivity extends Activity {
 
-    private static final int MAX_LINK_LENGTH = 2048;
-
     /** Exported activity: explicit intents skip the manifest filter, so check everything here. */
     private static boolean isValidLink(Uri u) {
         if (u == null || !u.isHierarchical()) return false;
-        final String host = u.getHost();
-        final String path = u.getPath();
-        return "https".equalsIgnoreCase(u.getScheme())
-                && host != null && host.equalsIgnoreCase(BuildConfig.SECURED_LINK_HOST)
-                && u.getUserInfo() == null
-                && (u.getPort() == -1 || u.getPort() == 443)
-                && ("/i".equals(path) || "/a".equals(path) || "/g".equals(path))
-                && u.toString().length() <= MAX_LINK_LENGTH;
+        return LinkShape.isValid(u.getScheme(), u.getHost(), u.getUserInfo(), u.getPort(), u.getPath(),
+                u.toString().length(), BuildConfig.SECURED_LINK_HOST);
     }
 
     @Override
