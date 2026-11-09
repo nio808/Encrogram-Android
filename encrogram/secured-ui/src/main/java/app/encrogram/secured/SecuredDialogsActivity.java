@@ -111,7 +111,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private static final int TEXT_BACK = 1, TEXT_NO_RESULTS = 2;
     private static final int ID_PIN = 1, ID_MUTE = 2, ID_ARCHIVE = 3, ID_DELETE = 4, ID_READ = 5;
     private static final String ACTION_MODE_TAG = "secured_list";
-    private static final int ID_BACKUP = 20;   // the ⋮ menu: Backup (12 words)
+    private static final int ID_BACKUP = 20;   // the ⋮ menu: Settings
 
     /** One row of the list. */
     private static final class Item {
@@ -428,7 +428,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             @Override
             public void onItemClick(int id) {
                 if (id >= ID_PIN && id <= ID_READ) onSelectionAction(id);
-                else if (id == ID_BACKUP) presentFragment(new SecuredBackupSettingsActivity());
+                else if (id == ID_BACKUP) presentFragment(new SecuredSettingsActivity());
             }
         });
         // The ⋮ menu (only on the list): Backup. Same construction as the chat screen's menu.
@@ -436,7 +436,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         moreItem = menu.addItem(0, org.telegram.messenger.R.drawable.ic_ab_other, SecuredResourcesProvider.get());
         Kit.securePopup(moreItem.getPopupLayout());
         moreItem.setContentDescription(context.getString(R.string.sec_bk_menu_more));
-        moreItem.addSubItem(ID_BACKUP, org.telegram.messenger.R.drawable.msg_secret, context.getString(R.string.sec_bk_menu), SecuredResourcesProvider.get());
+        moreItem.addSubItem(ID_BACKUP, org.telegram.messenger.R.drawable.msg_settings, context.getString(R.string.sec_set_menu), SecuredResourcesProvider.get());
         moreItem.setVisibility(mode == Mode.LIST ? View.VISIBLE : View.GONE);
         labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet),
                 org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages))

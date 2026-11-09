@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_set_title">Settings</string>
+    <string name="sec_set_menu">Settings</string>
+    <string name="sec_set_profile">Profile</string>
+    <string name="sec_set_name">Name</string>
+    <string name="sec_set_save">Save</string>
+    <string name="sec_set_name_info">Your name is shown only to your Secured contacts and groups.</string>
+</resources>
