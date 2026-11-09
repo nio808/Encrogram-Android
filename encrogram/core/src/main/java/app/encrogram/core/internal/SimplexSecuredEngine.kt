@@ -492,16 +492,20 @@ internal class SimplexSecuredEngine(
         // Only names the core reads as mentions in the text, each member once, at most 3 (getCIMentions).
         val wanted = if (ref.isGroup) SecuredMentions.forSend(text, mentions) else emptyMap()
         var reply = send(Commands.sendText(ref, text, replyToId, wanted))
+        var sentMentions = wanted
         if (wanted.isNotEmpty() && reply is CoreReply.Error && reply.error.type == "errorStore" && reply.error.detail in MENTION_REFUSALS) {
             // The core checks mentions before anything is sent (Commands.hs:716-718): the text still goes, without them.
             SecuredLog.w(Ev.ITEM_ACTION, "mentions_dropped", wanted.size)
             reply = send(Commands.sendText(ref, text, replyToId))
+            sentMentions = emptyMap()
         }
         when (val r = reply) {
             is CoreReply.Result -> {
                 // localView: a reply to one of our earlier messages in a rejoin's history quotes it as ours.
-                val item = if (r.type == "newChatItems") localView(CoreJson.parseChatItems(r.body)).firstOrNull { it.chatId == chatId } else null
-                if (item == null) return@post err(callback, unexpected(r))
+                val parsed = if (r.type == "newChatItems") localView(CoreJson.parseChatItems(r.body)).firstOrNull { it.chatId == chatId } else null
+                if (parsed == null) return@post err(callback, unexpected(r))
+                // The send reply's mentions carry no memberRef yet (parseMentions drops them); the stored copy has them.
+                val item = if (parsed.mentions.isEmpty() && sentMentions.isNotEmpty()) parsed.copy(mentions = sentMentions) else parsed
                 ok(callback, MessageMapper.toMessage(item, roleIn(chatId)))
                 applyNewItems(listOf(item))
             }
