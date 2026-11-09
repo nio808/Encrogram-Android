@@ -1221,6 +1221,28 @@ internal object CoreJson {
     }
 
     /**
+     * The SMP servers of every queue in a ConnectionStats (simplexmq Agent/Protocol.hs:686-717): `rcvQueuesInfo[].rcvServer`
+     * (our inbox) and `sndQueuesInfo[].sndServer` (the other side's inbox), each `smp://<keyHash>@<hosts>[:<port>]`
+     * (strEncode, Protocol.hs:1317-1322), including queues of a switch under way. Never logged: they name servers.
+     */
+    fun queueServers(stats: JSONObject): List<String> {
+        val out = ArrayList<String>()
+        stats.optJSONArray("rcvQueuesInfo").forEachObject { q -> q.str("rcvServer")?.let { out.add(it) } }
+        stats.optJSONArray("sndQueuesInfo").forEachObject { q -> q.str("sndServer")?.let { out.add(it) } }
+        return out
+    }
+
+    /**
+     * b1: some queue of this connection is on a server none of [ours] serves ([ServerAddress.servedBy]); an address we
+     * can't read counts as foreign (fail closed). Stats without any queue: nothing to judge, false.
+     */
+    fun foreignQueues(stats: JSONObject, ours: List<ServerAddress>): Boolean =
+        queueServers(stats).any { s -> ServerAddress.parse(s)?.takeIf { it.scheme == "smp" }?.servedBy(ours) != true }
+
+    /** The ConnectionStats of a `contactInfo` / `groupMemberInfo` reply; absent without an active connection. */
+    fun statsOf(body: JSONObject): JSONObject? = body.optJSONObject("connectionStats_") ?: body.optJSONObject("connectionStats")
+
+    /**
      * `contactInfo` body {contact, connectionStats_?, customUserProfile?} (Controller.hs:788; the JSON field keeps the
      * trailing underscore, as upstream's ContactInfo shows). Stats are absent for a contact without an active connection.
      */

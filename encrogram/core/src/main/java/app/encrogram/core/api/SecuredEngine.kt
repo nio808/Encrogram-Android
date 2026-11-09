@@ -229,6 +229,11 @@ data class GroupMember @JvmOverloads constructor(
     val status: MemberStatus,
     val isMe: Boolean,
     val contactChatId: Long? = null,
+    /**
+     * Our connection with this member has a queue on a relay Encrogram doesn't run (b1): while they stay in the group,
+     * sending to it is paused (fail closed, SecuredError.Kind.UNAPPROVED_RELAY). An admin can remove them.
+     */
+    val foreignRelay: Boolean = false,
 )
 
 /** A service row. [memberName] is who it is about (null when it is you or the group itself). */
@@ -299,7 +304,10 @@ sealed class SecuredResult<out T> {
 
 /** A user-readable failure. [message] is safe to show; it never contains message text or keys. */
 data class SecuredError(val kind: Kind, val message: String) {
-    /** Media: [TOO_LARGE] (over 100 MB, or over 16 MB for readMediaBytes), [UNSUPPORTED] (send it as a file), [STORAGE] (phone full). */
+    /**
+     * Media: [TOO_LARGE] (over 100 MB, or over 16 MB for readMediaBytes), [UNSUPPORTED] (send it as a file), [STORAGE] (phone full).
+     * [UNAPPROVED_RELAY] also means a contact or group member is on a relay Encrogram doesn't run ([ChatSummary.foreignRelay]).
+     */
     enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN, TOO_LARGE, UNSUPPORTED, STORAGE }
 }
 
@@ -340,6 +348,12 @@ data class ChatSummary @JvmOverloads constructor(
     val gone: Boolean = false,
     /** The last message carries media: the UI shows "Photo", "Video"... then [lastMessageText] (the caption, or a file's name). */
     val lastMessageMedia: MediaKind? = null,
+    /**
+     * A relay Encrogram doesn't run is involved (b1): for a contact, a queue of our connection with them; for a group,
+     * the same for at least one member ([GroupMember.foreignRelay]). Sending here is refused with
+     * SecuredError.Kind.UNAPPROVED_RELAY until it clears (the contact comes back to our relay, or the member leaves).
+     */
+    val foreignRelay: Boolean = false,
 )
 
 data class SecuredMessage @JvmOverloads constructor(

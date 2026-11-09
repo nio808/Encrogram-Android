@@ -77,7 +77,7 @@ internal object MessageMapper {
      * One chat-list row. [archived] is our local flag ([ArchiveStore]); everything else comes from the engine. A
      * service row as the newest item (an invitation row) becomes [ChatSummary.lastEvent], with no message text.
      */
-    fun summaryOf(chat: CoreChat, archived: Boolean): ChatSummary {
+    fun summaryOf(chat: CoreChat, archived: Boolean, foreignRelay: Boolean = false): ChatSummary {
         val c = chat.contact
         val last = chat.lastItem?.takeIf { it.isMessage }
         val time = last?.timeMs?.takeIf { it > 0 } ?: maxOf(c.activityTimeMs, chat.lastItem?.timeMs ?: 0L)
@@ -97,6 +97,7 @@ internal object MessageMapper {
             disappearingTtlSeconds = c.timedTtlSeconds,
             lastEvent = lastEventOf(chat.lastItem),
             lastMessageMedia = mediaOf(last),
+            foreignRelay = foreignRelay,
         )
     }
 
@@ -108,7 +109,7 @@ internal object MessageMapper {
      * posting until [ChatSummary.invited] is accepted. Not ready while still connecting after accepting or joining.
      * A service row as the newest item ("Ann joined", "You were removed") is [ChatSummary.lastEvent].
      */
-    fun groupSummary(chat: CoreGroupChat, archived: Boolean): ChatSummary {
+    fun groupSummary(chat: CoreGroupChat, archived: Boolean, foreignRelay: Boolean = false): ChatSummary {
         val g = chat.group
         val last = chat.lastItem?.takeIf { it.isMessage }
         val time = last?.timeMs?.takeIf { it > 0 } ?: maxOf(g.activityTimeMs, chat.lastItem?.timeMs ?: 0L)
@@ -135,6 +136,7 @@ internal object MessageMapper {
             lastEvent = if (g.invited) null else lastEventOf(chat.lastItem),
             gone = g.gone,
             lastMessageMedia = if (g.invited) null else mediaOf(last),
+            foreignRelay = foreignRelay,
         )
     }
 

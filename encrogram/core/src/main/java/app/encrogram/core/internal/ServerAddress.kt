@@ -29,6 +29,18 @@ internal class ServerAddress private constructor(
         scheme == other.scheme && keyHash == other.keyHash && hosts == other.hosts &&
             effectivePort() == other.effectivePort()
 
+    /**
+     * A relay we run serves this address (b1): one of [ours] has the same scheme and key fingerprint (compared as
+     * unpadded base64url: the core writes it padded) and every host here is one of its hosts. Unlike [sameRelayExact],
+     * host order and the port don't matter: the fingerprint pins the server's certificate and the hosts are ours, so a
+     * queue made by a build that reaches the same relay on another port (443 or 5223) is still on our relay.
+     */
+    fun servedBy(ours: List<ServerAddress>): Boolean = ours.any { o ->
+        o.scheme == scheme && fp(o.keyHash) == fp(keyHash) && hosts.all { it in o.hosts }
+    }
+
+    private fun fp(k: String): String = k.trimEnd('=').replace('+', '-').replace('/', '_')
+
     private fun effectivePort(): String =
         port.ifEmpty { if (scheme == "xftp") "443" else "5223" }
 

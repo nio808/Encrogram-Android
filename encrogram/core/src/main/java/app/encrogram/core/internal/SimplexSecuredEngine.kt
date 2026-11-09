@@ -171,6 +171,18 @@ internal class SimplexSecuredEngine(
     /** Local-only archive flags, in the same no-backup folder as the databases. */
     private val archive: ArchiveStore by lazy { ArchiveStore(File(dataDir, ARCHIVE_FILE)) }
 
+    // ---- relays we don't run (b1, [ForeignRelays]): engine thread ----
+    /** Contacts and members with a queue on a relay we don't run ([ForeignRelays.mark]); sending to them is paused. */
+    private val foreignStore: ArchiveStore by lazy { ArchiveStore(File(dataDir, FOREIGN_RELAYS_FILE)) }
+    /** Marks a failed write couldn't keep: still refused for the rest of this run (fail closed). */
+    private val foreignUnsaved = HashSet<Long>()
+    /** Our SMP relays, parsed once. */
+    private val ourSmp: List<ServerAddress> by lazy { config.smpServers.mapNotNull { ServerAddress.parse(it) } }
+    /** The start check's connections still to look at ([queueRelayChecks]), one per engine task. */
+    private val relayChecks = ArrayDeque<RepairKey>()
+    /** Bumped by each start check and each stop, so a check from an earlier run stops at its next step. */
+    private var relayCheckGen = 0L
+
     /** Present from profile creation until our servers have been verified once: start with the network locked. */
     private val lockdownMarker: File get() = File(dataDir, LOCKDOWN_MARKER)
 
@@ -458,6 +470,7 @@ internal class SimplexSecuredEngine(
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post createNoteOnEngine(text, replyToId, callback)
         val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
         postRefusal(chatId)?.let { return@post refuse(callback, "send_group", it) }
+        foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
         if (replyToId != null) {
             val quoted = itemOrErr(chatId, replyToId, callback) ?: return@post
             if (quoted.deleted) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
@@ -496,6 +509,10 @@ internal class SimplexSecuredEngine(
         }
         if (chatCache[chatId] == null) return@post err(callback, ErrorMapper.chatGone())
         val notes = chatId == SAVED_MESSAGES_CHAT_ID
+        // Edits, reactions and deletes for everyone are sent to the other side (b1); forwards are checked at their target.
+        if (action is ItemAction.Edit || action is ItemAction.React || action == ItemAction.DeleteForEveryone) {
+            foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
+        }
         when (action) {
             is ItemAction.Edit -> editOnEngine(chatId, ids, action.newText, callback)
             ItemAction.DeleteForMe -> deleteOnEngine(chatId, ids, Commands.DeleteMode.INTERNAL, callback)
@@ -530,13 +547,17 @@ internal class SimplexSecuredEngine(
             // The reload that follows drops the chat's archive flag (ArchiveStore.retainOnly).
             is ChatAction.Delete ->
                 if (group) deleteGroupOnEngine(chatId, action.notifyContact, callback)
-                else chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact), "contactDeleted", callback) { media.onChatRemoved(chatId) }
+                // Telling a contact on a relay we don't run would be a send to it (b1): deleted quietly instead.
+                else chatCommand("delete", Commands.deleteContact(chatId, action.notifyContact && foreignRefusal(chatId) == null), "contactDeleted", callback) {
+                    media.onChatRemoved(chatId)
+                }
             is ChatAction.SetDisappearing -> {
                 if (group) return@post refuse(callback, "disappearing_group", ErrorMapper.CONTACTS_ONLY)
                 val ttl = action.ttlSeconds
                 if (ttl != null && !InputRules.ttlAllowed(ttl)) {
                     return@post err(callback, ErrorMapper.invalid("Choose a timer between 1 second and 1 year."))
                 }
+                foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
                 val contact = contactOrErr(chatId, callback) ?: return@post
                 chatCommand("disappearing", Commands.setContactPrefs(chatId, CoreJson.contactPrefsUpdate(contact, ttl)), "contactPrefsUpdated", callback)
             }
@@ -608,6 +629,7 @@ internal class SimplexSecuredEngine(
         if (chatId == SAVED_MESSAGES_CHAT_ID) return@post refuse(callback, "media_notes", ErrorMapper.MEDIA_NOT_IN_SAVED)
         val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
         postRefusal(chatId)?.let { return@post refuse(callback, "send_group", it) }
+        foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
         val quoted = replyToId?.let { itemOrErr(chatId, it, callback) ?: return@post }
         if (quoted?.deleted == true) return@post refuse(callback, "reply_deleted", ErrorMapper.CANT_REPLY)
         media.send(chatId, ref, prepared, caption, quoted, callback)
@@ -675,6 +697,9 @@ internal class SimplexSecuredEngine(
             val contact = row != null && row.kind == ChatKind.DIRECT && id > 0 && !isGroupChatId(id) && row.ready
             if (!contact) return@post refuse(callback, "add_not_contact", ErrorMapper.NOT_A_CONTACT)
         }
+        // A new member is introduced to everyone (b1): not while someone is on a relay we don't run, nor such a contact.
+        foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
+        if (ids.any { foreignRefusal(it) != null }) return@post refuseForeign(callback, ErrorMapper.FOREIGN_RELAY_ADD)
         val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
         var failed = 0
         for (id in ids) {
@@ -726,10 +751,12 @@ internal class SimplexSecuredEngine(
         when (val r = send(Commands.listMembers(groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "groupMembers") return@post err(callback, unexpected(r))
+                val marks = foreignMarks()
                 val list = CoreJson.parseMembers(r.body).map { m ->
                     val contactChat = m.memberContactId?.takeIf { id -> chatCache[id]?.kind == ChatKind.DIRECT && !isGroupChatId(id) }
                     val status = if (g.deleted) MemberStatus.REMOVED else m.status
-                    GroupMember(m.groupMemberId, m.displayName, m.role, status, m.isMe, contactChat)
+                    val foreign = !m.isMe && ForeignRelays.memberMarked(marks, groupId, m.groupMemberId)
+                    GroupMember(m.groupMemberId, m.displayName, m.role, status, m.isMe, contactChat, foreign)
                 }
                 ok(callback, list)
             }
@@ -766,6 +793,8 @@ internal class SimplexSecuredEngine(
     override fun setMemberRole(chatId: Long, memberId: Long, role: MemberRole, callback: SecuredCallback<Unit>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+        // Everyone is told the new role (b1); removing, leaving and deleting stay possible.
+        foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
         val members = membersOrErr(g, callback) ?: return@post
         GroupRules.roleChangeRefusal(members.firstOrNull { it.isMe }, members.firstOrNull { !it.isMe && it.groupMemberId == memberId }, role)
             ?.let { return@post refuse(callback, "role", it) }
@@ -782,7 +811,9 @@ internal class SimplexSecuredEngine(
         val members = membersOrErr(g, callback) ?: return@post
         GroupRules.removeRefusal(members.firstOrNull { it.isMe }, members.firstOrNull { !it.isMe && it.groupMemberId == memberId })
             ?.let { return@post refuse(callback, "remove", it) }
-        chatCommand("member_remove", Commands.removeMember(g.groupId, memberId), "userDeletedMembers", callback)
+        chatCommand("member_remove", Commands.removeMember(g.groupId, memberId), "userDeletedMembers", callback) {
+            setForeign(RepairKey.member(g.groupId, memberId), false)
+        }
     }
 
     /**
@@ -2401,6 +2432,7 @@ internal class SimplexSecuredEngine(
     private fun forwardOnEngine(chatId: Long, ids: List<Long>, toChatId: Long, callback: SecuredCallback<Unit>) {
         if (chatCache[toChatId] == null) return err(callback, ErrorMapper.chatGone())
         postRefusal(toChatId)?.let { return refuse(callback, "forward_group", it) }
+        foreignRefusal(toChatId)?.let { return refuseForeign(callback, it) }
         val from = refOf(chatId) ?: return err(callback, ErrorMapper.chatGone())
         val to = refOf(toChatId) ?: return err(callback, ErrorMapper.chatGone())
         when (val r = send(Commands.forward(to, from, ids))) {
@@ -2659,6 +2691,98 @@ internal class SimplexSecuredEngine(
             }
             else -> refuse(callback, "notes_chat_action", ErrorMapper.NOT_IN_SAVED)
         }
+    }
+
+    // ---- relays we don't run (b1, research/foreign-relays.md) ---------------------------------------------------------
+
+    private fun foreignMarks(): Set<Long> = if (foreignUnsaved.isEmpty()) foreignStore.all() else foreignStore.all() + foreignUnsaved
+
+    /** Why sending to [chatId] is paused (a contact or a group member on a relay we don't run), or null. */
+    private fun foreignRefusal(chatId: Long): String? = ForeignRelays.refusal(foreignMarks(), chatId)
+
+    private fun <T> refuseForeign(callback: SecuredCallback<T>, message: String) {
+        SecuredLog.i(Ev.ACTION_REFUSED, "foreign_relay")
+        err(callback, ErrorMapper.foreignRelay(message))
+    }
+
+    /** Records what a check found for one connection and updates its chat row. Engine thread. */
+    private fun setForeign(key: RepairKey, foreign: Boolean) {
+        val mark = ForeignRelays.mark(key) ?: return
+        if ((foreignStore.isArchived(mark) || mark in foreignUnsaved) == foreign) return
+        if (foreignStore.set(mark, foreign)) {
+            foreignUnsaved.remove(mark)
+        } else {
+            SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "foreign")
+            // Not written: a new mark still holds for this run; a mark that can't be cleared stays (fail closed).
+            if (!foreign) return
+            foreignUnsaved.add(mark)
+        }
+        SecuredLog.i(Ev.FOREIGN_RELAY, if (foreign) "marked" else "cleared")
+        val chatId = if (key.isMember) CoreJson.groupChatId(key.groupId) else key.contactId
+        val row = chatCache[chatId] ?: return
+        val now = ForeignRelays.chatMarked(foreignMarks(), chatId)
+        if (row.foreignRelay == now) return
+        chatCache[chatId] = row.copy(foreignRelay = now)
+        publishChats()
+        notifyChatsChanged()
+    }
+
+    /** One `/_info` for one connection, and its queue servers judged ([ForeignRelays.verdict]). Engine thread. */
+    private fun checkRelay(key: RepairKey) {
+        if (state != EngineState.RUNNING || ctrl == 0L || key.isGroupPlaceholder) return
+        ForeignRelays.verdict(send(infoCommand(key)), ourSmp, GONE_CONNECTION_ERRORS)?.let { setForeign(key, it) }
+    }
+
+    /**
+     * Connection events get one `/_info`; a queue switch brings its own stats (the new queue is in them from its first
+     * step); a member who left or was removed loses the mark. Engine thread, RUNNING.
+     */
+    private fun relayOnEvent(reply: CoreReply.Result) {
+        ForeignRelays.connectionOf(reply.type, reply.body)?.let { return checkRelay(it) }
+        ForeignRelays.departedOf(reply.type, reply.body)?.let { return setForeign(it, false) }
+        val key = when (reply.type) {
+            "contactSwitch" -> CoreJson.switchEvent(reply.body)?.let { RepairKey.contact(it.first) }
+            "groupMemberSwitch" -> CoreJson.memberSwitchEvent(reply.body)?.let { RepairKey.member(it.first, it.second) }
+            else -> null
+        } ?: return
+        ForeignRelays.switchVerdict(reply.body, ourSmp)?.let { setForeign(key, it) }
+    }
+
+    /**
+     * Once per start: every contact, then each group's active members (one `/_members`, then one `/_info` each). One
+     * connection per engine task, so commands from the UI queued meanwhile run in between.
+     */
+    private fun queueRelayChecks() {
+        relayChecks.clear()
+        val gen = ++relayCheckGen
+        for ((id, row) in chatCache) if (row.kind == ChatKind.DIRECT && id > 0 && !isGroupChatId(id)) relayChecks.add(RepairKey.contact(id))
+        for (g in groupCache.values) if (!g.invited && !g.gone && g.chatId !in hiddenChats) relayChecks.add(RepairKey.group(g.groupId))
+        SecuredLog.i(Ev.FOREIGN_RELAY, "check", relayChecks.size)
+        if (relayChecks.isNotEmpty()) post { relayCheckStep(gen) }
+    }
+
+    private fun relayCheckStep(gen: Long) {
+        if (gen != relayCheckGen || state != EngineState.RUNNING || ctrl == 0L) return
+        val key = relayChecks.removeFirstOrNull() ?: return
+        try {
+            if (key.isGroupPlaceholder) expandRelayCheck(key.groupId) else checkRelay(key)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.FOREIGN_RELAY, t)
+        }
+        if (relayChecks.isNotEmpty()) post { relayCheckStep(gen) }
+    }
+
+    /** A group's active members go to the front of the queue; marks of members who are no longer active go. */
+    private fun expandRelayCheck(groupId: Long) {
+        val r = send(Commands.listMembers(groupId))
+        if (r !is CoreReply.Result || r.type != "groupMembers") return
+        val members = CoreJson.parseMembers(r.body)
+        val active = RestoreRepair.memberKeys(groupId, members)
+        for (m in members) {
+            val key = RepairKey.member(groupId, m.groupMemberId)
+            if (!m.isMe && key !in active) setForeign(key, false)
+        }
+        for (key in active.asReversed()) relayChecks.addFirst(key)
     }
 
     private fun <T> refuse(callback: SecuredCallback<T>, tag: String, message: String) {
@@ -2979,6 +3103,11 @@ internal class SimplexSecuredEngine(
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.RESTORE_REPAIR, t)
         }
+        try {
+            queueRelayChecks()
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.FOREIGN_RELAY, t)
+        }
         // Downloads whose passing check was recorded while the engine wasn't running (during start, or before a restart).
         try {
             media.catchUp()
@@ -3068,6 +3197,9 @@ internal class SimplexSecuredEngine(
         ownHistorySwept.clear()
         joinHistorySwept.clear()
         joinAcceptedAt.clear()
+        relayChecks.clear()
+        relayCheckGen++
+        foreignUnsaved.clear()
         memberIdCache.clear()
         previewCache.clear()
         refreshWindowOpen = false
@@ -3155,6 +3287,11 @@ internal class SimplexSecuredEngine(
                 backupOnEvent(reply)
             } catch (t: Throwable) {
                 SecuredLog.crash(Ev.RESTORE_REPAIR, t)
+            }
+            try {
+                relayOnEvent(reply)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.FOREIGN_RELAY, t)
             }
         }
         when (reply) {
@@ -3436,6 +3573,12 @@ internal class SimplexSecuredEngine(
         if (!archive.retainOnly(known)) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "prune")
         val groupIds = groups.mapTo(HashSet()) { it.group.groupId }
         if (!linkJoins.retainIf { CoreJson.linkJoinGroupId(it) in groupIds }) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "link_joins_prune")
+        // Relay marks (b1): listed contacts, and members of groups we're still in.
+        val contactIds = chats.mapTo(HashSet()) { it.contact.contactId }
+        val memberGroups = groups.filter { !it.group.invited && !it.group.gone }.mapTo(HashSet()) { it.group.groupId }
+        if (!foreignStore.retainIf { ForeignRelays.keep(it, contactIds, memberGroups) }) SecuredLog.w(Ev.ARCHIVE_IO_FAILED, "foreign_prune")
+        foreignUnsaved.retainAll { ForeignRelays.keep(it, contactIds, memberGroups) }
+        val marks = foreignMarks()
         previewCache.keys.retainAll(known)
         chatCache.clear()
         lastItemIds.clear()
@@ -3445,7 +3588,7 @@ internal class SimplexSecuredEngine(
             val c = listed.contact
             if (c.isContactCard || c.removed) continue
             val chat = listed.copy(lastItem = lastShown(c.contactId, ChatRef.contact(c.contactId), listed.lastItem))
-            chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId))
+            chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId), ForeignRelays.chatMarked(marks, c.contactId))
             // Messages and the service rows we show (lastEvent): edits and deletions of either reload the row.
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
@@ -3470,7 +3613,7 @@ internal class SimplexSecuredEngine(
             val last = if (listed.group.invited) newest else lastShown(id, ChatRef.group(listed.group.groupId), newest)?.let { localView(listOf(it)).single() }
             val unread = listed.unreadCount - sweepHistory(listed.group, listed.unreadCount)
             val chat = listed.copy(lastItem = last, unreadCount = unread.coerceAtLeast(0))
-            chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id))
+            chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id), ForeignRelays.chatMarked(marks, id))
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
         }
         // Saved Messages: the user's note folder (the core creates one with every user).
@@ -3731,6 +3874,8 @@ internal class SimplexSecuredEngine(
         const val READ_ITEMS_CHUNK = 100
         /** Members who joined through our group links ([withLinkJoins]), next to the databases. */
         const val LINK_JOINS_FILE = "link_joins"
+        /** [ForeignRelays] marks, next to the databases. */
+        const val FOREIGN_RELAYS_FILE = "foreign_relays"
         /** [applyNetwork]: reconnect once the default network has stayed the same this long. */
         const val RECONNECT_SETTLE_MS = 2_000L
         /**

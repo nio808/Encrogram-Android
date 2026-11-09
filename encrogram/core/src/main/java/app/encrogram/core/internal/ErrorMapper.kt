@@ -58,6 +58,14 @@ internal object ErrorMapper {
     const val ALREADY_JOINING = "You're already joining this group. It appears in your chats once it connects."
     const val UNSUPPORTED_GROUP_LINK = "This link is for a kind of channel Encrogram doesn't support."
 
+    // ---- relays we don't run (b1) ----
+    const val FOREIGN_RELAY_CONTACT = "This contact uses a server Encrogram doesn't use, so messages to them are paused."
+    const val FOREIGN_RELAY_GROUP = "Someone in this group uses a server Encrogram doesn't use, so sending here is paused until an admin removes them."
+    const val FOREIGN_RELAY_ADD = "This contact uses a server Encrogram doesn't use, so they can't be added to a group."
+
+    /** A send to a contact or group with a queue on a relay we don't run ([ForeignRelays]). [message] is one of the sentences above. */
+    fun foreignRelay(message: String): SecuredError = SecuredError(Kind.UNAPPROVED_RELAY, message)
+
     /** Some of the people could not be added; the others were. Counts only, never names. */
     fun addFailed(failed: Int, total: Int): SecuredError =
         SecuredError(Kind.ENGINE, if (failed == total) "No one could be added. Try again." else "$failed of $total people couldn't be added. Try again for them.")

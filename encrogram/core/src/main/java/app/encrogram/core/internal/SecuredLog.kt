@@ -42,6 +42,8 @@ internal object SecuredLog {
         // server, description or preview.
         MEDIA_PREPARED, MEDIA_PREPARE_FAILED, MEDIA_SENT, MEDIA_DESCR, MEDIA_ACCEPTED, MEDIA_CANCELLED, MEDIA_EVENT,
         MEDIA_DONE, MEDIA_FAILED, MEDIA_READ_FAILED, MEDIA_WIPED, MEDIA_IO_FAILED, MEDIA_CATCHUP,
+        // Relays we don't run (b1): "marked", "cleared", "check"; never a server, a name or an id.
+        FOREIGN_RELAY,
     }
 
     /** Tests only: receives every line that would be written, even while [enabled] is off (the canary test reads it). */
