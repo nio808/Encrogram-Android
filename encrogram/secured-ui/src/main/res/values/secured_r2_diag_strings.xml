@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_r2d_row">Diagnostics</string>
+    <string name="sec_r2d_title">Diagnostics</string>
+    <string name="sec_r2d_toggle">Keep a technical log</string>
+    <string name="sec_r2d_info">Keeps a short technical log on this phone to help fix problems. It never includes your messages or contacts and is never sent anywhere unless you copy it.</string>
+    <string name="sec_r2d_empty">Nothing logged yet.</string>
+    <string name="sec_r2d_off">Diagnostics is off.</string>
+    <string name="sec_r2d_copy">Copy</string>
+    <string name="sec_r2d_clear">Clear</string>
+    <string name="sec_r2d_copied">Log copied</string>
+</resources>

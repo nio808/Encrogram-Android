@@ -99,6 +99,11 @@ final class SecuredSettingsActivity extends SecuredBackupScreen {
         content.addView(backup);
 
         addStorage(c, rp);
+
+        final TextSettingsCell diag = new TextSettingsCell(c, rp);
+        diag.setText(c.getString(R.string.sec_r2d_row), false);
+        diag.setOnClickListener(v -> presentFragment(new SecuredDiagnosticsActivity()));
+        content.addView(diag);
     }
 
     // ---- profile photo ---------------------------------------------------------------------------------------

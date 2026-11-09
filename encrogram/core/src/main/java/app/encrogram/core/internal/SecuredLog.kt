@@ -2,6 +2,9 @@ package app.encrogram.core.internal
 
 import android.util.Log
 import app.encrogram.core.BuildConfig
+import java.io.File
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 /**
  * The only logger in :encrogram-core.
@@ -69,11 +72,13 @@ internal object SecuredLog {
 
     private fun write(priority: Int, ev: Ev, tag: String?, count: Int?) {
         val sink = testSink
-        if (!enabled && sink == null) return
+        val diag = diag
+        if (!enabled && sink == null && diag == null) return
         val sb = StringBuilder(ev.name)
         sanitizeTag(tag)?.let { sb.append(" kind=").append(it) }
         if (count != null) sb.append(" n=").append(count)
         sink?.invoke(sb.toString())
+        diag?.add(sb.toString())
         if (!enabled) return
         try {
             Log.println(priority, TAG, sb.toString())
@@ -92,4 +97,85 @@ internal object SecuredLog {
         }
         return tag
     }
+
+    // ---- opt-in diagnostics (A5) -------------------------------------------------------------------------------
+
+    /** The on-phone ring buffer; null while diagnostics is off (then nothing is kept or written). */
+    @Volatile
+    private var diag: DiagBuffer? = null
+
+    /** Starts keeping the last lines in memory and in [file] (call only when the tester turned diagnostics on). */
+    internal fun diagStart(file: File) {
+        diag = DiagBuffer(file)
+    }
+
+    /** Stops and deletes the file. */
+    internal fun diagStop() {
+        diag?.clear()
+        diag = null
+    }
+
+    internal fun diagActive(): Boolean = diag != null
+
+    internal fun diagLines(): List<String>? = diag?.lines()
+
+    internal fun diagClear() {
+        diag?.clear(keepFile = true)
+    }
+
+    /** A line built by the diagnostics API itself from class names only. No-op while diagnostics is off. */
+    internal fun diagRaw(line: String) {
+        diag?.add(line)
+    }
+
+    /**
+     * The last [max] lines, each stamped with the time of day. In memory and mirrored to [file] so a crash leaves them
+     * on disk. Appends are cheap; the file is rewritten from memory every [max] appends so it never grows past ~2x.
+     */
+    internal class DiagBuffer(private val file: File?, private val max: Int = 300) {
+        private val buf = ArrayDeque<String>()
+        private var appended = 0
+
+        init {
+            // Keep what an earlier run left (the crash lines), so one file tells the whole story.
+            try {
+                if (file != null && file.isFile) file.readLines().takeLast(max).forEach { buf.addLast(it) }
+            } catch (_: Throwable) {
+            }
+        }
+
+        @Synchronized
+        fun add(line: String) {
+            val stamped = STAMP.format(LocalTime.now()) + " " + line
+            buf.addLast(stamped)
+            while (buf.size > max) buf.removeFirst()
+            if (file == null) return
+            try {
+                file.parentFile?.mkdirs()
+                if (++appended >= max) {
+                    appended = 0
+                    file.writeText(buf.joinToString("\n", postfix = "\n"))
+                } else {
+                    file.appendText(stamped + "\n")
+                }
+            } catch (_: Throwable) {
+                // Diagnostics must never break the engine.
+            }
+        }
+
+        @Synchronized
+        fun lines(): List<String> = buf.toList()
+
+        @Synchronized
+        fun clear(keepFile: Boolean = false) {
+            buf.clear()
+            appended = 0
+            try {
+                if (keepFile) file?.writeText("") else file?.delete()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private val STAMP: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
 }

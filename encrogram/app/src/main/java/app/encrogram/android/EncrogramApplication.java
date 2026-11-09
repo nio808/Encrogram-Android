@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.graphics.Color;
 
 import app.encrogram.core.background.NotificationConfig;
+import app.encrogram.core.api.SecuredDiagnostics;
 import app.encrogram.core.background.SecuredBackground;
 import app.encrogram.secured.SecuredUi;
 
@@ -45,6 +46,7 @@ public class EncrogramApplication extends ApplicationLoader {
         }
 
         super.onCreate();
+        installDiagnostics();
 
         if (BuildConfig.DEBUG) {
             // A13: log slow or leaky work in debug builds only.
@@ -53,6 +55,28 @@ public class EncrogramApplication extends ApplicationLoader {
             android.os.StrictMode.setVmPolicy(new android.os.StrictMode.VmPolicy.Builder()
                     .detectLeakedClosableObjects().penaltyLog().build());
         }
+    }
+
+    /**
+     * A5: opt-in crash lines. Installed after Telegram's own setup so we wrap whatever handler is there. It only
+     * writes (class names and our own frames, never messages) when the tester turned Diagnostics on, and always
+     * hands the crash on to the previous handler.
+     */
+    private void installDiagnostics() {
+        try {
+            SecuredDiagnostics.INSTANCE.install(this);
+        } catch (Throwable ignored) {
+        }
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        final android.content.Context app = this;
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            try {
+                if (SecuredDiagnostics.INSTANCE.isEnabled(app)) SecuredDiagnostics.INSTANCE.recordCrash(app, throwable);
+            } catch (Throwable ignored) {
+                // Never let diagnostics hide the real crash.
+            }
+            if (previous != null) previous.uncaughtException(thread, throwable);
+        });
     }
 
     /** Tap intent of a Secured notification: only the local chat id, no text. Same CLEAR_TOP style as Telegram's own. */
