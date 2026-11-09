@@ -218,6 +218,35 @@ interface SecuredEngine {
         playback.close()
     }
 
+    /** Encrypted media kept on this phone. */
+    fun mediaStorage(callback: SecuredCallback<MediaStorage>) = notYet(callback)
+
+    /** Days downloaded media is kept on this phone, or null for forever (the default). */
+    fun mediaRetentionDays(): Int? = null
+
+    /**
+     * Keep media for [days] (null = forever). Older files leave this phone now and once a day; their messages stay and
+     * show NOT_ON_DEVICE (the relay keeps files only about 2 days, so they can't come back). Your own sent files count too.
+     */
+    fun setMediaRetention(days: Int?, callback: SecuredCallback<Unit>) = notYet(callback)
+
+    /** Removes every media file from this phone now; the messages stay (NOT_ON_DEVICE). */
+    fun clearMedia(callback: SecuredCallback<Unit>) = notYet(callback)
+
+    // ---- photos and details (audit round 2) ----------------------------------------------------------------------
+
+    /**
+     * Sets (or removes, null) your profile photo: a JPEG the UI re-encoded (so no metadata), at most [AVATAR_MAX_BYTES].
+     * Your contacts and groups get it with your profile. Errors: TOO_LARGE, UNSUPPORTED (not a JPEG).
+     */
+    fun setProfilePhoto(jpeg: ByteArray?, callback: SecuredCallback<SecuredProfile>) = notYet(callback)
+
+    /** Groups, owner or admin: sets or removes the group photo, same rules as [setProfilePhoto]. Else NOT_ALLOWED. */
+    fun setGroupPhoto(chatId: Long, jpeg: ByteArray?, callback: SecuredCallback<Unit>) = notYet(callback)
+
+    /** When a message was sent and received, per-member delivery of your group messages, and earlier versions after edits. */
+    fun messageInfo(chatId: Long, messageId: Long, callback: SecuredCallback<MessageInfo>) = notYet(callback)
+
     // ---- network ----------------------------------------------------------------------------------------------
 
     /** False while the phone has no usable network; screens then say "Waiting for network…" like Telegram's. */
@@ -229,6 +258,31 @@ const val GROUP_CHAT_ID_BASE: Long = 1L shl 40
 
 fun isGroupChatId(chatId: Long): Boolean = chatId >= GROUP_CHAT_ID_BASE
 
+/** Largest photo [SecuredEngine.setProfilePhoto] accepts: its data URL must stay under the core's 12,500 characters. */
+const val AVATAR_MAX_BYTES: Int = 9_000
+
+/** Encrypted media on this phone: [bytes] in [files] files. */
+data class MediaStorage(val bytes: Long, val files: Int)
+
+/**
+ * [sentAtMs]: the sender's time; [receivedAtMs]: when it reached or was made on this phone. [deliveries]: groups, your own
+ * messages only (empty when the group has no delivery receipts). [versions]: earlier texts after edits, newest first.
+ */
+data class MessageInfo @JvmOverloads constructor(
+    val sentAtMs: Long,
+    val receivedAtMs: Long,
+    val status: MessageStatus,
+    val deliveries: List<MemberDelivery> = emptyList(),
+    val versions: List<MessageVersion> = emptyList(),
+)
+
+data class MemberDelivery(val memberId: Long, val displayName: String, val status: MessageStatus)
+
+/** User content: [text] never reaches a log. */
+data class MessageVersion(val text: String, val timeMs: Long) {
+    override fun toString() = "MessageVersion($timeMs)"
+}
+
 enum class ChatKind { DIRECT, GROUP, CHANNEL }
 
 /** SimpleX roles we show (relay/author map to observer/member). */
@@ -237,7 +291,13 @@ enum class MemberRole { OBSERVER, MEMBER, MODERATOR, ADMIN, OWNER }
 enum class MemberStatus { INVITED, CONNECTING, CONNECTED, LEFT, REMOVED }
 
 /** [memberId] is the core's groupMemberId: stable per member in this group, never a Telegram id. */
-data class MessageSender(val memberId: Long, val displayName: String, val role: MemberRole)
+data class MessageSender @JvmOverloads constructor(
+    val memberId: Long,
+    val displayName: String,
+    val role: MemberRole,
+    /** Their profile photo, untrusted: decode with bounds. */
+    val avatar: MediaPreview? = null,
+)
 
 /** [contactChatId]: this member's 1:1 Secured chat id when you have them as a contact (core memberContactId), else null. */
 data class GroupMember @JvmOverloads constructor(
@@ -252,6 +312,8 @@ data class GroupMember @JvmOverloads constructor(
      * sending to it is paused (fail closed, SecuredError.Kind.UNAPPROVED_RELAY). An admin can remove them.
      */
     val foreignRelay: Boolean = false,
+    /** Their profile photo, untrusted: decode with bounds. */
+    val avatar: MediaPreview? = null,
 )
 
 /** A service row. [memberName] is who it is about (null when it is you or the group itself). */
@@ -330,7 +392,7 @@ data class SecuredError(val kind: Kind, val message: String) {
     enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN, TOO_LARGE, UNSUPPORTED, STORAGE, KEY_LOST }
 }
 
-data class SecuredProfile(val displayName: String)
+data class SecuredProfile @JvmOverloads constructor(val displayName: String, val avatar: MediaPreview? = null)
 
 data class ChatSummary @JvmOverloads constructor(
     val chatId: Long,
@@ -372,7 +434,8 @@ data class ChatSummary @JvmOverloads constructor(
      * the same for at least one member ([GroupMember.foreignRelay]). Sending here is refused with
      * SecuredError.Kind.UNAPPROVED_RELAY until it clears (the contact comes back to our relay, or the member leaves).
      */
-    val foreignRelay: Boolean = false,
+    val foreignRelay: Boolean = false,    /** The contact's or group's photo, untrusted: decode with bounds. */
+    val avatar: MediaPreview? = null,
 )
 
 data class SecuredMessage @JvmOverloads constructor(

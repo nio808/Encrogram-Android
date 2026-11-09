@@ -143,6 +143,11 @@ class CommandsTest {
     fun fixedCommands() {
         assertEquals("/u", Commands.SHOW_ACTIVE_USER)
         assertEquals("/network socks=off smp-proxy=unknown smp-proxy-fallback=no", Commands.NETWORK_CONFIG)
+        assertEquals("/network", Commands.GET_NETWORK_CONFIG)
+        val cfg = org.json.JSONObject().put("smpPingInterval", 1_200_000_000L).put("sessionMode", "session")
+        val set = Commands.setNetworkConfig(cfg)
+        assertTrue(set.startsWith("/_network {"))
+        assertEquals(cfg.toString(), org.json.JSONObject(set.removePrefix("/_network ")).toString())
         assertEquals("/_operators", Commands.GET_OPERATORS)
         assertEquals("/_start main=on", Commands.START_CHAT)
         assertEquals("/_servers 3", Commands.getUserServers(3))

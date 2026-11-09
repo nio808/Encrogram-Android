@@ -57,12 +57,43 @@ internal object ServerConfigPlanner {
 
     // ---- network ------------------------------------------------------------------------------------------------
 
-    /** `networkConfig` body: proxy for unknown relays, never a direct fallback, no SOCKS. */
+    /**
+     * The official Android app's mobile values (SimpleXAPI.kt NetCfg.defaults, :5067-5075), in microseconds: an SMP ping
+     * every 20 minutes (core default 10), 10 ms extra timeout per KB (default 5), 12 receive groups (default 8).
+     */
+    const val SMP_PING_INTERVAL_US = 1_200_000_000L
+    const val TCP_TIMEOUT_PER_KB_US = 10_000L
+    const val RCV_CONCURRENCY = 12
+
+    /** One TLS connection per user per server (TSMSession, the core's default), set explicitly. */
+    private const val SESSION_MODE = "session"
+
+    /**
+     * The NetworkConfig to send with `/_network` ([Commands.setNetworkConfig]): the `networkConfig` the core returned,
+     * so every field it has survives, with our fail-closed fields (no SOCKS, unknown relays only through our relay as a
+     * proxy, never a direct fallback, session mode) and the mobile values above. Null when the body has no config.
+     */
+    fun tunedNetworkConfig(body: JSONObject): JSONObject? {
+        val cfg = body.optJSONObject("networkConfig")?.deepCopy() ?: return null
+        cfg.remove("socksProxy")   // omitted = Nothing, the way the core writes it
+        return cfg.put("smpProxyMode", "unknown")
+            .put("smpProxyFallback", "prohibit")
+            .put("sessionMode", SESSION_MODE)
+            .put("smpPingInterval", SMP_PING_INTERVAL_US)
+            .put("tcpTimeoutPerKb", TCP_TIMEOUT_PER_KB_US)
+            .put("rcvConcurrency", RCV_CONCURRENCY)
+    }
+
+    /** `networkConfig` body read back: proxy for unknown relays, never a direct fallback, no SOCKS, and the values above. */
     fun networkConfigOk(body: JSONObject): Boolean {
         val cfg = body.optJSONObject("networkConfig") ?: return false
         return cfg.str("smpProxyMode") == "unknown" &&
             cfg.str("smpProxyFallback") == "prohibit" &&
-            (!cfg.has("socksProxy") || cfg.isNull("socksProxy"))
+            (!cfg.has("socksProxy") || cfg.isNull("socksProxy")) &&
+            cfg.str("sessionMode") == SESSION_MODE &&
+            cfg.optLong("smpPingInterval", -1) == SMP_PING_INTERVAL_US &&
+            cfg.optLong("tcpTimeoutPerKb", -1) == TCP_TIMEOUT_PER_KB_US &&
+            cfg.optInt("rcvConcurrency", -1) == RCV_CONCURRENCY
     }
 
     // ---- user servers -------------------------------------------------------------------------------------------

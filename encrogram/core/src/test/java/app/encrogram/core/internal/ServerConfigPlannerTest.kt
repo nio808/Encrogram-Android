@@ -70,13 +70,66 @@ class ServerConfigPlannerTest {
 
     // ---- network --------------------------------------------------------------------------------------------
 
+    /** What `/network` returns after the tuned `/_network` (APIGetNetworkConfig), as the core encodes it. */
+    private fun storedTuned(): JSONObject {
+        val tuned = ServerConfigPlanner.tunedNetworkConfig(body(Samples.NETWORK_CONFIG_OK))!!
+        return JSONObject().put("type", "networkConfig").put("networkConfig", JSONObject(tuned.toString()))
+    }
+
     @Test
     fun networkVerification() {
-        assertTrue(ServerConfigPlanner.networkConfigOk(body(Samples.NETWORK_CONFIG_OK)))
+        assertTrue(ServerConfigPlanner.networkConfigOk(storedTuned()))
+        // The proxy fields alone (the `/network` reply before tuning) are not enough any more.
+        assertFalse(ServerConfigPlanner.networkConfigOk(body(Samples.NETWORK_CONFIG_OK)))
         assertFalse(ServerConfigPlanner.networkConfigOk(body(Samples.NETWORK_CONFIG_DEFAULT)))
-        val withSocks = JSONObject(Samples.NETWORK_CONFIG_OK).getJSONObject("result")
-        withSocks.getJSONObject("networkConfig").put("socksProxy", "127.0.0.1:9050")
-        assertFalse(ServerConfigPlanner.networkConfigOk(withSocks))
+        assertFalse(ServerConfigPlanner.networkConfigOk(JSONObject()))
+        val changes = listOf<(JSONObject) -> Unit>(
+            { it.put("socksProxy", "127.0.0.1:9050") },
+            { it.put("smpProxyMode", "never") },
+            { it.put("smpProxyFallback", "allowProtected") },
+            { it.put("sessionMode", "entity") },
+            { it.remove("sessionMode") },
+            { it.put("smpPingInterval", 600_000_000) },
+            { it.put("tcpTimeoutPerKb", 5_000) },
+            { it.put("rcvConcurrency", 8) },
+            { it.remove("rcvConcurrency") },
+        )
+        for ((i, change) in changes.withIndex()) {
+            val stored = storedTuned()
+            change(stored.getJSONObject("networkConfig"))
+            assertFalse("change $i", ServerConfigPlanner.networkConfigOk(stored))
+        }
+        val nullSocks = storedTuned()
+        nullSocks.getJSONObject("networkConfig").put("socksProxy", JSONObject.NULL)
+        assertTrue(ServerConfigPlanner.networkConfigOk(nullSocks))
+    }
+
+    @Test
+    fun tunedNetworkConfigKeepsEveryFieldAndOurFailClosedOnes() {
+        val base = body(Samples.NETWORK_CONFIG_OK)
+        val cfg = base.getJSONObject("networkConfig")
+        // Fields this test sample lacks and a later core may add: they must survive unchanged.
+        cfg.put("tcpKeepAlive", JSONObject().put("keepIdle", 30).put("keepIntvl", 15).put("keepCnt", 4))
+        cfg.put("futureField", JSONObject().put("x", 1))
+        // A SOCKS proxy left over (the first-run lock) is dropped: omitted means none.
+        cfg.put("socksProxy", "127.0.0.1:9").put("smpProxyMode", "always").put("smpProxyFallback", "allow")
+        val tuned = ServerConfigPlanner.tunedNetworkConfig(base)!!
+
+        assertFalse(tuned.has("socksProxy"))
+        assertEquals("unknown", tuned.getString("smpProxyMode"))
+        assertEquals("prohibit", tuned.getString("smpProxyFallback"))
+        assertEquals("session", tuned.getString("sessionMode"))
+        assertEquals(1_200_000_000L, tuned.getLong("smpPingInterval"))
+        assertEquals(10_000L, tuned.getLong("tcpTimeoutPerKb"))
+        assertEquals(12, tuned.getInt("rcvConcurrency"))
+        for (kept in listOf("socksMode", "hostMode", "requiredHostMode", "smpWebPortServers", "tcpConnectTimeout", "tcpTimeout", "smpPingCount", "logTLSErrors")) {
+            assertEquals(kept, cfg.get(kept).toString(), tuned.get(kept).toString())
+        }
+        assertEquals(cfg.getJSONObject("tcpKeepAlive").toString(), tuned.getJSONObject("tcpKeepAlive").toString())
+        assertEquals(1, tuned.getJSONObject("futureField").getInt("x"))
+        // The reply it was built from is not changed.
+        assertEquals("127.0.0.1:9", cfg.getString("socksProxy"))
+        assertEquals(null, ServerConfigPlanner.tunedNetworkConfig(JSONObject()))
     }
 
     // ---- user servers ---------------------------------------------------------------------------------------

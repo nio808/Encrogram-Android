@@ -27,6 +27,7 @@ class SecuredService : Service() {
     private var engine: SecuredEngine? = null
     private var listener: SecuredListener? = null
     private var stopped = false
+    private var foregroundStarted = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -39,7 +40,14 @@ class SecuredService : Service() {
             return
         }
         val l = object : SecuredListener {
-            override fun onMessageReceived(message: SecuredMessage) = onIncoming(message, e)
+            override fun onMessageReceived(message: SecuredMessage) {
+                // A throw here would reach the engine's event loop (A10): log the class only and carry on.
+                try {
+                    onIncoming(message, e)
+                } catch (t: Throwable) {
+                    SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)
+                }
+            }
         }
         engine = e
         listener = l
@@ -83,6 +91,7 @@ class SecuredService : Service() {
         return try {
             val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0
             ServiceCompat.startForeground(this, NotificationText.SERVICE_ID, SecuredNotifier.serviceNotification(this, config), type)
+            foregroundStarted = true
             true
         } catch (t: Throwable) {   // ForegroundServiceStartNotAllowedException and SecurityException
             SecuredLog.crash(SecuredLog.Ev.BG_START_REFUSED, t)
@@ -94,6 +103,21 @@ class SecuredService : Service() {
     private fun safeStop() {
         if (stopped) return
         stopped = true
+        // Stopping before startForeground can crash on Android 8+ (A16), so post a notification first, as SimpleX does.
+        if (!foregroundStarted) {
+            try {
+                val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0
+                val config = SecuredBackground.config
+                val note = if (config != null) SecuredNotifier.serviceNotification(this, config) else SecuredNotifier.bareServiceNotification(this)
+                ServiceCompat.startForeground(this, NotificationText.SERVICE_ID, note, type)
+                foregroundStarted = true
+            } catch (t: Throwable) {   // Android refused: nothing was shown, so there is nothing to remove
+                SecuredLog.crash(SecuredLog.Ev.BG_START_REFUSED, t)
+            }
+        }
+        try {
+            if (foregroundStarted) ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        } catch (_: Throwable) {}
         stopSelf()
     }
 

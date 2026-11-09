@@ -2,10 +2,12 @@ package app.encrogram.core.internal
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.Base64
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -27,16 +29,17 @@ internal class DbKeyStore(private val context: Context) {
     /**
      * Returns the passphrase, creating it when there is none yet.
      * @param databaseExists whether database files are already on disk. If they are, a missing or unreadable
-     *   passphrase is fatal (a new one could not open them); otherwise a fresh passphrase is made.
+     *   passphrase is fatal (a new one could not open them), and a Keystore error that may pass is retried first
+     *   ([readWithRetry]); otherwise a fresh passphrase is made.
      */
     fun obtain(databaseExists: Boolean): String {
         val ct = prefs.getString(KEY_CIPHERTEXT, null)
         val iv = prefs.getString(KEY_IV, null)
         if (ct != null && iv != null) {
+            if (databaseExists) return readWithRetry({ decrypt(ct, iv) })
             try {
                 return decrypt(ct, iv)
             } catch (e: Exception) {
-                if (databaseExists) throw KeyFailure("key_unreadable")
                 // No database to lose: replace the unusable passphrase below.
             }
         } else if (databaseExists) {
@@ -117,10 +120,15 @@ internal class DbKeyStore(private val context: Context) {
 
     private fun decrypt(ct: String, iv: String): String {
         val dec = Base64.getDecoder()
-        val key = existingWrappingKey() ?: throw IllegalStateException("no wrapping key")
+        val (ctBytes, ivBytes) = try {
+            dec.decode(ct) to dec.decode(iv)
+        } catch (e: IllegalArgumentException) {
+            throw StoredValueBroken()
+        }
+        val key = existingWrappingKey() ?: throw KeyGone()
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, dec.decode(iv)))
-        return String(cipher.doFinal(dec.decode(ct)), Charsets.UTF_8)
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, ivBytes))
+        return String(cipher.doFinal(ctBytes), Charsets.UTF_8)
     }
 
     private fun keyStore(): KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -141,7 +149,51 @@ internal class DbKeyStore(private val context: Context) {
         return generator.generateKey()
     }
 
+    /** The Keystore has no key under our alias (getKey returned null). */
+    internal class KeyGone : Exception()
+
+    /** The stored passphrase or IV isn't valid base64 any more. */
+    internal class StoredValueBroken : Exception()
+
     companion object {
+        /** [KeyFailure] reason: the Keystore kept failing for a few seconds. Not a lost key: a later start can still work. */
+        const val KEYSTORE_BUSY = "keystore_busy"
+
+        /** Pauses before each new read after a Keystore error that may pass (daemon restart, right after boot or an update). */
+        internal val RETRY_PAUSES_MS = longArrayOf(300, 1_000, 2_000)
+
+        /**
+         * True when the passphrase can never be read on this phone (A3): the key is gone or invalidated, the stored values
+         * are broken, or the key doesn't open them (the GCM tag fails). Any other Keystore error may pass.
+         */
+        internal fun readLost(e: Throwable): Boolean =
+            e is KeyGone || e is StoredValueBroken || e is KeyPermanentlyInvalidatedException || e is AEADBadTagException
+
+        /**
+         * [read] with retries for errors that may pass. Throws [KeyFailure]: "key_unreadable" (only a reset helps,
+         * KEY_LOST) at once for [readLost], else [KEYSTORE_BUSY] after the last retry.
+         */
+        internal fun readWithRetry(read: () -> String, pause: (Long) -> Unit = Thread::sleep): String {
+            var retries = 0
+            while (true) {
+                val failure = try {
+                    return read()
+                } catch (e: Exception) {
+                    e
+                }
+                if (readLost(failure)) {
+                    SecuredLog.e(SecuredLog.Ev.DB_KEY_FAILED, failure.javaClass.simpleName)
+                    throw KeyFailure("key_unreadable")
+                }
+                if (retries == RETRY_PAUSES_MS.size) {
+                    SecuredLog.crash(SecuredLog.Ev.DB_KEY_FAILED, failure)
+                    throw KeyFailure(KEYSTORE_BUSY)
+                }
+                SecuredLog.w(SecuredLog.Ev.DB_KEY_FAILED, "retry", retries + 1)
+                pause(RETRY_PAUSES_MS[retries++])
+            }
+        }
+
         const val PREFS_NAME = "encrogram_secured_keys"
         private const val KEY_CIPHERTEXT = "db_passphrase_ct"
         private const val KEY_IV = "db_passphrase_iv"

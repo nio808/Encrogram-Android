@@ -51,6 +51,15 @@ internal object Commands {
      */
     const val NETWORK_CONFIG = "/network socks=off smp-proxy=unknown smp-proxy-fallback=no"
 
+    /** APIGetNetworkConfig (Commands.hs:1845, :5552) -> `networkConfig`. */
+    const val GET_NETWORK_CONFIG = "/network"
+
+    /**
+     * APISetNetworkConfig (Commands.hs:1844, :5550) -> `cmdOk`: the WHOLE NetworkConfig (simplexmq Client.hs, JSON with
+     * defaultJSON field names), so build it with [ServerConfigPlanner.tunedNetworkConfig] from a read-back config.
+     */
+    fun setNetworkConfig(networkConfig: JSONObject): String = "/_network " + asciiJson(networkConfig.toString())
+
     /**
      * APISetNetworkInfo (Commands.hs:1851, :5549) -> `cmdOk`: the phone's network, sent on every change as the official
      * Android app does (NetworkObserver.kt). Works before `/_start`. Example: `/_network info {"networkType":"wifi","online":true}`.

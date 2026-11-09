@@ -188,3 +188,36 @@ internal object MessageMapper {
             .thenByDescending { it.chatId },
     )
 }
+
+/**
+ * Per chat, the newest item id the cached row already counts (A4). A list load takes the core's unread count, which
+ * includes items whose `newChatItems` events still wait in the engine queue; [fresh] keeps those from counting twice.
+ * Item ids only grow (SQLite rowids), except that a deleted top row's id can be given out again: [deleted].
+ * Engine thread only.
+ */
+internal class CountedItems {
+    private val upTo = HashMap<Long, Long>()
+
+    fun clear() = upTo.clear()
+
+    /** A list load: the row counts every item up to [newestItemId], the core's newest item in the chat (null: none yet). */
+    fun loaded(chatId: Long, newestItemId: Long?) {
+        if (newestItemId == null) upTo.remove(chatId) else upTo[chatId] = newestItemId
+    }
+
+    /**
+     * The items newer than their row's mark, in order; then each chat's mark moves to its newest item. Every item is
+     * checked against the marks as they were before the batch, so a batch in any order is counted once.
+     */
+    fun fresh(items: List<CoreItem>): List<CoreItem> {
+        val out = items.filter { i -> upTo[i.chatId]?.let { i.itemId > it } ?: true }
+        for (i in items) if (i.itemId > (upTo[i.chatId] ?: Long.MIN_VALUE)) upTo[i.chatId] = i.itemId
+        return out
+    }
+
+    /** An item at or below the mark was deleted: its id may come back for a new item, which must count. */
+    fun deleted(chatId: Long, itemId: Long) {
+        val mark = upTo[chatId] ?: return
+        if (itemId <= mark) upTo[chatId] = itemId - 1
+    }
+}

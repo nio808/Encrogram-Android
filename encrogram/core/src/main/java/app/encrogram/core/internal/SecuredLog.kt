@@ -24,6 +24,12 @@ internal object SecuredLog {
         DB_OPEN, DB_OPEN_FAILED, DB_RETRY_AFTER_PARTIAL, DB_KEY_CREATED, DB_KEY_FAILED,
         STATE, START_FAILED, CONFIG_STEP_FAILED, CONFIG_OK,
         CMD_ERROR, CMD_INVALID_REPLY, CMD_UNEXPECTED_REPLY,
+        // A network command tried again with a longer core timeout: the error tag and the retry number.
+        CMD_RETRY,
+        // A screen's listener or callback threw (release builds only; the exception's class name).
+        LISTENER_FAILED,
+        // Milliseconds since STARTING: tag "chats_loaded" or "running".
+        START_MS,
         EVENT, EVENT_ERROR, EVENT_PARSE_FAILED,
         RECEIVER_STARTED, RECEIVER_STOPPED, RECEIVER_ERROR,
         CHATS_LOADED, INVITE_REFUSED, CONNECT_REFUSED, PRESET_CARD_REMOVED,

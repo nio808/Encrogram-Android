@@ -112,6 +112,8 @@ internal class SimplexSecuredEngine(
     @Volatile private var lastFailure: SecuredError? = null
     @Volatile private var currentProfile: SecuredProfile? = null
     @Volatile private var chatSnapshot: List<ChatSummary> = emptyList()
+    /** [System.nanoTime] when the state last became STARTING (engine thread). */
+    private var startingAtNs = 0L
 
     // ---- written on the engine thread only (ctrl is also read by the receive thread) ----
     @Volatile private var ctrl = 0L
@@ -120,6 +122,8 @@ internal class SimplexSecuredEngine(
     private val chatCache = HashMap<Long, ChatSummary>()
     /** Item id of each cached row's last message, so status and edit events can update the row. */
     private val lastItemIds = HashMap<Long, Long>()
+    /** Newest item each cached row's unread count already includes, so a queued event after a reload isn't counted twice. */
+    private val counted = CountedItems()
     /** Chats where disappearing messages are on for both sides (marking read starts received timers). */
     private val timedChats = HashSet<Long>()
     /** The local note folder behind Saved Messages ([SAVED_MESSAGES_CHAT_ID]), from the last chat list load. */
@@ -282,10 +286,10 @@ internal class SimplexSecuredEngine(
         }
         override fun itemsAdded(items: List<CoreItem>) = applyNewItems(items)
         override fun progress(chatId: Long, itemId: Long, done: Long, total: Long) {
-            main.post { for (l in listeners) l.onMediaProgress(chatId, itemId, done, total) }
+            tellListeners { it.onMediaProgress(chatId, itemId, done, total) }
         }
         override fun <T> deliver(callback: SecuredCallback<T>, result: SecuredResult<T>) {
-            main.post { callback.onResult(result) }
+            main.post { SafeDelivery.one { callback.onResult(result) } }
         }
         override fun onEngine(task: () -> Unit) = post(task)
         override fun running() = state == EngineState.RUNNING && ctrl != 0L
@@ -310,8 +314,8 @@ internal class SimplexSecuredEngine(
         main.post {
             if (!listeners.contains(listener)) return@post
             val s = state
-            listener.onStateChanged(s)
-            if (s == EngineState.FAILED) lastFailure?.let { listener.onError(it) }
+            SafeDelivery.one { listener.onStateChanged(s) }
+            if (s == EngineState.FAILED) lastFailure?.let { SafeDelivery.one { listener.onError(it) } }
         }
     }
 
@@ -383,7 +387,7 @@ internal class SimplexSecuredEngine(
 
     override fun createInvite(callback: SecuredCallback<SecuredInvite>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        when (val r = send(Commands.addContact(userId))) {
+        when (val r = sendNet(Commands.addContact(userId))) {
             is CoreReply.Result -> {
                 if (r.type != "invitation") return@post err(callback, unexpected(r))
                 val created = CoreJson.parseInvitation(r.body)
@@ -439,7 +443,7 @@ internal class SimplexSecuredEngine(
         // resolve here would only fail the same way inside /connect.
         // A `/g` link may only join a group: any other plan for it is refused (review #4).
         val groupInput = LinkChecker.isShortGroupLink(normalized)
-        val verdict = when (val plan = send(Commands.connectPlan(userId, normalized))) {
+        val verdict = when (val plan = sendNet(Commands.connectPlan(userId, normalized))) {
             is CoreReply.Result ->
                 if (plan.type == "connectionPlan") ConnectPlan.verdict(plan.body, config.allowedHosts, config.smpServers, groupInput)
                 else ConnectPlan.Verdict.Refuse(unexpected(plan), "plan_reply")
@@ -454,7 +458,7 @@ internal class SimplexSecuredEngine(
             is ConnectPlan.Verdict.JoinGroup -> return@post joinGroupLinkOnEngine(verdict, callback)
             ConnectPlan.Verdict.Connect -> Unit
         }
-        when (val r = send(Commands.connect(normalized))) {
+        when (val r = sendNet(Commands.connect(normalized))) {
             is CoreReply.Result -> when (r.type) {
                 "sentConfirmation", "sentInvitation" -> {
                     ok(callback, Unit)
@@ -758,7 +762,7 @@ internal class SimplexSecuredEngine(
         // Joining answers the inviter's own queue (APIJoinGroup -> joinConnection): not when that contact is on a relay we don't run (b1).
         if (g.invitedByContactId?.let { foreignRefusal(it) } != null) return@post refuseForeign(callback, ErrorMapper.FOREIGN_RELAY_JOIN)
         val acceptedAt = System.currentTimeMillis()
-        when (val r = send(Commands.joinGroup(g.groupId))) {
+        when (val r = sendNet(Commands.joinGroup(g.groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "userAcceptedGroupSent") return@post err(callback, unexpected(r))
                 // The history the group sends once we're connected covers everything up to now (G11).
@@ -875,7 +879,7 @@ internal class SimplexSecuredEngine(
             CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
         }
         if (link == null) {
-            link = when (val r = send(Commands.createGroupLink(g.groupId, role))) {
+            link = when (val r = sendNet(Commands.createGroupLink(g.groupId, role))) {
                 is CoreReply.Result -> if (r.type == "groupLinkCreated") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
                 is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
                 CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
@@ -897,7 +901,7 @@ internal class SimplexSecuredEngine(
         if (!approved) {
             // Never hand out a link that would bring people to a server we don't run.
             SecuredLog.e(Ev.INVITE_REFUSED, "group_link")
-            send(Commands.deleteGroupLink(g.groupId))
+            sendNet(Commands.deleteGroupLink(g.groupId))
             return@post err(callback, SecuredError(SecuredError.Kind.UNAPPROVED_RELAY, ErrorMapper.GROUP_LINK_ELSEWHERE))
         }
         // A channel link must let people in as observers only; never hand out one that doesn't.
@@ -914,7 +918,7 @@ internal class SimplexSecuredEngine(
     override fun deleteGroupLink(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
-        when (val r = send(Commands.deleteGroupLink(g.groupId))) {
+        when (val r = sendNet(Commands.deleteGroupLink(g.groupId))) {
             is CoreReply.Result -> {
                 if (r.type != "groupLinkDeleted") return@post err(callback, unexpected(r))
                 SecuredLog.i(Ev.GROUP_ACTION, "link_delete")
@@ -933,7 +937,7 @@ internal class SimplexSecuredEngine(
      * (groupLinkConnecting, a chat-list event) with the link's role, connecting, and later connected.
      */
     private fun joinGroupLinkOnEngine(join: ConnectPlan.Verdict.JoinGroup, callback: SecuredCallback<Unit>) {
-        when (val r = send(Commands.connectResolved(userId, join.fullLink, join.shortLink))) {
+        when (val r = sendNet(Commands.connectResolved(userId, join.fullLink, join.shortLink))) {
             is CoreReply.Result -> when (r.type) {
                 "sentInvitation" -> {
                     SecuredLog.i(Ev.GROUP_ACTION, "join_link")
@@ -1101,7 +1105,7 @@ internal class SimplexSecuredEngine(
 
     private fun publishBackupState(change: (BackupState) -> BackupState) {
         synchronized(backupLock) { backupStatus = change(backupState()) }
-        main.post { for (l in listeners) l.onBackupStateChanged() }
+        tellListeners { it.onBackupStateChanged() }
     }
 
     /**
@@ -1530,7 +1534,7 @@ internal class SimplexSecuredEngine(
         worker.execute {
             try {
                 if (waiting.isNotEmpty()) {
-                    val all = SecuredCallback<Unit> { result -> for (c in waiting) c.onResult(result) }
+                    val all = SecuredCallback<Unit> { result -> for (c in waiting) SafeDelivery.one { c.onResult(result) } }
                     beginAttemptOnWorker("now", manual = true, callback = all)
                 } else {
                     retryPendingDeletes()
@@ -1550,6 +1554,7 @@ internal class SimplexSecuredEngine(
         userId = 0L
         chatCache.clear()
         lastItemIds.clear()
+        counted.clear()
         timedChats.clear()
         groupCache.clear()
         hiddenChats = emptySet()
@@ -1566,8 +1571,7 @@ internal class SimplexSecuredEngine(
 
     /** After an export: the network settings checked again, then the chat started. False when either failed. */
     private fun resumeAfterPause(): Boolean = try {
-        val net = expectResult(send(Commands.NETWORK_CONFIG), "network_resume", "networkConfig")
-        if (!ServerConfigPlanner.networkConfigOk(net.body)) throw configFailure("network_resume_verify", net)
+        applyNetworkConfig("network_resume")
         chatStarted = true
         expectResult(send(Commands.START_CHAT), "start_resume", "chatStarted", "chatRunning")
         true
@@ -2479,7 +2483,7 @@ internal class SimplexSecuredEngine(
                 SecuredLog.i(Ev.ITEM_ACTION, "forward", copies.size)
                 ok(callback, Unit)
                 applyNewItems(items)
-                main.post { for (m in copies) for (l in listeners) l.onMessageReceived(m) }
+                main.post { for (m in copies) SafeDelivery.each(listeners) { it.onMessageReceived(m) } }
             }
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.FORWARD))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
@@ -3072,8 +3076,11 @@ internal class SimplexSecuredEngine(
         } catch (f: DbKeyStore.KeyFailure) {
             SecuredLog.e(Ev.DB_KEY_FAILED, f.reason)
             // The databases are there but their key is gone or unreadable: only a reset helps (b3, KEY_LOST).
-            val error = if (f.reason in KEY_LOST_REASONS) ErrorMapper.keyLost()
-            else SecuredError(SecuredError.Kind.ENGINE, "Secured storage can't be unlocked on this device (${f.reason}).")
+            val error = when (f.reason) {
+                in KEY_LOST_REASONS -> ErrorMapper.keyLost()
+                DbKeyStore.KEYSTORE_BUSY -> SecuredError(SecuredError.Kind.ENGINE, ErrorMapper.KEYSTORE_BUSY)
+                else -> SecuredError(SecuredError.Kind.ENGINE, "Secured storage can't be unlocked on this device (${f.reason}).")
+            }
             throw StartFailure(error, f.reason)
         }
         var (tag, c) = migrateInit(prefix, key)
@@ -3173,8 +3180,7 @@ internal class SimplexSecuredEngine(
                 val net = expectResult(send(NETWORK_LOCKED), "network_lock", "networkConfig")
                 if (!networkLockedOk(net.body)) throw configFailure("network_lock_verify", net)
             } else {
-                val net = expectResult(send(Commands.NETWORK_CONFIG), "network", "networkConfig")
-                if (!ServerConfigPlanner.networkConfigOk(net.body)) throw configFailure("network_verify", net)
+                applyNetworkConfig("network")
             }
 
             // 2. Disable every preset operator (SimpleX Chat, Flux) and with them all their servers.
@@ -3205,8 +3211,7 @@ internal class SimplexSecuredEngine(
             // 6. First run: our servers are verified, so lift the lock and verify the normal network settings.
             if (lockNetwork) {
                 unlockSent = true
-                val net = expectResult(send(Commands.NETWORK_CONFIG), "network_unlock", "networkConfig")
-                if (!ServerConfigPlanner.networkConfigOk(net.body)) throw configFailure("network_unlock_verify", net)
+                applyNetworkConfig("network_unlock")
                 clearFirstRunLockdown()
             }
 
@@ -3271,6 +3276,19 @@ internal class SimplexSecuredEngine(
         }
     }
 
+    /**
+     * Our network settings: the proxy fields through `/network` (as before), then the official app's mobile timings on
+     * top of the config that returns, sent whole with `/_network` so no field is lost; read back and checked in full.
+     * Throws [StartFailure] (the step names stay those of the single `/network` before).
+     */
+    private fun applyNetworkConfig(step: String) {
+        val base = expectResult(send(Commands.NETWORK_CONFIG), step, "networkConfig")
+        val tuned = ServerConfigPlanner.tunedNetworkConfig(base.body) ?: throw configFailure("${step}_verify", base)
+        expectResult(send(Commands.setNetworkConfig(tuned)), "${step}_set", "cmdOk")
+        val stored = expectResult(send(Commands.GET_NETWORK_CONFIG), "${step}_read", "networkConfig")
+        if (!ServerConfigPlanner.networkConfigOk(stored.body)) throw configFailure("${step}_verify", stored)
+    }
+
     /** `networkConfig` body: every connection through the unreachable SOCKS proxy; unknown relays only proxied. */
     private fun networkLockedOk(body: JSONObject): Boolean {
         val cfg = body.optJSONObject("networkConfig") ?: return false
@@ -3327,6 +3345,7 @@ internal class SimplexSecuredEngine(
         userId = 0L
         chatCache.clear()
         lastItemIds.clear()
+        counted.clear()
         timedChats.clear()
         groupCache.clear()
         hiddenChats = emptySet()
@@ -3362,7 +3381,7 @@ internal class SimplexSecuredEngine(
         lastFailure = f.error
         setState(EngineState.FAILED)
         val e = f.error
-        main.post { for (l in listeners) l.onError(e) }
+        tellListeners { it.onError(e) }
     }
 
     // =============================================================================================================
@@ -3407,12 +3426,17 @@ internal class SimplexSecuredEngine(
         SecuredLog.i(Ev.RECEIVER_STOPPED)
     }
 
+    /**
+     * Stops the receive thread without waiting out its [RECV_WAIT_MICROS] wait: that wait only reads the old controller's
+     * output queue (Mobile.hs:356-365, chatRecvMsgWait), which closing or replacing the store never frees, and whatever
+     * it returns is dropped (its token is stopped, and `receiver === r` fails). The official app leaves it the same way.
+     */
     private fun stopReceiver() {
         val r = receiver ?: return
         r.running = false
         receiver = null
         try {
-            r.thread.join(RECV_WAIT_MICROS / 1000L + 2000L)
+            r.thread.join(RECV_STOP_JOIN_MS)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
         }
@@ -3454,13 +3478,13 @@ internal class SimplexSecuredEngine(
                     // never notify (SecuredService.notifies).
                     val incoming = items.filter { it.chatId != SAVED_MESSAGES_CHAT_ID && ((it.isMessage && (!it.outgoing || it.earlierOwn)) || it.event != null) }
                         .map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
-                    if (incoming.isNotEmpty()) main.post { for (m in incoming) for (l in listeners) l.onMessageReceived(m) }
+                    if (incoming.isNotEmpty()) main.post { for (m in incoming) SafeDelivery.each(listeners) { it.onMessageReceived(m) } }
                 }
                 "chatItemsStatusesUpdated" -> {
                     val items = CoreJson.parseChatItems(reply.body).filter { it.isMessage }
                     if (items.isNotEmpty()) {
                         noRecipients.settled(items)
-                        main.post { for (i in items) for (l in listeners) l.onMessageStatusChanged(i.chatId, i.itemId, i.status) }
+                        main.post { for (i in items) SafeDelivery.each(listeners) { it.onMessageStatusChanged(i.chatId, i.itemId, i.status) } }
                         applyStatuses(items)
                     }
                 }
@@ -3545,7 +3569,7 @@ internal class SimplexSecuredEngine(
     private fun setOnline(value: Boolean) {
         if (online == value) return
         online = value
-        main.post { for (l in listeners) l.onConnectionChanged(value) }
+        tellListeners { it.onConnectionChanged(value) }
     }
 
     // =============================================================================================================
@@ -3637,7 +3661,7 @@ internal class SimplexSecuredEngine(
         val changed = noRecipients.check(items)
         if (changed.isEmpty()) return
         SecuredLog.i(Ev.ITEM_ACTION, "no_recipients", changed.size)
-        main.post { for (i in changed) for (l in listeners) l.onMessageStatusChanged(i.chatId, i.itemId, i.status) }
+        main.post { for (i in changed) SafeDelivery.each(listeners) { it.onMessageStatusChanged(i.chatId, i.itemId, i.status) } }
         applyStatuses(changed)
     }
 
@@ -3746,6 +3770,7 @@ internal class SimplexSecuredEngine(
         previewCache.keys.retainAll(known)
         chatCache.clear()
         lastItemIds.clear()
+        counted.clear()
         timedChats.clear()
         groupCache.clear()
         for (listed in chats) {
@@ -3753,6 +3778,7 @@ internal class SimplexSecuredEngine(
             if (c.isContactCard || c.removed) continue
             val chat = listed.copy(lastItem = lastShown(c.contactId, ChatRef.contact(c.contactId), listed.lastItem))
             chatCache[c.contactId] = MessageMapper.summaryOf(chat, archive.isArchived(c.contactId), ForeignRelays.chatMarked(marks, c.contactId))
+            counted.loaded(c.contactId, listed.lastItem?.itemId)
             // Messages and the service rows we show (lastEvent): edits and deletions of either reload the row.
             chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[c.contactId] = it.itemId }
             if (c.timedEnabled) timedChats.add(c.contactId)
@@ -3779,6 +3805,7 @@ internal class SimplexSecuredEngine(
             val unread = listed.unreadCount - sweepHistory(listed.group, listed.unreadCount)
             val chat = listed.copy(lastItem = last, unreadCount = unread.coerceAtLeast(0))
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id), ForeignRelays.chatMarked(marks, id))
+            counted.loaded(id, listed.lastItem?.itemId)
             chat.lastItem?.takeIf { it.shown }?.let {
                 lastItemIds[id] = it.itemId
                 previews.add(it)
@@ -3790,9 +3817,11 @@ internal class SimplexSecuredEngine(
         noteFolderId = notes?.folder?.noteFolderId
         if (notes != null) {
             chatCache[SAVED_MESSAGES_CHAT_ID] = MessageMapper.notesSummary(notes)
+            counted.loaded(SAVED_MESSAGES_CHAT_ID, notes.lastItem?.itemId)
             notes.lastItem?.takeIf { it.isMessage }?.let { lastItemIds[SAVED_MESSAGES_CHAT_ID] = it.itemId }
         }
         SecuredLog.i(Ev.CHATS_LOADED, count = chatCache.size)
+        if (state == EngineState.STARTING) logSinceStarting("chats_loaded")
         publishChats()
         if (notify) {
             notifyChatsChanged()
@@ -3809,7 +3838,8 @@ internal class SimplexSecuredEngine(
         watchNoRecipients(items)
         var changed = false
         var unknownChat = false
-        for (item in items) {
+        // Items a list load already counted (their events waited behind it) change nothing.
+        for (item in counted.fresh(items)) {
             val row = chatCache[item.chatId]
             if (row == null) {
                 unknownChat = true
@@ -3865,6 +3895,8 @@ internal class SimplexSecuredEngine(
     private fun applyDeletions(deletions: List<CoreDeletion>) {
         if (deletions.isEmpty()) return
         markChanged()
+        // Only a row that is gone frees its id; one marked deleted keeps it.
+        for (d in deletions) if (d.replacement == null) counted.deleted(d.chatId, d.itemId)
         val removed = LinkedHashMap<Long, MutableList<Long>>()
         val marked = ArrayList<CoreItem>()
         for (d in deletions) {
@@ -3880,7 +3912,7 @@ internal class SimplexSecuredEngine(
         }
         if (removed.isNotEmpty()) {
             val gone = removed.mapValues { it.value.toList() }
-            main.post { for ((chatId, ids) in gone) for (l in listeners) l.onMessagesRemoved(chatId, ids) }
+            main.post { for ((chatId, ids) in gone) SafeDelivery.each(listeners) { it.onMessagesRemoved(chatId, ids) } }
         }
         emitChanged(marked)
         val lastGone = deletions.filter { lastItemIds[it.chatId] == it.itemId }
@@ -3894,7 +3926,7 @@ internal class SimplexSecuredEngine(
         val messages = localView(items).filter { it.shown }.map { MessageMapper.toMessage(it, roleIn(it.chatId)) }
         if (messages.isEmpty()) return
         markChanged()
-        main.post { for (m in messages) for (l in listeners) l.onMessageChanged(m) }
+        main.post { for (m in messages) SafeDelivery.each(listeners) { it.onMessageChanged(m) } }
     }
 
     private fun publishChats() {
@@ -3930,11 +3962,11 @@ internal class SimplexSecuredEngine(
      * Runs one engine command on the engine thread. Logs only reply/error type tags; an error whose detail is in
      * [expected] is an answer the caller asked for, not a failure, and isn't logged as CMD_ERROR.
      */
-    private fun send(cmd: String, expected: Set<String> = emptySet()): CoreReply {
+    private fun send(cmd: String, expected: Set<String> = emptySet(), retryNum: Int = 0): CoreReply {
         val c = ctrl
         if (c == 0L) return CoreReply.Error(CoreError("error", "chatNotStarted", null))
         val raw = try {
-            chatSendCmdRetry(c, cmd, 0)
+            chatSendCmdRetry(c, cmd, retryNum)
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.CMD_INVALID_REPLY, t)
             return CoreReply.Invalid
@@ -3947,6 +3979,9 @@ internal class SimplexSecuredEngine(
         }
         return reply
     }
+
+    /** [send] for a command that reaches a relay before it answers: a timeout or network error is retried ([NetRetry]). */
+    private fun sendNet(cmd: String): CoreReply = NetRetry.run({ online }) { n -> send(cmd, retryNum = n) }
 
     private fun expectResult(reply: CoreReply, step: String, vararg types: String): CoreReply.Result {
         if (reply is CoreReply.Result && reply.type in types) return reply
@@ -3987,22 +4022,36 @@ internal class SimplexSecuredEngine(
         state = s
         if (s != EngineState.FAILED) lastFailure = null
         SecuredLog.i(Ev.STATE, s.name)
-        main.post { for (l in listeners) l.onStateChanged(s) }
+        if (s == EngineState.STARTING) startingAtNs = System.nanoTime()
+        if (s == EngineState.RUNNING) logSinceStarting("running")
+        tellListeners { it.onStateChanged(s) }
         // Events handled while not RUNNING are dropped: every screen reloads once when RUNNING is reached.
         if (s == EngineState.RUNNING) notifyChatsChanged()
     }
 
     private fun notifyChatsChanged() {
-        main.post { for (l in listeners) l.onChatsChanged() }
+        tellListeners { it.onChatsChanged() }
+    }
+
+    /** Start timing (A15): milliseconds since the engine last became STARTING, as a count, never a time of day. */
+    private fun logSinceStarting(step: String) {
+        val at = startingAtNs
+        if (at == 0L) return
+        SecuredLog.i(Ev.START_MS, step, ((System.nanoTime() - at) / 1_000_000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+    }
+
+    /** Every listener on the main thread, each call guarded ([SafeDelivery]). */
+    private fun tellListeners(call: (SecuredListener) -> Unit) {
+        main.post { SafeDelivery.each(listeners, call) }
     }
 
     private fun <T> ok(callback: SecuredCallback<T>, value: T) {
         val result = SecuredResult.Ok(value)
-        main.post { callback.onResult(result) }
+        main.post { SafeDelivery.one { callback.onResult(result) } }
     }
 
     private fun <T> err(callback: SecuredCallback<T>, error: SecuredError) {
-        main.post { callback.onResult(SecuredResult.Err(error)) }
+        main.post { SafeDelivery.one { callback.onResult(SecuredResult.Err(error)) } }
     }
 
     private fun post(task: () -> Unit) {
@@ -4031,7 +4080,10 @@ internal class SimplexSecuredEngine(
         const val DB_PREFIX = "secured"
         const val LOCKDOWN_MARKER = "first_run_lockdown"
         const val MIGRATION_CONFIRM = "yesUp"
-        const val RECV_WAIT_MICROS = 2_000_000
+        /** chat_recv_msg_wait's timeout: one empty wake-up per 30 s when idle (the official app waits 300 s). */
+        const val RECV_WAIT_MICROS = 30_000_000
+        /** [stopReceiver]: a thread just handing over an event finishes in this; one still waiting is left to end alone. */
+        const val RECV_STOP_JOIN_MS = 300L
         /** [lastShown]: items per page and pages at most (a link join into a big group adds a row per earlier member). */
         const val LOOKBACK_COUNT = 50
         const val LOOKBACK_PAGES = 3

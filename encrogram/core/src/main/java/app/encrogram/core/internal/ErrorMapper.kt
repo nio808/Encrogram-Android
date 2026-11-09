@@ -61,6 +61,8 @@ internal object ErrorMapper {
     // ---- the database key lost, and "Reset Secured" (b3) ----
     const val KEY_LOST = "Secured's key on this phone can't be read, so its data can't be opened. If restarting the phone doesn't help, " +
         "reset Secured to start again. If you saved your 12 words, they bring your account back."
+    /** The Keystore failed for a few seconds at start ([DbKeyStore.KEYSTORE_BUSY]): the key is still there, so never the reset offer. */
+    const val KEYSTORE_BUSY = "Secured couldn't unlock its storage just now. Try again in a moment."
     const val RESET_INCOMPLETE = "Some Secured files couldn't be deleted. Try the reset again."
     const val RESET_RUNNING = "Secured is already being reset."
 
