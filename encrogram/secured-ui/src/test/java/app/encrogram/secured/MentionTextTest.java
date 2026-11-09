@@ -63,4 +63,19 @@ public class MentionTextTest {
         assertTrue(m.containsKey("Bob"));
         assertFalse(m.containsKey("Ann Lee"));
     }
+
+    @Test
+    public void sameNameWithSuffixIsItsOwnMention() {
+        // Two members called Bob: the engine's token makes the second "Bob_1"; "@Bob_1" is never "@Bob".
+        final List<int[]> a = r("@Bob @Bob_1", "Bob", "Bob_1");
+        assertEquals(2, a.size());
+        assertArrayEquals(new int[]{0, 4}, a.get(0));
+        assertArrayEquals(new int[]{5, 11}, a.get(1));
+        final LinkedHashMap<String, Long> m = new LinkedHashMap<>();
+        m.put("Bob", 1L);
+        m.put("Bob_1", 2L);
+        MentionText.prune("hi @Bob_1", m);
+        assertFalse(m.containsKey("Bob"));
+        assertTrue(m.containsKey("Bob_1"));
+    }
 }

@@ -359,6 +359,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 if (bitmaps != null) bitmaps.forget(chatId, id);
                 if (audio != null && audio.isCurrent(chatId, id)) audio.release();
             }
+            if (message.getDeleted() && unreadMentions.remove(Long.valueOf(id))) updateMentionButton();
             upsertMessage(message, false);
         }
 
@@ -1108,7 +1109,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
         final FrameLayout field = new FrameLayout(context);
         field.setBackground(Kit.roundRect(Kit.color(Theme.key_chat_messagePanelBackground), 22));
-        input = new SecuredComposerEditText(context, SecuredResourcesProvider.get());
+        input = new SecuredComposerEditText(context, SecuredResourcesProvider.get()) {
+            @Override
+            protected void onSelectionChanged(int selStart, int selEnd) {
+                super.onSelectionChanged(selStart, selEnd);
+                // Moving the cursor away from "@name" closes the member list (a TextWatcher sees only edits).
+                if (input == this && mentionPicker != null && mentionStart >= 0) checkMention(getText());
+            }
+        };
         input.setHint(context.getString(notes ? R.string.secnotes_hint : R.string.sec_composer_hint));
         input.setHintTextColor(Kit.color(Theme.key_chat_messagePanelHint));
         input.setTextColor(Kit.color(Theme.key_chat_messagePanelText));
@@ -1277,16 +1285,23 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         unreadDividerBefore = Long.MIN_VALUE;
         if (notes || unreadAtOpen <= 0) return 0;
         long first = Long.MIN_VALUE;
+        int firstIndex = -1;
         int unread = 0;
-        for (SecuredMessage m : page) {
+        for (int i = 0; i < page.size(); i++) {
+            final SecuredMessage m = page.get(i);
             if (!m.getUnread() || m.getOutgoing()) continue;
-            if (first == Long.MIN_VALUE) first = m.getMessageId();
+            if (first == Long.MIN_VALUE) {
+                first = m.getMessageId();
+                firstIndex = i;
+            }
             unread++;
             if (m.getMentionsMe() && !unreadMentions.contains(m.getMessageId())) unreadMentions.add(m.getMessageId());
         }
         if (first == Long.MIN_VALUE) return 0;
         unreadBelow = unread;
-        if (!endReached && unread < unreadAtOpen) return 2;
+        // Older history exists and even the oldest loaded message is unread: the first unread one isn't loaded.
+        // (Comparing with the list's unread count would misfire: it can count rows this screen doesn't show.)
+        if (!endReached && firstIndex == 0) return 2;
         unreadDividerBefore = first;
         return 1;
     }
@@ -1356,10 +1371,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             hideMentions();
             return;
         }
-        final boolean opening = mentionStart < 0;
+        // One members() call per "@"; the position stays while nothing matches, so a late list still opens it.
+        final boolean opening = mentionStart != i;
         mentionStart = i;
         if (opening) loadMembers();
-        if (!mentionPicker.show(query)) mentionStart = -1;
+        mentionPicker.show(query);
     }
 
     /** Replaces "@query" with the member's token (as the core reads it) and remembers whom it names. */
@@ -1613,7 +1629,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             } else {
                 // Fail closed with a readable reason, and give the text (and the reply) back so nothing is lost.
                 restoreDraft(text, replyTarget);
-                if (mentions != null) mentionMap.putAll(mentions);
+                if (mentions != null && input != null && text.equals(input.getText().toString())) mentionMap.putAll(mentions);
                 showToast(((SecuredResult.Err) result).getError());
             }
         };
@@ -1625,7 +1641,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             }
         } catch (Throwable t) {
             restoreDraft(text, replyTarget);
-            if (mentions != null) mentionMap.putAll(mentions);
+            if (mentions != null && input != null && text.equals(input.getText().toString())) mentionMap.putAll(mentions);
             showToast(null);
         }
     }
@@ -2590,6 +2606,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             endReached = true;
             hasNewer = false;
             unreadBelow = 0;
+            unreadMentions.clear();
+            unreadDividerBefore = Long.MIN_VALUE;
+            updateMentionButton();
             objects.clear();
             objectSources.clear();
             cancelStrip();
@@ -2915,6 +2934,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         // A removed media message: close its viewer, stop its voice and forget its bitmaps (the engine has already
         // closed its playback and deleted the file).
         SecuredMediaViewer.closeFor(chatId, gone);
+        if (unreadMentions.removeAll(gone)) updateMentionButton();
         for (Long id : gone) {
             liveProgress.remove(id);
             if (bitmaps != null) bitmaps.forget(chatId, id);

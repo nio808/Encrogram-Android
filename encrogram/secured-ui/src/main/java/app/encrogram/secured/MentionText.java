@@ -3,6 +3,7 @@ package app.encrogram.secured;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -18,26 +19,44 @@ final class MentionText {
     private MentionText() {
     }
 
-    /** Sorted, non-overlapping {start, end} pairs of every mention of {@code keys} in {@code text} at or after {@code from}. */
+    /**
+     * Sorted, non-overlapping {start, end} pairs of every mention of {@code keys} in {@code text} at or after
+     * {@code from}. Read as the core reads them (SecuredMentions, Markdown.hs mentionP): {@code @'name'} up to the
+     * closing quote; otherwise the run up to the next whitespace, without trailing punctuation, must equal a key
+     * (so {@code @Bob_1} is "Bob_1", never "Bob").
+     */
     static List<int[]> ranges(String text, int from, Collection<String> keys) {
         if (text == null || keys == null || keys.isEmpty() || from >= text.length()) return Collections.emptyList();
+        final HashSet<String> names = new HashSet<>(keys);
         final ArrayList<int[]> out = new ArrayList<>();
-        for (String key : keys) {
-            if (key == null || key.isEmpty()) continue;
-            find(text, Math.max(0, from), "@'" + key + "'", true, out);
-            find(text, Math.max(0, from), "@" + key, false, out);
-        }
-        Collections.sort(out, (a, b) -> Integer.compare(a[0], b[0]));
-        // Drop overlaps (a short key inside a longer one's quoted form): the earlier, then longer, range wins.
-        final ArrayList<int[]> clean = new ArrayList<>();
-        int end = -1;
-        for (int[] r : out) {
-            if (r[0] >= end) {
-                clean.add(r);
-                end = r[1];
+        final int n = text.length();
+        int i = text.indexOf('@', Math.max(0, from));
+        while (i >= 0) {
+            int next = i + 1;
+            if (i == 0 || Character.isWhitespace(text.charAt(i - 1))) {
+                if (i + 1 < n && text.charAt(i + 1) == '\'') {
+                    final int close = text.indexOf('\'', i + 2);
+                    if (close > i + 2 && names.contains(text.substring(i + 2, close))) {
+                        out.add(new int[]{i, close + 1});
+                        next = close + 1;
+                    }
+                } else {
+                    int end = i + 1;
+                    while (end < n) {
+                        final int cp = text.codePointAt(end);
+                        if (Character.isWhitespace(cp)) break;
+                        end += Character.charCount(cp);
+                    }
+                    final String name = stripPunctuation(text.substring(i + 1, end));
+                    if (!name.isEmpty() && names.contains(name)) {
+                        out.add(new int[]{i, i + 1 + name.length()});
+                    }
+                    next = end;
+                }
             }
+            i = next < n ? text.indexOf('@', next) : -1;
         }
-        return clean;
+        return out;
     }
 
     /** Whether {@code text} still contains a mention of {@code key} (the composer forgets keys that were deleted). */
@@ -51,20 +70,18 @@ final class MentionText {
         mentions.keySet().removeIf(k -> !contains(text, k));
     }
 
-    private static void find(String text, int from, String token, boolean quoted, List<int[]> out) {
-        int i = text.indexOf(token, from);
-        while (i >= 0) {
-            final int end = i + token.length();
-            final boolean startOk = i == 0 || Character.isWhitespace(text.charAt(i - 1));
-            final boolean endOk = quoted || end == text.length() || !continuesName(text.codePointAt(end));
-            if (startOk && endOk) out.add(new int[]{i, end});
-            i = text.indexOf(token, i + 1);
+    /** Data.Char.isPunctuation at the end of a name is not part of it (Markdown.hs splitPunctuation). */
+    private static String stripPunctuation(String s) {
+        int end = s.length();
+        while (end > 0) {
+            final int cp = s.codePointBefore(end);
+            if (!isPunctuation(cp)) break;
+            end -= Character.charCount(cp);
         }
+        return s.substring(0, end);
     }
 
-    /** A character that would make the core read a longer name: anything but whitespace and punctuation. */
-    private static boolean continuesName(int cp) {
-        if (Character.isWhitespace(cp)) return false;
+    private static boolean isPunctuation(int cp) {
         switch (Character.getType(cp)) {
             case Character.CONNECTOR_PUNCTUATION:
             case Character.DASH_PUNCTUATION:
@@ -73,9 +90,9 @@ final class MentionText {
             case Character.INITIAL_QUOTE_PUNCTUATION:
             case Character.FINAL_QUOTE_PUNCTUATION:
             case Character.OTHER_PUNCTUATION:
-                return false;
-            default:
                 return true;
+            default:
+                return false;
         }
     }
 }
