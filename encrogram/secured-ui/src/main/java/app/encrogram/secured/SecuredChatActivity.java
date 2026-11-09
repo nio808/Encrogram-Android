@@ -256,6 +256,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private boolean emojiShown;
     private boolean hidePanelWhenKeyboardOpens;
     private int keyboardHeightPort, keyboardHeightLand;
+    // Voice messages (MU10): the mic shares the send button's place while the box is empty.
+    private ImageView micButton;
+    private SecuredVoiceOverlay voiceOverlay;
+    private SecuredVoiceRecorder voice;
     /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
     private final HashMap<Long, long[]> liveProgress = new HashMap<>();
 
@@ -416,6 +420,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         AndroidUtilities.cancelRunOnUIThread(runSearch);
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
         if (emojiPanel != null) emojiPanel.dismissPopups();
+        if (voice != null) voice.destroy();
         NotificationCenter.getGlobalInstance().removeObserver(emojiLoaded, NotificationCenter.emojiLoaded);
         if (engine != null) {
             engine.removeListener(listener);
@@ -514,6 +519,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         emojiContainer.setVisibility(View.GONE);
         column.addView(emojiContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0));
         root.setDelegate(this::onKeyboardSize);
+        if (!notes) {
+            // Saved Messages takes text only in v1, so it has no recorder.
+            voice = new SecuredVoiceRecorder(voiceHost);
+            voiceOverlay = new SecuredVoiceOverlay(context, SecuredResourcesProvider.get(), voice);
+            root.addView(voiceOverlay, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        }
 
         loadMessages();
         return root;
@@ -1091,6 +1102,16 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         sendButton.setVisibility(View.GONE);
         sendButton.setOnClickListener(v -> send());
         row.addView(sendButton, LayoutHelper.createLinear(52, 44, Gravity.BOTTOM, 0, 0, 0, 0));
+        if (!notes) {
+            micButton = new ImageView(context);
+            micButton.setScaleType(ImageView.ScaleType.CENTER);
+            micButton.setImageResource(org.telegram.messenger.R.drawable.input_mic);
+            micButton.setColorFilter(new PorterDuffColorFilter(Kit.color(Theme.key_chat_messagePanelIcons), PorterDuff.Mode.SRC_IN));
+            micButton.setBackground(Theme.createSelectorDrawable(chatResources.getColor(Theme.key_listSelector), Theme.RIPPLE_MASK_CIRCLE_20DP));
+            micButton.setContentDescription(context.getString(R.string.secvoice_record));
+            micButton.setOnTouchListener((v, e) -> voice != null && voice.onMicTouch(v, e));
+            row.addView(micButton, LayoutHelper.createLinear(52, 44, Gravity.BOTTOM, 0, 0, 0, 0));
+        }
 
         input.addTextChangedListener(new TextWatcher() {
             @Override
@@ -1104,9 +1125,17 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             @Override
             public void afterTextChanged(Editable s) {
                 updateSendVisibility(s.toString().trim().length() > 0);
+                updateMicVisibility();
             }
         });
         return row;
+    }
+
+    /** The mic shows where Send would be: an empty box, not while editing, never in Saved Messages. */
+    private void updateMicVisibility() {
+        if (micButton == null) return;
+        final boolean show = !sendShown && editing == null;
+        micButton.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
     private void updateSendVisibility(boolean show) {
@@ -1136,6 +1165,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         final boolean wasEditing = editing != null;
         replyingTo = null;
         editing = null;
+        updateMicVisibility();
         if (replyStrip != null) replyStrip.setVisibility(View.GONE);
         if (wasEditing && input != null) input.setText("");
     }
@@ -1156,6 +1186,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (m == null || m.getDeleted() || !m.getCanEdit() || input == null) return;
         replyingTo = null;
         editing = m;
+        updateMicVisibility();
         showStrip(org.telegram.messenger.R.drawable.msg_edit, tg(org.telegram.messenger.R.string.EditMessage), m.getText());
         input.setText(m.getText());
         input.setSelection(input.length());
@@ -1711,6 +1742,75 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public void onMediaFailed(SecuredError e) {
             if (!destroyed) showToast(e);
+        }
+    };
+
+    private final SecuredVoiceRecorder.Host voiceHost = new SecuredVoiceRecorder.Host() {
+        @Override
+        public BaseFragment fragment() {
+            return SecuredChatActivity.this;
+        }
+
+        @Override
+        public SecuredEngine engine() {
+            return engine;
+        }
+
+        @Override
+        public long chatId() {
+            return chatId;
+        }
+
+        @Override
+        public Long replyToId() {
+            return replyingTo != null ? replyingTo.getMessageId() : null;
+        }
+
+        @Override
+        public Theme.ResourcesProvider resources() {
+            return SecuredResourcesProvider.get();
+        }
+
+        @Override
+        public SecuredVoiceOverlay overlay() {
+            return voiceOverlay;
+        }
+
+        @Override
+        public View composerBar() {
+            return composerView;
+        }
+
+        @Override
+        public View micButton() {
+            return micButton;
+        }
+
+        @Override
+        public void onRecordingStarts() {
+            if (audio != null) audio.pause();
+        }
+
+        @Override
+        public void onVoiceSent(SecuredMessage m) {
+            if (destroyed) return;
+            if (replyingTo != null) cancelStrip();
+            upsertMessage(m, true);
+        }
+
+        @Override
+        public void onVoiceFailed(SecuredError e) {
+            if (destroyed) return;
+            if (e != null) {
+                showToast(e);
+            } else if (getContext() != null) {
+                showMediaNote(getContext().getString(R.string.secvoice_failed));
+            }
+        }
+
+        @Override
+        public void showNote(String text) {
+            showMediaNote(text);
         }
     };
 
@@ -2937,8 +3037,15 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (audio != null) audio.pause();
         SecuredMediaViewer.pauseAll();
         if (emojiPanel != null) emojiPanel.dismissPopups();
+        if (voice != null) voice.onPause();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
         SecuredBackground.setOpenChat(null);
+    }
+
+    @Override
+    public void onRequestPermissionsResultFragment(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResultFragment(requestCode, permissions, grantResults);
+        if (voice != null && !destroyed) voice.onPermissionResult(requestCode, grantResults);
     }
 
     @Override
@@ -2949,6 +3056,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     @Override
     public boolean onBackPressed(boolean invoked) {
+        if (voice != null && voice.isActive()) {
+            if (invoked) voice.onLockedCancel();
+            return false;
+        }
         if (emojiShown) {
             if (invoked) hideEmojiPanel();
             return false;

@@ -149,6 +149,7 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
         addView(line, new LayoutParams(LayoutParams.MATCH_PARENT, Math.max(1, AndroidUtilities.dp(0.5f)), Gravity.TOP));
 
         picker = EmojiColorPickerWindow.create(context, resources);
+        Kit.securePopup(picker);
 
         grid = new GridView(context);
         layout = new GridLayoutManager(context, 8);
