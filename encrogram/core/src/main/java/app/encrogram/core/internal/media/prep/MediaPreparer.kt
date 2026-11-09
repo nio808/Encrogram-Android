@@ -13,6 +13,7 @@ import app.encrogram.core.internal.media.MediaVault
 import app.encrogram.core.internal.media.Prepared
 import app.encrogram.core.internal.media.SealedFile
 import app.encrogram.core.internal.media.Sniffed
+import app.encrogram.core.internal.media.VoiceFile
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -28,6 +29,8 @@ import java.util.Arrays
  * - GIF and animated WebP: sanitized in memory (20 MiB at most), sealed from memory.
  * - VIDEO (MP4, MOV): staged in `view/`, metadata zeroed in place, sealed, staging file deleted on every path.
  * - FILE: byte for byte. In memory up to the policy's seal limit, otherwise staged in `view/` and deleted.
+ * - VOICE: the engine's own recording ([MediaInput.Recorded], already in `view/`): size, length and ftyp checked,
+ *   metadata zeroed in place, sealed; the recording is closed and deleted on every path.
  *
  * Every temporary plaintext file is deleted on success and failure, every [Picture] is released exactly once, and
  * plaintext arrays are zeroed here (the vault zeroes only its own direct buffer). The log gets a kind or a reason
@@ -43,6 +46,9 @@ internal class MediaPreparer(
 
     override fun prepare(input: MediaInput): Prepared {
         try {
+            if (input is MediaInput.Recorded) {
+                return prepareVoice(input).also { SecuredLog.i(SecuredLog.Ev.MEDIA_PREPARED, it.kind.name) }
+            }
             val picked = input as? MediaInput.Picked ?: throw PrepException(PrepException.Reason.UNSUPPORTED)
             val src = try {
                 opener.open(picked)
@@ -194,6 +200,54 @@ internal class MediaPreparer(
             return Prepared(MediaKind.VIDEO, name, mime, preview, maxOf(info.durationSeconds, 0), false, sealed)
         } finally {
             deleteQuietly(view)
+        }
+    }
+
+    // ---- voice -------------------------------------------------------------------------------------------------
+
+    /**
+     * Only our own [VoiceFile] is accepted (anything else is closed and refused). Empty: UNREADABLE; over the policy's
+     * size or length: TOO_LARGE; not an MPEG-4 `ftyp` file, or metadata that can't be neutralized: UNSUPPORTED.
+     */
+    private fun prepareVoice(input: MediaInput.Recorded): Prepared {
+        val recording = input.recording as? VoiceFile ?: run {
+            try {
+                input.recording.close()
+            } catch (e: Exception) {
+                // not ours; nothing more to do
+            }
+            throw PrepException(PrepException.Reason.UNSUPPORTED)
+        }
+        val file = recording.finish() ?: throw PrepException(PrepException.Reason.UNREADABLE)
+        try {
+            val size = file.length()
+            if (size <= 0L) throw PrepException(PrepException.Reason.UNREADABLE)
+            if (size > config.voiceMaxBytes || MediaPolicy.voiceTooLong(input.durationMs, config)) {
+                throw PrepException(PrepException.Reason.TOO_LARGE)
+            }
+            val head = try {
+                RandomAccessFile(file, "r").use { f ->
+                    val b = ByteArray(minOf(size, MediaKindRules.HEAD_BYTES.toLong()).toInt())
+                    f.readFully(b)
+                    b
+                }
+            } catch (e: IOException) {
+                throw PrepException(PrepException.Reason.UNREADABLE)
+            }
+            val sniffed = MediaKindRules.sniff(head)
+            if (sniffed != Sniffed.MP4 && sniffed != Sniffed.M4A) throw PrepException(PrepException.Reason.UNSUPPORTED)
+            requireRoom(size)
+            val clean = try {
+                RandomAccessFile(file, "rw").use { Mp4Meta.neutralize(it) }
+            } catch (e: IOException) {
+                false
+            }
+            if (!clean) throw PrepException(PrepException.Reason.UNSUPPORTED)
+            val name = MediaNames.neutral(MediaKind.VOICE)
+            val sealed = sealStaged(file)
+            return Prepared(MediaKind.VOICE, name, "audio/mp4", null, MediaPolicy.voiceSeconds(input.durationMs, config), false, sealed)
+        } finally {
+            deleteQuietly(file)
         }
     }
 

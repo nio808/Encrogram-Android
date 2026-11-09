@@ -289,6 +289,8 @@ internal object ErrorMapper {
     /** readMediaBytes over the 16 MB memory limit: the UI opens it with openMediaForPlayback instead. */
     const val MEDIA_TOO_LARGE_TO_OPEN = "This file is too large to open this way."
     const val MEDIA_STORAGE_FULL = "There isn't enough free space on this phone."
+    const val VOICE_TOO_LONG = "This voice message is too long. Voice messages can be up to 5 minutes."
+    const val VOICE_UNREADABLE = "This recording couldn't be used. Record it again."
     const val MEDIA_CAPTION_TOO_LONG = "Captions can be up to 1024 characters."
     const val MEDIA_PREPARED_GONE = "This attachment is no longer available. Pick it again."
     const val MEDIA_NOT_IN_SAVED = "Photos and files can't be added to Saved Messages in this version."

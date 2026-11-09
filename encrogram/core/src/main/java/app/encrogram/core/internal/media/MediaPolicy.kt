@@ -20,6 +20,9 @@ internal data class MediaPolicyConfig(
     val captionChars: Int = 1024,
     val previewChars: Int = 8_000,
     val descriptionOverdueMs: Long = 72L * 3600 * 1000,
+    /** A voice message we send: at most this many bytes (AAC in MPEG-4) and [voiceMaxSeconds] (SimpleX's own limit is 300 s). */
+    val voiceMaxBytes: Long = 3L * MIB,
+    val voiceMaxSeconds: Int = 300,
 ) {
     companion object {
         const val MIB = 1024L * 1024L
@@ -30,6 +33,16 @@ internal data class MediaPolicyConfig(
 internal object MediaPolicy {
 
     val DEFAULT = MediaPolicyConfig()
+
+    /** A recording's length in whole seconds as sent (`duration`): rounded, at least 1, at most [MediaPolicyConfig.voiceMaxSeconds]. */
+    fun voiceSeconds(durationMs: Long, c: MediaPolicyConfig = DEFAULT): Int =
+        roundedSeconds(durationMs).coerceIn(1L, c.voiceMaxSeconds.toLong()).toInt()
+
+    /** Longer than a voice message may be: it would round to more than [MediaPolicyConfig.voiceMaxSeconds]. */
+    fun voiceTooLong(durationMs: Long, c: MediaPolicyConfig = DEFAULT): Boolean = roundedSeconds(durationMs) > c.voiceMaxSeconds
+
+    /** Milliseconds to the nearest second (half up), without overflowing. */
+    private fun roundedSeconds(ms: Long): Long = Math.floorDiv(ms, 1000L) + if (Math.floorMod(ms, 1000L) >= 500) 1 else 0
 
     /** True when a file of [kind] and [sizeBytes] downloads by itself once its description has passed our check. */
     fun autoDownload(kind: MediaKind, sizeBytes: Long, c: MediaPolicyConfig = DEFAULT): Boolean {

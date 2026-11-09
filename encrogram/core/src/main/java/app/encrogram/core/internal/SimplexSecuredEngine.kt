@@ -31,6 +31,7 @@ import app.encrogram.core.api.SecuredMentions
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredProfile
 import app.encrogram.core.api.SecuredResult
+import app.encrogram.core.api.VoiceRecording
 import app.encrogram.core.api.isGroupChatId
 import app.encrogram.core.backup.BackupClient
 import app.encrogram.core.backup.BackupSecrets
@@ -628,7 +629,17 @@ internal class SimplexSecuredEngine(
     // ---- media: the engine's checks, then MediaCoordinator (docs/media-plan.md §4.5) ----
 
     override fun prepareMedia(input: MediaInput, callback: SecuredCallback<PreparedMedia>) =
-        if (state != EngineState.RUNNING) err(callback, ErrorMapper.notRunning(state)) else media.prepare(input, callback)
+        if (state != EngineState.RUNNING) {
+            MediaCoordinator.release(input)
+            err(callback, ErrorMapper.notRunning(state))
+        } else {
+            media.prepare(input, callback)
+        }
+
+    override fun startVoiceRecording(callback: SecuredCallback<VoiceRecording>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        media.startVoiceRecording(callback)
+    }
 
     override fun discardMedia(prepared: PreparedMedia) = media.discard(prepared)
 

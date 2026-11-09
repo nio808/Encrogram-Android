@@ -12,6 +12,7 @@ import app.encrogram.core.api.SecuredError
 import app.encrogram.core.api.SecuredError.Kind
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredResult
+import app.encrogram.core.api.VoiceRecording
 import app.encrogram.core.internal.ChatRef
 import app.encrogram.core.internal.CoreItem
 import app.encrogram.core.internal.ErrorMapper
@@ -77,15 +78,23 @@ internal class MediaCoordinator(
     // Sending
     // =============================================================================================================
 
-    /** Any thread (the engine checked RUNNING). Prepares on the prep thread; the result arrives on main. */
+    /**
+     * Any thread (the engine checked RUNNING). Prepares on the prep thread; the result arrives on main. A recording
+     * ([MediaInput.Recorded]) is closed and deleted on every path: by the preparer, or here when it never runs.
+     */
     fun prepare(input: MediaInput, callback: SecuredCallback<PreparedMedia>) {
         val gen = currentGeneration()
-        launch(prepExecutor, callback, Ev.MEDIA_PREPARE_FAILED) {
-            if (!isCurrent(gen)) return@launch fail(callback, stopped(), Ev.MEDIA_PREPARE_FAILED, "stopped")
+        launch(prepExecutor, callback, Ev.MEDIA_PREPARE_FAILED, onRejected = { release(input) }) {
+            if (!isCurrent(gen)) {
+                release(input)
+                return@launch fail(callback, stopped(), Ev.MEDIA_PREPARE_FAILED, "stopped")
+            }
             val p = try {
                 preparer.prepare(input)
             } catch (t: Throwable) {
-                return@launch fail(callback, prepError(t), Ev.MEDIA_PREPARE_FAILED, tagOf(t))
+                release(input)
+                val error = if (input is MediaInput.Recorded) voiceError(t) else prepError(t)
+                return@launch fail(callback, error, Ev.MEDIA_PREPARE_FAILED, tagOf(t))
             }
             val token = synchronized(lock) {
                 if (gen == generation) tokens.incrementAndGet().also { prepared[it] = p } else null
@@ -101,6 +110,20 @@ internal class MediaCoordinator(
             )
             host.deliver(callback, SecuredResult.Ok(media))
         }
+    }
+
+    /**
+     * Engine thread (RUNNING). A new private file in `view/` for one voice recording, opened read-write; STORAGE when
+     * there isn't room for the longest voice message. Delivered on main.
+     */
+    fun startVoiceRecording(callback: SecuredCallback<VoiceRecording>) {
+        if (!vault.hasRoomFor(config.voiceMaxBytes, config)) return fail(callback, storageFull(), Ev.MEDIA_PREPARE_FAILED, "voice_room")
+        val recording = try {
+            vault.newRecording()
+        } catch (t: Throwable) {
+            return fail(callback, storageFull(), Ev.MEDIA_PREPARE_FAILED, "voice_file")
+        }
+        ok(callback, recording)
     }
 
     /** Any thread. Forgets [media] and deletes its sealed copy (on the prep thread). Already sent or unknown: nothing. */
@@ -643,7 +666,7 @@ internal class MediaCoordinator(
     }
 
     /** Runs [task] on [executor]; a crash or a refused task becomes a readable error for [callback]. */
-    private fun <T> launch(executor: Executor, callback: SecuredCallback<T>, ev: Ev, task: () -> Unit) {
+    private fun <T> launch(executor: Executor, callback: SecuredCallback<T>, ev: Ev, onRejected: () -> Unit = {}, task: () -> Unit) {
         val job = Runnable {
             try {
                 task()
@@ -655,6 +678,7 @@ internal class MediaCoordinator(
         try {
             executor.execute(job)
         } catch (e: RejectedExecutionException) {
+            onRejected()
             fail(callback, stopped(), ev, "rejected")
         }
     }
@@ -672,6 +696,13 @@ internal class MediaCoordinator(
     private fun preparedGone() = ErrorMapper.invalid(ErrorMapper.MEDIA_PREPARED_GONE)
 
     private fun storageFull() = SecuredError(Kind.STORAGE, ErrorMapper.MEDIA_STORAGE_FULL)
+
+    /** A voice recording's refusals in its own words; anything else as for any file. */
+    private fun voiceError(t: Throwable): SecuredError = when ((t as? PrepException)?.reason) {
+        PrepException.Reason.TOO_LARGE -> SecuredError(Kind.TOO_LARGE, ErrorMapper.VOICE_TOO_LONG)
+        PrepException.Reason.UNSUPPORTED, PrepException.Reason.UNREADABLE -> SecuredError(Kind.UNSUPPORTED, ErrorMapper.VOICE_UNREADABLE)
+        else -> prepError(t)
+    }
 
     /** Failures while preparing or committing. */
     private fun prepError(t: Throwable): SecuredError = when (t) {
@@ -719,6 +750,16 @@ internal class MediaCoordinator(
     override fun toString() = "MediaCoordinator"
 
     companion object {
+        /** A recording handed to prepareMedia that won't be prepared: closed and deleted (idempotent). Anything else: nothing. */
+        fun release(input: MediaInput) {
+            val recorded = input as? MediaInput.Recorded ?: return
+            try {
+                recorded.recording.close()
+            } catch (e: Exception) {
+                SecuredLog.w(Ev.MEDIA_IO_FAILED, "voice_close")
+            }
+        }
+
         /** The core events handleEvent routes to [onEvent] (`rcvFileDescrReady` goes to [recordDescription] first). */
         val EVENTS: Set<String> get() = MediaJson.EVENTS
 

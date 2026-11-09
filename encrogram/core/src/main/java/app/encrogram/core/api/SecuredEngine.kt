@@ -186,6 +186,9 @@ interface SecuredEngine {
     /** Strips metadata, makes the preview and stores the file encrypted, off the main thread. Errors: TOO_LARGE, UNSUPPORTED, STORAGE. */
     fun prepareMedia(input: MediaInput, callback: SecuredCallback<PreparedMedia>) = notYet(callback)
 
+    /** A fresh private file for one voice recording (AAC in MPEG-4, .m4a). Callback on the main thread. STORAGE when the phone is full. */
+    fun startVoiceRecording(callback: SecuredCallback<VoiceRecording>) = notYet(callback)
+
     /** Gives back a prepared file that won't be sent (its encrypted copy is deleted). */
     fun discardMedia(prepared: PreparedMedia) {}
 

@@ -83,7 +83,21 @@ sealed class MediaInput {
     data class Picked @JvmOverloads constructor(val uri: String, val asFile: Boolean = false) : MediaInput() {
         override fun toString() = "Picked(asFile=$asFile)"
     }
-    // Later phase: the engine-owned voice recorder adds its own input type here.
+    /** A finished recording from [SecuredEngine.startVoiceRecording]; [durationMs] as the recorder measured it. prepareMedia takes ownership (closes and deletes it on every path). */
+    class Recorded(val recording: VoiceRecording, val durationMs: Long) : MediaInput() {
+        override fun toString() = "Recorded"
+    }
+}
+
+/**
+ * A voice message being recorded into a private file the engine owns (in the vault's view/, so it is wiped at
+ * start and stop). The UI only writes to it through MediaRecorder.setOutputFile(fileDescriptor) and never sees a path.
+ */
+interface VoiceRecording : java.io.Closeable {
+    /** Seekable, read-write, for android.media.MediaRecorder.setOutputFile(FileDescriptor). Valid until close or prepareMedia. */
+    val fileDescriptor: java.io.FileDescriptor
+    /** Discard: closes the descriptor and deletes the file. Idempotent. */
+    override fun close()
 }
 
 /**

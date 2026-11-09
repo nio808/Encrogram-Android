@@ -95,6 +95,22 @@ internal class MediaVault(
     /** A fresh, not yet existing file in `view/` for a preparer to stage plaintext in (sealed with [sealFile]). */
     fun newViewFile(): File = newFile(ensureDir(viewDir))
 
+    /**
+     * A new empty file in `view/` (created exclusively) opened read-write for the voice recorder. Wiped with `view/` at
+     * start and stop like any staging file; [VoiceFile.close] deletes it sooner.
+     */
+    fun newRecording(): VoiceFile {
+        val f = newViewFile()
+        Files.createFile(f.toPath())
+        val raf = try {
+            java.io.RandomAccessFile(f, "rw")
+        } catch (e: IOException) {
+            deleteQuietly(f)
+            throw e
+        }
+        return VoiceFile(f, raf)
+    }
+
     // ---- sealing (prep thread) ---------------------------------------------------------------------------------
 
     /**
