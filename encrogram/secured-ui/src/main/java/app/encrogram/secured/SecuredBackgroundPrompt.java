@@ -25,6 +25,7 @@ final class SecuredBackgroundPrompt {
 
     private static final int REQUEST_POST_NOTIFICATIONS = 7301;   // Telegram's codes: 2..22, 104, 150..211
     private static final String KEY_BG_ASKED = "background_asked";
+    private static final String KEY_NOTIF_ASKED = "notifications_asked";
 
     private final BaseFragment fragment;
     private SecuredEngine bgEngine;
@@ -90,6 +91,8 @@ final class SecuredBackgroundPrompt {
             SecuredBackground.start(activity);
             final SharedPreferences prefs = activity.getSharedPreferences(SecuredUi.UI_PREFS, Context.MODE_PRIVATE);
             if (prefs.getBoolean(KEY_BG_ASKED, false)) {
+                // Older installs, or a prompt dismissed without a button: still ask for notifications, once.
+                requestNotificationPermission(activity);
                 return;
             }
             prefs.edit().putBoolean(KEY_BG_ASKED, true).apply();
@@ -101,22 +104,40 @@ final class SecuredBackgroundPrompt {
             b.setTitle(activity.getString(R.string.sec_bg_title));
             b.setMessage(activity.getString(R.string.sec_bg_text));
             b.setPositiveButton(activity.getString(R.string.sec_bg_allow), (d, w) -> {
-                try {
-                    activity.startActivity(BatteryHelper.requestIgnoreIntent(activity));
-                } catch (Throwable ignored) {
+                // The notification request first; two system screens at once swallow one of them.
+                final boolean asked = requestNotificationPermission(activity);
+                final Runnable battery = () -> {
+                    try {
+                        activity.startActivity(BatteryHelper.requestIgnoreIntent(activity));
+                    } catch (Throwable ignored) {
+                    }
+                };
+                if (asked) {
+                    AndroidUtilities.runOnUIThread(battery, 1200);
+                } else {
+                    battery.run();
                 }
-                requestNotificationPermission(activity);
             });
-            b.setNegativeButton(activity.getString(R.string.sec_bg_not_now), (d, w) -> requestNotificationPermission(activity));
+            b.setNegativeButton(activity.getString(R.string.sec_bg_not_now), null);
+            // Any way out of the dialog (button, tap outside, back) leads to the notification request, once.
+            b.setOnDismissListener(d -> requestNotificationPermission(activity));
             Kit.show(fragment, b.create());
         } catch (Throwable ignored) {
         }
     }
 
-    private static void requestNotificationPermission(Activity activity) {
-        if (Build.VERSION.SDK_INT >= 33
-                && activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            activity.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_POST_NOTIFICATIONS);
+    /** Android's own request, at most once ever (no nagging after a refusal). Returns true when the system dialog was started. */
+    private static boolean requestNotificationPermission(Activity activity) {
+        if (Build.VERSION.SDK_INT < 33
+                || activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return false;
         }
+        final SharedPreferences prefs = activity.getSharedPreferences(SecuredUi.UI_PREFS, Context.MODE_PRIVATE);
+        if (prefs.getBoolean(KEY_NOTIF_ASKED, false)) {
+            return false;
+        }
+        prefs.edit().putBoolean(KEY_NOTIF_ASKED, true).apply();
+        activity.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_POST_NOTIFICATIONS);
+        return true;
     }
 }

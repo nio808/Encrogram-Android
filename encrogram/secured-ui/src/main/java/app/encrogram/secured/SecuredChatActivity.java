@@ -1175,7 +1175,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         shownTtl = ttl;
         Drawable timer = null;
         if (ttl != null && ttl > 0) {
-            final TimerDrawable t = new TimerDrawable(avatarContainer.getContext(), chatResources);
+            final TimerDrawable t = new TitleTimerDrawable(avatarContainer.getContext(), chatResources);
             t.setTime(ttl);
             timer = t;
         }
@@ -4209,6 +4209,27 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public int getOpacity() {
             return PixelFormat.TRANSLUCENT;
+        }
+    }
+
+    /**
+     * TimerDrawable draws its "1d" label from the canvas origin (made for the action bar, where bounds start at 0,0).
+     * In the title the bounds sit after the text, so the label landed on the lock. Draw it in a translated frame.
+     */
+    private static final class TitleTimerDrawable extends TimerDrawable {
+        TitleTimerDrawable(Context context, Theme.ResourcesProvider rp) {
+            super(context, rp);
+        }
+
+        @Override
+        public void draw(@NonNull Canvas canvas) {
+            final Rect b = new Rect(getBounds());
+            canvas.save();
+            canvas.translate(b.left, b.top);
+            setBounds(0, 0, b.width(), b.height());
+            super.draw(canvas);
+            setBounds(b.left, b.top, b.right, b.bottom);
+            canvas.restore();
         }
     }
 }

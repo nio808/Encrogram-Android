@@ -83,7 +83,12 @@ public final class SecuredResourcesProvider implements Theme.ResourcesProvider {
         } else if (key == Theme.key_chat_outTimeText
                 || key == Theme.key_chat_outSentCheck
                 || key == Theme.key_chat_outSentCheckRead
-                || key == Theme.key_chat_outSentClock) {
+                || key == Theme.key_chat_outSentClock
+                || key == Theme.key_chat_outTimeSelectedText
+                || key == Theme.key_chat_outSentCheckSelected
+                || key == Theme.key_chat_outSentCheckReadSelected
+                || key == Theme.key_chat_outSentClockSelected
+                || key == Theme.key_chat_outViewsSelected) {
             return d ? 0xFFC9CBFF : 0xFF5357CC;
         }
         return Theme.getColor(key);

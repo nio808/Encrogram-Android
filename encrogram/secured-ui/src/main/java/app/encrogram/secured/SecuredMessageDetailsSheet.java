@@ -77,7 +77,10 @@ final class SecuredMessageDetailsSheet {
 
     private static void fill(Context c, LinearLayout out, MessageInfo info) {
         row(c, out, R.string.sec_r2i_sent, time(info.getSentAtMs()));
-        row(c, out, R.string.sec_r2i_received, time(info.getReceivedAtMs()));
+        // Only incoming messages were received on this phone; for ones you sent show just Sent and the status.
+        if (info.getStatus() == MessageStatus.RECEIVED) {
+            row(c, out, R.string.sec_r2i_received, time(info.getReceivedAtMs()));
+        }
         row(c, out, R.string.sec_r2i_status, c.getString(word(info.getStatus())));
 
         if (!info.getDeliveries().isEmpty()) {
