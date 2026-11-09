@@ -410,7 +410,11 @@ internal class MediaCoordinator(
             "rcvFileError", "rcvFileSndCancelled", "sndFileError", "sndFileCancelled" -> {
                 if (ev.tag.startsWith("rcv") && file != null) ledger.remove(file.fileId)
                 forget(item.chatId, item.itemId)
-                SecuredLog.w(Ev.MEDIA_FAILED, file?.let { FileStatusMapper.map(it, !it.statusTag.startsWith("rcv")).failure?.name } ?: ev.tag)
+                // Failure plus the core's error type (auth, blocked, noFile, relay, other): fixed tokens, never its text.
+                SecuredLog.w(Ev.MEDIA_FAILED, file?.let { f ->
+                    val failure = FileStatusMapper.map(f, !f.statusTag.startsWith("rcv")).failure?.name
+                    listOfNotNull(failure, f.errorTag, f.errorWords).joinToString(".")
+                } ?: ev.tag)
             }
             // Still moving (a retry): nothing new to show.
             "rcvFileWarning", "sndFileWarning" -> {

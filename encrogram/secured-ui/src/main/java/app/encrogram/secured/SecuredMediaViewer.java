@@ -143,6 +143,8 @@ final class SecuredMediaViewer {
     @Nullable
     private Surface surface;
     private boolean prepared, completed, dragging, videoFailed;
+    /** Cleared when the screen pauses before the video is ready, so it does not start behind the lock screen. */
+    private boolean mayPlay = true;
     private int videoW, videoH, durationMs;
     private final Runnable progressTick = this::tick;
 
@@ -464,8 +466,13 @@ final class SecuredMediaViewer {
         try {
             final MediaPlayer p = new MediaPlayer();
             player = p;
-            p.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build());
+            final AudioAttributes.Builder ab = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Other apps may not record what a Secured video plays.
+                ab.setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE);
+            }
+            p.setAudioAttributes(ab.build());
             dataSource = new ReaderDataSource(playback.getReader());
             p.setDataSource(dataSource);
             p.setSurface(surface);
@@ -474,6 +481,10 @@ final class SecuredMediaViewer {
                 prepared = true;
                 durationMs = Math.max(0, mp.getDuration());
                 if (seekBar != null) seekBar.setEnabled(durationMs > 0);
+                if (!mayPlay) {
+                    updatePlayIcon();
+                    return;
+                }
                 try {
                     mp.start();
                 } catch (Throwable t) {
@@ -554,6 +565,7 @@ final class SecuredMediaViewer {
                     p.seekTo(0);
                     completed = false;
                 }
+                mayPlay = true;
                 p.start();
                 AndroidUtilities.cancelRunOnUIThread(progressTick);
                 AndroidUtilities.runOnUIThread(progressTick, 250);
@@ -566,6 +578,7 @@ final class SecuredMediaViewer {
     }
 
     private void pauseVideo() {
+        mayPlay = false;
         final MediaPlayer p = player;
         if (p == null || !prepared || closed) return;
         try {

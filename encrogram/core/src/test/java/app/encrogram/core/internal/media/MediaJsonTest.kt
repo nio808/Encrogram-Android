@@ -201,4 +201,16 @@ class MediaJsonTest {
         assertEquals(9, i.durationSeconds)
         assertEquals(MediaKind.VIDEO, i.file!!.kind)
     }
+
+    @Test
+    fun errorWordsKeepOnlyAllowlistedTokens() {
+        assertEquals("XFTP-FILE_IO", MediaJson.errorWords("error XFTP FILE_IO on chunk"))
+        assertEquals("INTERNAL-ENOENT", MediaJson.errorWords("INTERNAL \"/data/user/0/x/files/Holiday PHOTO.jpg: does not exist\""))
+        assertEquals("EACCES", MediaJson.errorWords("openFile: permission denied"))
+        // Names, paths and unknown capitals never come through.
+        assertNull(MediaJson.errorWords("ALICE sent SECRET_PLAN.pdf"))
+        assertNull(MediaJson.errorWords(null))
+        // At most three words plus the errno phrases, no repeats.
+        assertEquals("AUTH-BLOCKED-QUOTA", MediaJson.errorWords("AUTH AUTH BLOCKED QUOTA SIZE DIGEST"))
+    }
 }

@@ -82,6 +82,7 @@ internal object MediaJson {
             progressTotal = total.coerceAtLeast(0L),
             errorTag = errorTag,
             errorHint = hint,
+            errorWords = if (errorTag == "other") errorWords(errorJson?.str("fileError")) else null,
         )
     }
 
@@ -92,6 +93,27 @@ internal object MediaJson {
         SIZE_TOKEN.containsMatchIn(text) -> FileErrorHint.SIZE
         text.contains("file digest") -> FileErrorHint.DIGEST
         else -> null
+    }
+
+    /** Error words of the core and its agent that may appear in a FileError text; anything else is never kept. */
+    private val ERROR_WORDS = setOf(
+        "INTERNAL", "CRYPTO", "FILE", "CMD", "SESSION", "HAS_FILE", "NO_FILE", "AUTH", "BLOCKED", "QUOTA", "SIZE", "DIGEST",
+        "TIMEOUT", "NETWORK", "HOST", "TRANSPORT", "VERSION", "PROXY", "NO_SERVER", "DUPLICATE", "XFTP", "BROKER", "AGENT",
+        "CONN", "SMP", "NOT_AVAILABLE", "UNEXPECTED", "LARGE_MSG", "NO_SERVICE", "INACTIVE", "RESPONSE", "IO",
+        "BLOCK", "HANDSHAKE", "FILE_IO", "DUPLICATE_", "PROHIBITED", "SYNTAX", "NO_AUTH", "HAS_AUTH", "NO_ENTITY",
+    )
+    private val WORD = Regex("[A-Z][A-Z_]{1,15}")
+
+    /** Up to three distinct allowlisted words, joined with '-', for a log tag (support diagnosis); null when none. */
+    fun errorWords(text: String?): String? {
+        if (text == null) return null
+        val words = WORD.findAll(text).map { it.value }.filter { it in ERROR_WORDS }.distinct().take(3).toList()
+        val extra = buildList {
+            if (text.contains("does not exist")) add("ENOENT")
+            if (text.contains("ermission denied")) add("EACCES")
+            if (text.contains("o space left")) add("ENOSPC")
+        }
+        return (words + extra).take(4).joinToString("-").ifEmpty { null }
     }
 
     /** msgContent.image when it is a jpg, jpeg or png data URL of at most [MAX_PREVIEW_CHARS] characters; else null. */

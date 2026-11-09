@@ -82,6 +82,8 @@ abstract class SecuredMediaCell extends View {
     protected SecuredMedia media;
     protected boolean out;
     protected boolean pinnedTop;
+    /** Joined to the bubble below (its caption, or the same sender's next message): no avatar, joined corners. */
+    protected boolean pinnedBottom;
     /** A caption bubble is joined under this one: no time here, square bottom corners. */
     protected boolean captionBelow;
     protected boolean group;
@@ -154,9 +156,10 @@ abstract class SecuredMediaCell extends View {
 
     /**
      * Binds a media message. {@code captionBelow}: its caption is shown as a joined text bubble under this one.
+     * {@code pinnedBottom}: joined to the next bubble of the same run (always true with a caption below).
      * {@code group}: incoming bubbles get the avatar column and the sender's name.
      */
-    final void bind(SecuredMessage m, boolean pinnedTop, boolean captionBelow, boolean group, boolean notes) {
+    final void bind(SecuredMessage m, boolean pinnedTop, boolean pinnedBottom, boolean captionBelow, boolean group, boolean notes) {
         final boolean sameMessage = message != null && m != null && message.getMessageId() == m.getMessageId();
         final boolean sameFile = sameMessage && media != null && m.getMedia() != null && media.getState() == m.getMedia().getState();
         message = m;
@@ -164,6 +167,7 @@ abstract class SecuredMediaCell extends View {
         out = m.getOutgoing();
         this.pinnedTop = pinnedTop;
         this.captionBelow = captionBelow;
+        this.pinnedBottom = pinnedBottom || captionBelow;
         this.group = group;
         this.notes = notes;
         if (!sameFile && media != null) {
@@ -288,7 +292,7 @@ abstract class SecuredMediaCell extends View {
         contentInsets(insets);
         final int header = headerHeight();
         final int top = pinnedTop ? dp(1) : dp(4);
-        final int bottomGap = captionBelow ? dp(1) : dp(4);
+        final int bottomGap = pinnedBottom ? dp(1) : dp(4);
         final int contentH = contentHeight(bw);
         final int bodyH = header + insets.top + contentH + insets.bottom;
         final float left = out ? width - dp(11) - bw : leftOffset() + dp(11);
@@ -348,8 +352,8 @@ abstract class SecuredMediaCell extends View {
         drawHeader(canvas);
         drawContent(canvas);
         if (!captionBelow) drawTime(canvas);
-        if (drawAvatar && !captionBelow) {
-            // The last bubble of a sender's run gets the avatar (a joined caption bubble draws it instead).
+        if (drawAvatar && !pinnedBottom) {
+            // Only the last bubble of a sender's run gets the avatar (a joined caption bubble draws it instead).
             final int size = dp(42);
             final int bottom = (int) body.bottom;
             avatar.setBounds(dp(6) + (checkBoxVisible ? dp(35) : 0), bottom - size, dp(6) + (checkBoxVisible ? dp(35) : 0) + size, bottom);
@@ -390,7 +394,7 @@ abstract class SecuredMediaCell extends View {
         final View parent = getParent() instanceof View ? (View) getParent() : null;
         final int parentW = parent != null ? parent.getMeasuredWidth() : getMeasuredWidth();
         final int parentH = parent != null ? parent.getMeasuredHeight() : getMeasuredHeight();
-        bubble.setTop(getTop(), parentW, parentH, pinnedTop, captionBelow);
+        bubble.setTop(getTop(), parentW, parentH, pinnedTop, pinnedBottom);
         bubble.setBounds(bounds);
         bubble.draw(canvas);
         final Drawable shadow = bubble.getShadowDrawable();

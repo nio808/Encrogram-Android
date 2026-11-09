@@ -90,6 +90,10 @@ final class SecuredPhotoCell extends SecuredMediaCell {
                 animated = null;
                 animReq = NONE;
             }
+            // A decode that came back empty is tried again once per new state, never on every draw.
+            if (full == null) fullReq = NONE;
+            if (animated == null && still == null) animReq = NONE;
+            if (preview == null) previewReq = NONE;
         }
         action.setProgress(progressFraction(), false);
     }

@@ -5,6 +5,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -52,6 +53,8 @@ final class SecuredAudioPlayer {
     private MediaPlayer player;
     private boolean prepared;
     private boolean playing;
+    /** False once the user paused (or the screen did) while the file was still opening: then it must not start. */
+    private boolean mayPlay;
 
     private AudioFocusRequest focusRequest;
 
@@ -134,6 +137,7 @@ final class SecuredAudioPlayer {
 
     /** Pause only; the message stays loaded so play resumes from here. */
     void pause() {
+        mayPlay = false;
         if (!playing) return;
         playing = false;
         handler.removeCallbacks(tick);
@@ -155,6 +159,7 @@ final class SecuredAudioPlayer {
         handler.removeCallbacks(tick);
         playing = false;
         prepared = false;
+        mayPlay = false;
         pendingFraction = -1f;
         hasCurrent = false;
         final MediaPlayer p = player;
@@ -196,6 +201,7 @@ final class SecuredAudioPlayer {
         curChat = m.getChatId();
         curMessage = m.getMessageId();
         pendingFraction = fraction;
+        mayPlay = true;
         final int gen = generation;
         notifyCurrent();
         try {
@@ -224,10 +230,7 @@ final class SecuredAudioPlayer {
             dataSource = new ReaderDataSource(pb.getReader());
             final MediaPlayer p = new MediaPlayer();
             player = p;
-            p.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build());
+            p.setAudioAttributes(attributes());
             p.setOnPreparedListener(mp -> onPrepared());
             p.setOnCompletionListener(mp -> onCompleted());
             p.setOnErrorListener((mp, what, extra) -> {
@@ -255,11 +258,16 @@ final class SecuredAudioPlayer {
                 return;
             }
         }
-        startPlaying();
+        if (mayPlay) {
+            startPlaying();
+        } else {
+            notifyCurrent();
+        }
     }
 
     private void startPlaying() {
         if (!prepared || player == null) return;
+        mayPlay = true;
         requestFocus();
         try {
             player.start();
@@ -290,10 +298,7 @@ final class SecuredAudioPlayer {
         if (am == null) return;
         if (focusRequest == null) {
             focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build())
+                    .setAudioAttributes(attributes())
                     .setOnAudioFocusChangeListener(change -> {
                         if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
                             pause();
@@ -318,6 +323,17 @@ final class SecuredAudioPlayer {
 
     // ---- helpers ---------------------------------------------------------------------------------------------
 
+    /** Speech for media playback; other apps may not record it (Android 10 and later). */
+    private static AudioAttributes attributes() {
+        final AudioAttributes.Builder b = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            b.setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE);
+        }
+        return b.build();
+    }
+
     private int duration() {
         try {
             return player != null && prepared ? player.getDuration() : 0;
@@ -330,7 +346,7 @@ final class SecuredAudioPlayer {
         return isCurrent(m.getChatId(), m.getMessageId());
     }
 
-    private boolean isCurrent(long chatId, long messageId) {
+    boolean isCurrent(long chatId, long messageId) {
         return hasCurrent && curChat == chatId && curMessage == messageId;
     }
 

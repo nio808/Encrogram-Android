@@ -40,6 +40,8 @@ internal data class CoreFile(
     /** From fixed tokens in an `other` error's text; the text itself is dropped in MediaJson. */
     val errorHint: FileErrorHint? = null,
     val local: LocalFacts = LocalFacts.NONE,
+    /** Up to three fixed protocol words from the error text (INTERNAL, FILE, SESSION...), for the log only; never the text. */
+    val errorWords: String? = null,
 ) {
     override fun toString() = "CoreFile($fileId,$kind,$statusTag,$protocol)"
 }

@@ -315,7 +315,15 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         public void onMessageChanged(SecuredMessage message) {
             if (message.getChatId() != chatId || destroyed) return;
             // A new media state carries its own byte count: forget the live one.
-            liveProgress.remove(message.getMessageId());
+            final long id = message.getMessageId();
+            liveProgress.remove(id);
+            final int idx = indexOf(id);
+            if (idx >= 0 && messages.get(idx).getMedia() != null && (message.getDeleted() || message.getMedia() == null)) {
+                // Deleted for everyone (or its file withdrawn): close what still shows or plays it.
+                SecuredMediaViewer.closeFor(chatId, java.util.Collections.singletonList(id));
+                if (bitmaps != null) bitmaps.forget(chatId, id);
+                if (audio != null && audio.isCurrent(chatId, id)) audio.release();
+            }
             upsertMessage(message, false);
         }
 
@@ -2364,7 +2372,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         for (Long id : gone) {
             liveProgress.remove(id);
             if (bitmaps != null) bitmaps.forget(chatId, id);
-            if (audio != null && audio.isPlaying(chatId, id)) audio.release();
+            if (audio != null && audio.isCurrent(chatId, id)) audio.release();
         }
         boolean changed = false;
         for (int i = messages.size() - 1; i >= 0; i--) {
@@ -2873,7 +2881,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             } else if (view instanceof SecuredMediaCell) {
                 final SecuredMediaCell cell = (SecuredMediaCell) view;
                 final boolean captionBelow = r.pinnedBottom && position + 1 < rows.size() && rows.get(position + 1).caption;
-                cell.bind(r.message, r.pinnedTop, captionBelow, groupChat, notes);
+                cell.bind(r.message, r.pinnedTop, r.pinnedBottom, captionBelow, groupChat, notes);
                 final long[] live = liveProgress.get(r.message.getMessageId());
                 if (live != null) cell.setProgress(live[0], live[1]);
                 final boolean selecting = !selectedIds.isEmpty();

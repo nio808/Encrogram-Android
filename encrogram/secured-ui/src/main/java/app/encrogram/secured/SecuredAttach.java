@@ -54,7 +54,8 @@ final class SecuredAttach {
     private AlertDialog spinner;
     private SecuredSendMediaSheet sendSheet;
     private boolean preparing;
-    private boolean cancelled;           // the user backed out of the spinner while prepareMedia was running
+    /** Bumped when the user backs out of the spinner: a prepareMedia result from an older run is discarded. */
+    private int prepareRun;
     private boolean destroyed;
 
     SecuredAttach(Host host) {
@@ -69,7 +70,7 @@ final class SecuredAttach {
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false, host.resources());
         builder.setItems(
                 new CharSequence[]{context.getString(R.string.secmedia_attach_gallery), context.getString(R.string.secmedia_attach_file)},
-                new int[]{org.telegram.messenger.R.drawable.msg_photos, org.telegram.messenger.R.drawable.msg_filehq},
+                new int[]{org.telegram.messenger.R.drawable.msg_photos, org.telegram.messenger.R.drawable.msg_sendfile},
                 (dialog, which) -> start(which == 0 ? REQUEST_GALLERY : REQUEST_FILE));
         final BottomSheet sheet = builder.create();
         menu = sheet;
@@ -142,22 +143,30 @@ final class SecuredAttach {
         final Activity activity = host.fragment().getParentActivity();
         if (activity == null) return;
         preparing = true;
-        cancelled = false;
+        final int run = ++prepareRun;
         final AlertDialog d = new AlertDialog(activity, AlertDialog.ALERT_TYPE_SPINNER, host.resources());
         spinner = d;
         d.setCanceledOnTouchOutside(false);
         d.setCancelable(true);   // Back: the result is discarded when it arrives
-        d.setOnCancelListener(x -> cancelled = true);
+        d.setOnCancelListener(x -> {
+            // Back on the spinner: the user may pick again at once; this run's result is thrown away.
+            prepareRun++;
+            preparing = false;
+            if (spinner == d) spinner = null;
+        });
         Kit.secure(d);
         d.show();
         host.engine().prepareMedia(new MediaInput.Picked(uri, asFile), result -> {
-            preparing = false;
-            final AlertDialog s = spinner;
-            spinner = null;
-            if (s != null && s.isShowing()) s.dismiss();
+            final boolean current = run == prepareRun;
+            if (current) {
+                preparing = false;
+                final AlertDialog s = spinner;
+                spinner = null;
+                if (s != null && s.isShowing()) s.dismiss();
+            }
             if (result instanceof SecuredResult.Ok) {
                 final app.encrogram.core.api.PreparedMedia prepared = ((SecuredResult.Ok<PreparedMedia>) result).getValue();
-                if (destroyed || cancelled || host.fragment().getParentActivity() == null) {
+                if (destroyed || !current || host.fragment().getParentActivity() == null) {
                     host.engine().discardMedia(prepared);
                     return;
                 }
@@ -166,7 +175,7 @@ final class SecuredAttach {
                 sheet.show(() -> {
                     if (sendSheet == sheet) sendSheet = null;
                 });
-            } else if (!destroyed && !cancelled) {
+            } else if (!destroyed && current) {
                 host.onMediaFailed(((SecuredResult.Err) result).getError());
             }
         });
