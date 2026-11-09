@@ -25,6 +25,12 @@ class CommandsTest {
     }
 
     @Test
+    fun itemInfoForGroupItemsOnly() {
+        assertEquals("/_get item info #3 7", Commands.itemInfo(ChatRef.group(3), 7))
+        assertTrue(runCatching { Commands.itemInfo(ChatRef.contact(5), 7) }.isFailure)
+    }
+
+    @Test
     fun createUser() {
         val cmd = Commands.createUser("Zoë 🌸")
         assertTrue(ascii(cmd))

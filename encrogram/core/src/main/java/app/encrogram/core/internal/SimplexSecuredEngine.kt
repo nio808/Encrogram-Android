@@ -160,6 +160,14 @@ internal class SimplexSecuredEngine(
     private var reconnectGen = 0L
     @Volatile private var online = true
 
+    /** Our own group messages sent with nobody to send them to ([NoRecipientCheck]): engine thread. */
+    private val noRecipients = NoRecipientCheck(
+        { item -> refOf(item.chatId)?.takeIf { it.isGroup }?.let { send(Commands.itemInfo(it, item.itemId)) } ?: CoreReply.Invalid },
+        System::currentTimeMillis,
+    )
+    /** Bumped at each stop, so a check queued in an earlier run does nothing. */
+    private var noRecipientGen = 0L
+
     /** [lastShown] results: chat id -> (that chat's newest item id when looked up, the item found or null). */
     private val previewCache = HashMap<Long, Pair<Long, CoreItem?>>()
     /** A list reload ran less than [REFRESH_WINDOW_MS] ago; [refreshOwed]: events asked for another one meanwhile. */
@@ -364,6 +372,7 @@ internal class SimplexSecuredEngine(
                     val items = InputRules.pageWindow(localView(CoreJson.parseChatItemsOfChat(r.body)), page, want)
                     val role = roleIn(chatId)
                     ok(callback, items.map { MessageMapper.toMessage(it, role) })
+                    watchNoRecipients(items)
                 } else {
                     err(callback, unexpected(r))
                 }
@@ -3331,6 +3340,8 @@ internal class SimplexSecuredEngine(
         foreignUnsaved.clear()
         memberIdCache.clear()
         previewCache.clear()
+        noRecipients.clear()
+        noRecipientGen++
         refreshWindowOpen = false
         refreshOwed = false
         noteFolderId = null
@@ -3448,6 +3459,7 @@ internal class SimplexSecuredEngine(
                 "chatItemsStatusesUpdated" -> {
                     val items = CoreJson.parseChatItems(reply.body).filter { it.isMessage }
                     if (items.isNotEmpty()) {
+                        noRecipients.settled(items)
                         main.post { for (i in items) for (l in listeners) l.onMessageStatusChanged(i.chatId, i.itemId, i.status) }
                         applyStatuses(items)
                     }
@@ -3604,7 +3616,30 @@ internal class SimplexSecuredEngine(
      * this phone knows about their files ([MediaCoordinator.annotate]; nothing to do for items without one).
      */
     private fun localView(items: List<CoreItem>): List<CoreItem> =
-        media.annotate(GroupRules.markJoinHistory(GroupRules.markOwnHistory(withLinkJoins(items)) { earlierProofs[it] }) { joinAcceptedAt[it] })
+        noRecipients.apply(media.annotate(GroupRules.markJoinHistory(GroupRules.markOwnHistory(withLinkJoins(items)) { earlierProofs[it] }) { joinAcceptedAt[it] }))
+
+    /**
+     * Our own group messages still `sndNew` among items being shown (a chat page, row previews, items just sent): each
+     * asked about once ([NoRecipientCheck]), after the page or row has gone out, and young ones only once they are old
+     * enough, by when a normal send has long left the clock.
+     */
+    private fun watchNoRecipients(items: List<CoreItem>) {
+        if (state != EngineState.RUNNING) return
+        val due = noRecipients.take(items)
+        val gen = noRecipientGen
+        if (due.now.isNotEmpty()) post { checkNoRecipients(due.now, gen) }
+        if (due.later.isNotEmpty()) main.postDelayed({ post { checkNoRecipients(due.later, gen) } }, due.laterDelayMs)
+    }
+
+    /** One tick for each message the core confirms had no recipients: the usual status change, in the chat and its row. */
+    private fun checkNoRecipients(items: List<CoreItem>, gen: Long) {
+        if (gen != noRecipientGen || state != EngineState.RUNNING) return
+        val changed = noRecipients.check(items)
+        if (changed.isEmpty()) return
+        SecuredLog.i(Ev.ITEM_ACTION, "no_recipients", changed.size)
+        main.post { for (i in changed) for (l in listeners) l.onMessageStatusChanged(i.chatId, i.itemId, i.status) }
+        applyStatuses(changed)
+    }
 
     /**
      * Our own sent messages in an ended group row ([GroupRules.ownSent] over its newest [OWN_SENT_READ] items: a rejoin's
@@ -3733,6 +3768,7 @@ internal class SimplexSecuredEngine(
         ownSentCache.keys.retainAll(earlierRows.values.flatMapTo(HashSet()) { rows -> rows.map { it.groupId } })
         earlierProofs = earlierRows.mapValues { (_, rows) -> GroupRules.ownProofs(rows) { ownSentOf(it) } }.filterValues { it.isNotEmpty() }
         ownHistorySwept.keys.retainAll(earlierProofs.keys)
+        val previews = ArrayList<CoreItem>()
         for (listed in groups) {
             val id = listed.group.chatId
             groupCache[id] = listed.group
@@ -3743,8 +3779,12 @@ internal class SimplexSecuredEngine(
             val unread = listed.unreadCount - sweepHistory(listed.group, listed.unreadCount)
             val chat = listed.copy(lastItem = last, unreadCount = unread.coerceAtLeast(0))
             chatCache[id] = MessageMapper.groupSummary(chat, archive.isArchived(id), ForeignRelays.chatMarked(marks, id))
-            chat.lastItem?.takeIf { it.shown }?.let { lastItemIds[id] = it.itemId }
+            chat.lastItem?.takeIf { it.shown }?.let {
+                lastItemIds[id] = it.itemId
+                previews.add(it)
+            }
         }
+        watchNoRecipients(previews)
         // Saved Messages: the user's note folder (the core creates one with every user).
         val notes = CoreJson.parseNoteChat(r.body)
         noteFolderId = notes?.folder?.noteFolderId
@@ -3766,6 +3806,7 @@ internal class SimplexSecuredEngine(
      */
     private fun applyNewItems(items: List<CoreItem>) {
         if (items.isNotEmpty()) markChanged()
+        watchNoRecipients(items)
         var changed = false
         var unknownChat = false
         for (item in items) {
@@ -3795,7 +3836,8 @@ internal class SimplexSecuredEngine(
     /** Delivery ticks of a row's last message. */
     private fun applyStatuses(items: List<CoreItem>) {
         var changed = false
-        for (item in items) {
+        // A finished upload of a message that had no recipients: one tick in the row too, as in the chat (localView).
+        for (item in noRecipients.apply(items)) {
             if (!item.outgoing || lastItemIds[item.chatId] != item.itemId) continue
             previewCache.remove(item.chatId)
             val row = chatCache[item.chatId] ?: continue

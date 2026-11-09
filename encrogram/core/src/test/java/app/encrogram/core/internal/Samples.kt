@@ -146,6 +146,22 @@ object Samples {
         {"chatInfo":{"type":"direct","contact":${contact(5, "Bob", "ready")}},
          "chatItem":${chatItem(41, "directSnd", "sndMsgContent", "hi", "sndRcvd")}}]}}"""
 
+    /**
+     * chatItemInfo (APIGetChatItemInfo, Commands.hs:687-696; ChatItemInfo, Messages.hs:1345-1350) for our own item
+     * [itemId] in group 3. [statuses] is memberDeliveryStatuses, left out when null as the core leaves out Nothing.
+     */
+    fun chatItemInfo(itemId: Long, statuses: String? = null, status: String = "sndNew", dir: String = "groupSnd") =
+        """{"result":{"type":"chatItemInfo","user":$USER,
+        "chatItem":{"chatInfo":{"type":"group","groupInfo":{"groupId":3}},
+          "chatItem":${chatItem(itemId, dir, if (dir == "groupSnd") "sndMsgContent" else "rcvMsgContent", "hi", status)}},
+        "chatItemInfo":{"itemVersions":[{"chatItemVersionId":$itemId,"msgContent":{"type":"text","text":"hi"},
+          "itemVersionTs":"2026-11-07T10:20:30Z","createdAt":"2026-11-07T10:20:30Z"}],${
+            if (statuses != null) "\"memberDeliveryStatuses\":$statuses," else ""}"fileXftpServers":[]}}}"""
+
+    /** One MemberDeliveryStatus (Messages.hs:1375-1380): a member row of a group item. */
+    fun memberStatus(groupMemberId: Long, status: String) =
+        """{"groupMemberId":$groupMemberId,"memberDeliveryStatus":{"type":"$status"},"sentViaProxy":false}"""
+
     val API_CHATS = """{"result":{"type":"apiChats","user":$USER,"chats":[
         {"chatInfo":{"type":"direct","contact":${contact(5, "Bob", "ready", code = true)}},
          "chatItems":[${chatItem(41, "directSnd", "sndMsgContent", "hi", "sndSent")}],

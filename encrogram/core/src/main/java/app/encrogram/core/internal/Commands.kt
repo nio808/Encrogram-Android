@@ -309,6 +309,15 @@ internal object Commands {
         return "/_read chat items $chat ${itemIds.joinToString(",")}"
     }
 
+    /**
+     * APIGetChatItemInfo (`/_get item info <chatRef> <itemId>`, Commands.hs:5452; handler :687-696) -> `chatItemInfo`
+     * {chatItem, chatItemInfo}. Reads this phone's store only. Used for our own group items ([NoRecipientCheck]).
+     */
+    fun itemInfo(chat: ChatRef, itemId: Long): String {
+        require(chat.isGroup) { "group items only" }
+        return "/_get item info $chat $itemId"
+    }
+
     /** APIDeleteChat for a contact, without notifying anyone. Used only for preset contact cards. */
     fun deleteContactQuietly(contactId: Long): String = "/_delete @$contactId full notify=off"
 

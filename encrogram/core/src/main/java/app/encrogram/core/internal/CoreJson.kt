@@ -534,6 +534,19 @@ internal object CoreJson {
         return parseChatItem(chatId, aChatItem.optJSONObject("chatItem"), peerNameOf(info), joinedByLink(group), joinedAtMs(group))
     }
 
+    /**
+     * A `chatItemInfo` reply ([Commands.itemInfo]): the item as the core holds it now, and whether nobody was ever sent
+     * it. ChatItemInfo.memberDeliveryStatuses (Messages.hs:1345-1350) is `L.nonEmpty` of a group item's member rows
+     * (Commands.hs:691-693) and is left out when Nothing (defaultJSON omitNothingFields), so it is missing exactly
+     * when the item has no member row. Any other shape counts as recipients. Null when the reply holds no item or info.
+     */
+    fun parseItemInfo(body: JSONObject): Pair<CoreItem, Boolean>? {
+        val item = parseAChatItem(body.optJSONObject("chatItem")) ?: return null
+        val info = body.optJSONObject("chatItemInfo") ?: return null
+        val key = "memberDeliveryStatuses"
+        return item to (info.isNull(key) || info.optJSONArray(key)?.length() == 0)
+    }
+
     /** membership.createdAt of a GroupInfo (when our membership began on this phone), 0 when absent. */
     fun joinedAtMs(groupInfo: JSONObject?): Long = timeMs(groupInfo?.optJSONObject("membership")?.str("createdAt"))
 
