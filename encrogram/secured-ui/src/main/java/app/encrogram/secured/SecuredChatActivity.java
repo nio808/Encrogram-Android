@@ -2961,7 +2961,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static SecuredMessage withStatus(SecuredMessage m, MessageStatus status) {
         return new SecuredMessage(m.getChatId(), m.getMessageId(), m.getOutgoing(), m.getText(), m.getTimeMs(), status,
                 m.getReplyTo(), m.getEdited(), m.getDeleted(), m.getCanEdit(), m.getCanDeleteForEveryone(),
-                m.getForwarded(), m.getReactions(), m.getExpiresAtMs(), m.getSender(), m.getEvent(), m.getMedia());
+                m.getForwarded(), m.getReactions(), m.getExpiresAtMs(), m.getSender(), m.getEvent(), m.getMedia(),
+                m.getHistory(), m.getMentions(), m.getMentionsMe(), m.getUnread());
     }
 
     private MessageObject objectFor(SecuredMessage m) {
@@ -3068,7 +3069,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static SecuredMessage captionOf(SecuredMessage m) {
         return new SecuredMessage(m.getChatId(), m.getMessageId(), m.getOutgoing(), m.getText(), m.getTimeMs(), m.getStatus(),
                 null, m.getEdited(), m.getDeleted(), false, m.getCanDeleteForEveryone(),
-                false, m.getReactions(), m.getExpiresAtMs(), m.getSender(), null, null);
+                false, m.getReactions(), m.getExpiresAtMs(), m.getSender(), null, null,
+                m.getHistory(), m.getMentions(), m.getMentionsMe(), m.getUnread());
     }
 
     /** One line for the reply strip and quotes: the text, or "Photo", "Video"... for media without a caption. */
