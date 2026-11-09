@@ -18,7 +18,7 @@ import javax.crypto.spec.GCMParameterSpec
  * encrypted with a non-exportable Android Keystore AES-256-GCM key, in our own SharedPreferences file
  * ("encrogram_secured_keys"). Nothing here is ever logged.
  */
-internal class DbKeyStore(context: Context) {
+internal class DbKeyStore(private val context: Context) {
 
     class KeyFailure(val reason: String) : Exception(reason)
 
@@ -69,6 +69,29 @@ internal class DbKeyStore(context: Context) {
         }
         if (!prefs.edit().putString(KEY_CIPHERTEXT, ct).putString(KEY_IV, iv).commit()) throw KeyFailure("key_not_saved")
         SecuredLog.i(SecuredLog.Ev.DB_KEY_CREATED, "replaced")
+    }
+
+    /**
+     * "Reset Secured" (b3): forgets the passphrase (our own prefs file is emptied, then deleted) and deletes its Keystore
+     * key. Only this file and alias: never another preference file. False when the passphrase couldn't be removed; a
+     * Keystore key that can't be deleted is only logged (with no passphrase left it unlocks nothing).
+     */
+    fun wipe(): Boolean {
+        val cleared = prefs.edit().clear().commit()
+        try {
+            val ks = keyStore()
+            if (ks.containsAlias(KEY_ALIAS)) ks.deleteEntry(KEY_ALIAS)
+        } catch (e: Exception) {
+            SecuredLog.crash(SecuredLog.Ev.DB_KEY_FAILED, e)
+        }
+        if (cleared) {
+            try {
+                context.deleteSharedPreferences(PREFS_NAME)
+            } catch (e: Exception) {
+                SecuredLog.crash(SecuredLog.Ev.DB_KEY_FAILED, e)
+            }
+        }
+        return cleared
     }
 
     /** A new random passphrase in the same form as [obtain] makes (32 random bytes, base64). */

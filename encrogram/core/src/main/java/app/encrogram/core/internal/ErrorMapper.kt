@@ -58,6 +58,15 @@ internal object ErrorMapper {
     const val ALREADY_JOINING = "You're already joining this group. It appears in your chats once it connects."
     const val UNSUPPORTED_GROUP_LINK = "This link is for a kind of channel Encrogram doesn't support."
 
+    // ---- the database key lost, and "Reset Secured" (b3) ----
+    const val KEY_LOST = "Secured's key on this phone can't be read, so its data can't be opened. If restarting the phone doesn't help, " +
+        "reset Secured to start again. If you saved your 12 words, they bring your account back."
+    const val RESET_INCOMPLETE = "Some Secured files couldn't be deleted. Try the reset again."
+    const val RESET_RUNNING = "Secured is already being reset."
+
+    /** The passphrase that opens the existing databases is gone or can't be decrypted ([DbKeyStore] key_missing / key_unreadable). */
+    fun keyLost(): SecuredError = SecuredError(Kind.KEY_LOST, KEY_LOST)
+
     // ---- relays we don't run (b1) ----
     const val FOREIGN_RELAY_CONTACT = "This contact uses a server Encrogram doesn't use, so messages to them are paused."
     const val FOREIGN_RELAY_GROUP = "Someone in this group uses a server Encrogram doesn't use, so sending here is paused until an admin removes them."

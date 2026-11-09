@@ -3,6 +3,7 @@ package app.encrogram.core.internal
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import app.encrogram.core.background.SecuredNotifier
 import app.encrogram.core.api.BackupInfo
 import app.encrogram.core.api.BackupState
 import app.encrogram.core.api.ChatAction
@@ -64,6 +65,7 @@ import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -183,6 +185,9 @@ internal class SimplexSecuredEngine(
     /** Bumped by each start check and each stop, so a check from an earlier run stops at its next step. */
     private var relayCheckGen = 0L
 
+    /** "Reset Secured" is under way ([resetSecured]): engine thread. The state stays STARTING, so commands are refused. */
+    private var resetting = false
+
     /** Present from profile creation until our servers have been verified once: start with the network locked. */
     private val lockdownMarker: File get() = File(dataDir, LOCKDOWN_MARKER)
 
@@ -284,9 +289,12 @@ internal class SimplexSecuredEngine(
 
     override fun start() = post { startOnEngine() }
 
-    override fun stop() = post { stopOnEngine() }
+    // During a reset the engine is already stopped and reopens by itself at its end ([resetSecured]).
+    override fun stop() = post { if (resetting) SecuredLog.i(Ev.RESET, "stop_ignored") else stopOnEngine() }
 
     override fun state(): EngineState = state
+
+    override fun failure(): SecuredError? = if (state == EngineState.FAILED) lastFailure else null
 
     override fun addListener(listener: SecuredListener) {
         listeners.addIfAbsent(listener)
@@ -2693,6 +2701,107 @@ internal class SimplexSecuredEngine(
         }
     }
 
+    // ---- "Reset Secured" (b3) ---------------------------------------------------------------------------------------
+
+    /**
+     * Engine, phrase and backup threads in turn ([SecuredReset]): stop, delete everything under the data folder plus the
+     * database key, reopen an empty store. Safe in any state: a start or restore in flight finishes first (one engine
+     * thread), media work in flight gives up (generation) or is waited for (CtrlGate) by the stop.
+     */
+    override fun resetSecured(callback: SecuredCallback<Unit>) =
+        SecuredReset(::post, { hop(phraseExecutor, it) }, { hop(worker, it) }, resetSteps(callback)).run()
+
+    private fun resetSteps(callback: SecuredCallback<Unit>) = object : SecuredReset.Steps {
+        override fun begin(): Boolean {
+            if (resetting) {
+                refuse(callback, "reset_running", ErrorMapper.RESET_RUNNING)
+                return false
+            }
+            resetting = true
+            SecuredLog.w(Ev.RESET, "start")
+            return true
+        }
+
+        override fun stopEngine() {
+            cancelAutoTimer()
+            // Receiver and chat stopped, media generation bumped, the store closed inside CtrlGate.close, caches cleared.
+            stopOnEngine()
+            setState(EngineState.STARTING)
+            currentProfile = null
+            lastFailure = null
+        }
+
+        override fun wipePhrase() {
+            if (!vault.deleteAll()) SecuredLog.w(Ev.RESET, "phrase")
+        }
+
+        override fun wipeBackup() {
+            cancelAutoTimer()
+            // Again: words stored by a phrase task queued after our phrase step.
+            if (!vault.deleteAll()) SecuredLog.w(Ev.RESET, "phrase_late")
+            publishBackupState { BackupState() }
+        }
+
+        override fun wipeFiles(): Boolean {
+            // In-memory state first; the empty files these write are then deleted with the folder.
+            media.onStoreReplaced()
+            archive.retainIf { false }
+            linkJoins.retainIf { false }
+            foreignStore.retainIf { false }
+            foreignUnsaved.clear()
+            pendingCache = null
+            repairSinceCache = Long.MAX_VALUE
+            lastAutoSync.clear()
+            syncRechecks.clear()
+            val files = SecuredReset.deleteTree(dataDir)
+            backupStore.forget()
+            val key = DbKeyStore(appContext).wipe()
+            SecuredNotifier.clearAll(appContext)
+            if (!files) SecuredLog.e(Ev.RESET, "files")
+            if (!key) SecuredLog.e(Ev.RESET, "key")
+            return files && key
+        }
+
+        override fun reopen(): SecuredError? = try {
+            loadNative()
+            openDatabase()
+            startReceiver()
+            currentProfile = null
+            setState(EngineState.NEEDS_PROFILE)
+            null
+        } catch (f: StartFailure) {
+            SecuredLog.e(Ev.RESET, "reopen_" + f.logTag)
+            f.error
+        }
+
+        override fun end(error: SecuredError?) {
+            resetting = false
+            if (error == null) {
+                SecuredLog.w(Ev.RESET, "done")
+                ok(callback, Unit)
+            } else {
+                failClosed(StartFailure(error, "reset"))
+                err(callback, error)
+            }
+        }
+    }
+
+    /** Runs [task] on [exec] behind what is queued there; on this thread when [exec] refuses it. */
+    private fun hop(exec: ExecutorService, task: () -> Unit) {
+        val guarded = {
+            try {
+                task()
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.RESET, t)
+            }
+        }
+        try {
+            exec.execute(guarded)
+        } catch (e: RejectedExecutionException) {
+            guarded()
+        }
+    }
+
     // ---- relays we don't run (b1, research/foreign-relays.md) ---------------------------------------------------------
 
     private fun foreignMarks(): Set<Long> = if (foreignUnsaved.isEmpty()) foreignStore.all() else foreignStore.all() + foreignUnsaved
@@ -2936,7 +3045,10 @@ internal class SimplexSecuredEngine(
             DbKeyStore(appContext).obtain(databaseExists = chatDb.exists() || agentDb.exists())
         } catch (f: DbKeyStore.KeyFailure) {
             SecuredLog.e(Ev.DB_KEY_FAILED, f.reason)
-            throw StartFailure(SecuredError(SecuredError.Kind.ENGINE, "Secured storage can't be unlocked on this device (${f.reason})."), f.reason)
+            // The databases are there but their key is gone or unreadable: only a reset helps (b3, KEY_LOST).
+            val error = if (f.reason in KEY_LOST_REASONS) ErrorMapper.keyLost()
+            else SecuredError(SecuredError.Kind.ENGINE, "Secured storage can't be unlocked on this device (${f.reason}).")
+            throw StartFailure(error, f.reason)
         }
         var (tag, c) = migrateInit(prefix, key)
         if (tag != "ok" && chatDb.exists() != agentDb.exists()) {
@@ -3876,6 +3988,8 @@ internal class SimplexSecuredEngine(
         const val LINK_JOINS_FILE = "link_joins"
         /** [ForeignRelays] marks, next to the databases. */
         const val FOREIGN_RELAYS_FILE = "foreign_relays"
+        /** [DbKeyStore.KeyFailure] reasons that mean the existing databases can never be opened again on this phone. */
+        val KEY_LOST_REASONS = setOf("key_unreadable", "key_missing")
         /** [applyNetwork]: reconnect once the default network has stayed the same this long. */
         const val RECONNECT_SETTLE_MS = 2_000L
         /**

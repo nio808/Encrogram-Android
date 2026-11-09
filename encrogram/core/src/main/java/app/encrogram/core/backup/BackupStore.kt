@@ -110,6 +110,16 @@ internal class BackupStore(private val dir: File, private val box: Box? = null) 
         return true
     }
 
+    /**
+     * "Reset Secured" (b3), after the whole folder was deleted: drops what is held in memory too (the record, the
+     * rollback counters), so the next read starts from nothing.
+     */
+    @Synchronized
+    fun forget() {
+        meta = null
+        seen.clear()
+    }
+
     /** Backup turned off: forget the schedule, time, error and server tag; keep the rollback counters and the delete queue. */
     @Synchronized
     fun reset(): Boolean {

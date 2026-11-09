@@ -135,6 +135,21 @@ interface SecuredEngine {
     /** Up to [limit] BIP39 English words starting with [prefix] (lowercase), for typing suggestions. Local only. */
     fun phraseSuggestions(prefix: String, limit: Int): List<String> = emptyList()
 
+    /**
+     * Why the engine is [EngineState.FAILED] (the error [SecuredListener.onError] carried), or null in any other state.
+     * [SecuredError.Kind.KEY_LOST]: this phone can no longer open Secured's data; only [resetSecured] helps.
+     */
+    fun failure(): SecuredError? = null
+
+    /**
+     * Deletes Secured from this phone and starts over (b3). Stops the engine, then deletes both databases, the database
+     * key and its Keystore key, every media file, the 12 words and the backup's local records, archive flags and every
+     * other Secured file, and clears Secured notifications. Contacts are not told. Telegram's files are never touched.
+     * Works when RUNNING and when FAILED; ends in [EngineState.NEEDS_PROFILE] (create a profile, or [restore] with the
+     * 12 words). Can't be undone. Fails with [SecuredError.Kind.STORAGE] when a file couldn't be deleted (try again).
+     */
+    fun resetSecured(callback: SecuredCallback<Unit>) = notYet(callback)
+
     // ---- Groups and channels (docs/groups-plan.md, first release) -----------------------------------------------
     // Group chat ids are GROUP_CHAT_ID_BASE + the core's groupId. messages, sendMessage, itemAction, chatAction and
     // markRead accept them. ChatAction.Delete on a group: the owner with notifyContact=true deletes it for everyone;
@@ -306,9 +321,10 @@ sealed class SecuredResult<out T> {
 data class SecuredError(val kind: Kind, val message: String) {
     /**
      * Media: [TOO_LARGE] (over 100 MB, or over 16 MB for readMediaBytes), [UNSUPPORTED] (send it as a file), [STORAGE] (phone full).
+     * [KEY_LOST] (b3): the phone's key storage no longer opens Secured's data; offer [SecuredEngine.resetSecured].
      * [UNAPPROVED_RELAY] also means a contact or group member is on a relay Encrogram doesn't run ([ChatSummary.foreignRelay]).
      */
-    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN, TOO_LARGE, UNSUPPORTED, STORAGE }
+    enum class Kind { ENGINE_NOT_RUNNING, NO_PROFILE, UNAPPROVED_RELAY, INVALID_LINK, OWN_LINK, WRONG_PHRASE, NO_BACKUP, NEEDS_UNLOCK, NETWORK, ENGINE, NOT_ALLOWED, UNKNOWN, TOO_LARGE, UNSUPPORTED, STORAGE, KEY_LOST }
 }
 
 data class SecuredProfile(val displayName: String)

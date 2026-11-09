@@ -44,6 +44,8 @@ internal object SecuredLog {
         MEDIA_DONE, MEDIA_FAILED, MEDIA_READ_FAILED, MEDIA_WIPED, MEDIA_IO_FAILED, MEDIA_CATCHUP,
         // Relays we don't run (b1): "marked", "cleared", "check"; never a server, a name or an id.
         FOREIGN_RELAY,
+        // "Reset Secured" (b3): step tags only.
+        RESET,
     }
 
     /** Tests only: receives every line that would be written, even while [enabled] is off (the canary test reads it). */
