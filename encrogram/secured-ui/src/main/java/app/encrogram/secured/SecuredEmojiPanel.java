@@ -101,6 +101,8 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
     private final Adapter adapter = new Adapter();
     private final EmojiColorPickerWindow picker;
     private EmojiCell touched;
+    /** Where the long press began; moves closer than 2 mm keep the current tone (as in Telegram). -10000: moved. */
+    private float touchedX = -10000, touchedY = -10000;
     private int selectedTab = -1;
 
     private static final class Item {
@@ -353,6 +355,8 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
         final int xOffset = -x;
         final int yOffset = cell.getTop() < 0 ? cell.getTop() : 0;
         picker.setupArrow(dp(AndroidUtilities.isTablet() ? 30 : 22) - xOffset + (int) AndroidUtilities.dpf2(0.5f));
+        touchedX = grid.lastX;
+        touchedY = grid.lastY;
         picker.setFocusable(true);
         picker.showAsDropDown(cell, xOffset, -cell.getMeasuredHeight() - popupHeight + (cell.getMeasuredHeight() - emojiSize) / 2 - yOffset);
         grid.hideSelector(true);
@@ -387,6 +391,7 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
 
     private final class GridView extends RecyclerListView {
         private final int[] loc = new int[2];
+        float lastX, lastY;
 
         GridView(Context context) {
             super(context, resources);
@@ -409,6 +414,13 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
                 if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
                     finishPicker();
                 } else if (a == MotionEvent.ACTION_MOVE) {
+                    if (touchedX != -10000) {
+                        if (Math.abs(touchedX - e.getX()) <= AndroidUtilities.getPixelsInCM(0.2f, true)
+                                && Math.abs(touchedY - e.getY()) <= AndroidUtilities.getPixelsInCM(0.2f, false)) {
+                            return true;
+                        }
+                        touchedX = touchedY = -10000;
+                    }
                     getLocationOnScreen(loc);
                     float x = loc[0] + e.getX();
                     picker.pickerView.getLocationOnScreen(loc);
@@ -416,6 +428,8 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
                 }
                 return true;
             }
+            lastX = e.getX();
+            lastY = e.getY();
             return super.onTouchEvent(e);
         }
     }

@@ -60,6 +60,8 @@ final class SecuredVoiceOverlay extends View {
     private final String cancelText;
 
     private boolean shown;
+    /** False while the engine prepares the file: the timer stays at zero and the dot is grey (nothing records yet). */
+    private boolean recording;
     private boolean locked;
     private long startedAt;
     private float level;
@@ -99,6 +101,7 @@ final class SecuredVoiceOverlay extends View {
         micY = micCenterY;
         slideX = slideY = 0;
         locked = false;
+        recording = false;
         level = 0;
         startedAt = SystemClock.elapsedRealtime();
         shown = true;
@@ -119,6 +122,13 @@ final class SecuredVoiceOverlay extends View {
         invalidate();
     }
 
+    /** The microphone is recording now: the timer starts from zero. */
+    void setRecording() {
+        recording = true;
+        startedAt = SystemClock.elapsedRealtime();
+        invalidate();
+    }
+
     void setLocked() {
         locked = true;
         slideX = slideY = 0;
@@ -134,7 +144,7 @@ final class SecuredVoiceOverlay extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         if (!shown) return;
-        final long elapsed = SystemClock.elapsedRealtime() - startedAt;
+        final long elapsed = recording ? SystemClock.elapsedRealtime() - startedAt : 0;
 
         // The bar replaces the composer's field (Telegram draws the panel in the message panel's colour).
         fill.setColor(color(Theme.key_chat_messagePanelBackground));
@@ -144,8 +154,8 @@ final class SecuredVoiceOverlay extends View {
         // Red dot, blinking once a second, and the timer.
         final float cy = rect.centerY();
         final float blink = (elapsed % 1000) / 1000f;
-        fill.setColor(color(Theme.key_chat_recordedVoiceDot));
-        fill.setAlpha((int) (255 * (blink < 0.5f ? 1f - blink : blink)));
+        fill.setColor(recording ? color(Theme.key_chat_recordedVoiceDot) : color(Theme.key_chat_messagePanelHint));
+        fill.setAlpha(recording ? (int) (255 * (blink < 0.5f ? 1f - blink : blink)) : 255);
         canvas.drawCircle(rect.left + dp(20), cy, dp(5), fill);
         fill.setAlpha(255);
         final long tenths = elapsed / 10;

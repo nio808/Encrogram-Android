@@ -81,6 +81,7 @@ final class SecuredVoiceRecorder implements SecuredVoiceOverlay.Listener {
     private boolean locked;
     private boolean destroyed;
     private float downX, downY;
+    private long pressedAt;
     private long startedAt;
     private float level;
     private VoiceRecording recording;
@@ -125,6 +126,7 @@ final class SecuredVoiceRecorder implements SecuredVoiceOverlay.Listener {
                 }
                 downX = e.getRawX();
                 downY = e.getRawY();
+                pressedAt = SystemClock.elapsedRealtime();
                 begin();
                 return true;
             case MotionEvent.ACTION_MOVE:
@@ -145,9 +147,14 @@ final class SecuredVoiceRecorder implements SecuredVoiceOverlay.Listener {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 if (state == State.IDLE || locked) return true;
-                final boolean longEnough = state == State.RECORDING && elapsed() >= MIN_MS;
+                final boolean recordingNow = state == State.RECORDING;
+                final boolean longEnough = recordingNow && elapsed() >= MIN_MS;
                 finish(longEnough && e.getActionMasked() == MotionEvent.ACTION_UP);
-                if (!longEnough) host.showNote(host.fragment().getContext() != null ? host.fragment().getContext().getString(R.string.secvoice_hold) : null);
+                if (!longEnough && host.fragment().getContext() != null) {
+                    // Held long enough but the engine was still preparing the file: nothing was recorded, say so.
+                    final boolean heldLong = SystemClock.elapsedRealtime() - pressedAt >= MIN_MS;
+                    host.showNote(host.fragment().getContext().getString(!recordingNow && heldLong ? R.string.secvoice_not_ready : R.string.secvoice_hold));
+                }
                 return true;
         }
         return true;
@@ -245,6 +252,7 @@ final class SecuredVoiceRecorder implements SecuredVoiceOverlay.Listener {
         }
         startedAt = SystemClock.elapsedRealtime();
         state = State.RECORDING;
+        host.overlay().setRecording();
         host.composerBar().setKeepScreenOn(true);
         AndroidUtilities.runOnUIThread(levelTick, 60);
     }

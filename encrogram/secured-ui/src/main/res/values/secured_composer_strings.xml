@@ -16,5 +16,6 @@
     <string name="secvoice_open_settings">Settings</string>
     <string name="secvoice_not_now">Not now</string>
     <string name="secvoice_failed">The microphone couldn\'t record. Try again.</string>
+    <string name="secvoice_not_ready">The recorder wasn\'t ready yet, so nothing was recorded. Try again.</string>
     <string name="secvoice_stopped">Recording stopped and deleted.</string>
 </resources>

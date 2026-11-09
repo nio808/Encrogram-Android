@@ -256,6 +256,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private boolean emojiShown;
     private boolean hidePanelWhenKeyboardOpens;
     private int keyboardHeightPort, keyboardHeightLand;
+    /** When the panel asked for the keyboard: size reports from the keyboard that was still closing are older. */
+    private long keyboardRequestedAt;
     // Voice messages (MU10): the mic shares the send button's place while the box is empty.
     private ImageView micButton;
     private SecuredVoiceOverlay voiceOverlay;
@@ -445,6 +447,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     @Override
     public View createView(Context context) {
+        // Telegram rebuilds a fragment's view on some theme changes: the old recorder and panel belong to the old view.
+        if (voice != null) voice.destroy();
+        voice = null;
+        voiceOverlay = null;
+        micButton = null;
+        emojiPanel = null;
+        emojiShown = false;
+        hidePanelWhenKeyboardOpens = false;
         Theme.createChatResources(context, false);
         hasOwnBackground = true;
         sharedResources = new ChatMessageSharedResources(context);
@@ -1256,8 +1266,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             return;
         }
         hidePanelWhenKeyboardOpens = true;
+        keyboardRequestedAt = android.os.SystemClock.elapsedRealtime();
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
-        AndroidUtilities.runOnUIThread(panelFallback, 400);
+        AndroidUtilities.runOnUIThread(panelFallback, 700);
     }
 
     /** Closes the panel without opening the keyboard (Back, search, a bar replacing the composer). */
@@ -1300,7 +1311,21 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 }
             }
         }
-        if (hidePanelWhenKeyboardOpens) closePanelView();
+        // A report posted while the previous keyboard was still closing must not close the panel early.
+        if (hidePanelWhenKeyboardOpens && android.os.SystemClock.elapsedRealtime() - keyboardRequestedAt > 120) closePanelView();
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // Rotation: a recording's overlay was placed for the old layout, so it stops (and is deleted, never sent);
+        // the panel takes the height the keyboard has in the new orientation.
+        if (voice != null) voice.onPause();
+        if (emojiShown && emojiContainer != null) {
+            final ViewGroup.LayoutParams lp = emojiContainer.getLayoutParams();
+            lp.height = panelHeight();
+            emojiContainer.setLayoutParams(lp);
+        }
     }
 
     private int panelHeight() {
@@ -1825,6 +1850,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             return;
         }
         if (editing != null) cancelStrip();
+        hideEmojiPanel();
         AndroidUtilities.hideKeyboard(input);
         attach.showMenu();
     }
