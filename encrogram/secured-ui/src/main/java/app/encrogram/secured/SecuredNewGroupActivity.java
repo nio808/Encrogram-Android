@@ -371,7 +371,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
                     case T_CONTACT: {
                         final ChatSummary s = contacts.get(r[1]);
                         final boolean last = r[1] == contacts.size() - 1;
-                        ((SecuredMemberRow) holder.itemView).set(s.getChatId(), s.getDisplayName(), null, selected.contains(s.getChatId()), !last);
+                        ((SecuredMemberRow) holder.itemView).set(s.getChatId(), s.getDisplayName(), null, selected.contains(s.getChatId()), !last, s.getAvatar());
                         break;
                     }
                     default:

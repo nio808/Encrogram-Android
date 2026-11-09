@@ -122,6 +122,9 @@ final class SecuredMentionPicker extends FrameLayout {
         private final TextPaint namePaint = new TextPaint(TextPaint.ANTI_ALIAS_FLAG);
         private CharSequence name = "";
         private CharSequence drawn;
+        private android.graphics.Bitmap photo;
+        private final android.graphics.Path clip = new android.graphics.Path();
+        private final android.graphics.Paint photoPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG | android.graphics.Paint.FILTER_BITMAP_FLAG);
 
         Row(Context context) {
             super(context);
@@ -134,6 +137,7 @@ final class SecuredMentionPicker extends FrameLayout {
         void set(GroupMember m) {
             final String n = m.getDisplayName() == null ? "" : m.getDisplayName();
             Kit.setAvatar(avatar, m.getMemberId(), n);
+            photo = AvatarPhotos.bitmap(m.getAvatar());   // null or broken: letters
             name = Emoji.replaceEmoji(n, namePaint.getFontMetricsInt(), false);
             drawn = null;
             setContentDescription(n);
@@ -149,8 +153,17 @@ final class SecuredMentionPicker extends FrameLayout {
         protected void onDraw(Canvas canvas) {
             final int size = dp(28);
             final int top = (getHeight() - size) / 2;
-            avatar.setBounds(dp(12), top, dp(12) + size, top + size);
-            avatar.draw(canvas);
+            if (photo != null) {
+                clip.reset();
+                clip.addCircle(dp(12) + size / 2f, top + size / 2f, size / 2f, android.graphics.Path.Direction.CW);
+                canvas.save();
+                canvas.clipPath(clip);
+                canvas.drawBitmap(photo, null, new android.graphics.Rect(dp(12), top, dp(12) + size, top + size), photoPaint);
+                canvas.restore();
+            } else {
+                avatar.setBounds(dp(12), top, dp(12) + size, top + size);
+                avatar.draw(canvas);
+            }
             if (drawn == null) {
                 drawn = TextUtils.ellipsize(name, namePaint, Math.max(0, getWidth() - dp(55) - dp(12)), TextUtils.TruncateAt.END);
             }

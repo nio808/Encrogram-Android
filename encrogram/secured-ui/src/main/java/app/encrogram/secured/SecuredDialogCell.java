@@ -110,7 +110,9 @@ final class SecuredDialogCell extends DialogCell {
             // DialogCell's own avatar reads a two-word title as "TE": use the same helper as the chat header.
             if (chatAvatar == null) chatAvatar = new AvatarDrawable(SecuredResourcesProvider.get());
             Kit.setAvatar(chatAvatar, avatarKey, avatarName);
-            avatarImage.setImage(null, "50_50", chatAvatar, null, 0);
+            // The engine's photo, decoded in memory (AvatarPhotos); null or broken keeps the letters.
+            final android.graphics.drawable.Drawable photo = row != null ? AvatarPhotos.drawable(row.avatar) : null;
+            avatarImage.setImage(null, "50_50", photo != null ? photo : chatAvatar, null, 0);
         }
         return result;
     }

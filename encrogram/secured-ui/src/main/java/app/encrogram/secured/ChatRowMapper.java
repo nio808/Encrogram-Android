@@ -90,12 +90,15 @@ final class ChatRowMapper {
         boolean group;
         boolean invited;
         boolean channel;
+        /** Contact or group photo from the engine (untrusted bytes); null keeps the letter avatar. */
+        app.encrogram.core.api.MediaPreview avatar;
 
         /** Same everything: the chat list's DiffUtil leaves such a row alone (H2/P1). */
         boolean sameAs(Row o) {
             return o != null && chatId == o.chatId && outgoing == o.outgoing && tick == o.tick && pinned == o.pinned
                     && muted == o.muted && unread == o.unread && dateSeconds == o.dateSeconds && archived == o.archived
                     && saved == o.saved && group == o.group && invited == o.invited && channel == o.channel
+                    && (avatar == o.avatar || (avatar != null && avatar.equals(o.avatar)))
                     && java.util.Objects.equals(name, o.name) && java.util.Objects.equals(message, o.message);
         }
     }
@@ -108,6 +111,7 @@ final class ChatRowMapper {
         r.channel = c.getKind() == ChatKind.CHANNEL;
         r.invited = r.group && c.getInvited();
         r.name = r.saved ? labels.savedMessages : c.getDisplayName() != null ? c.getDisplayName() : "";
+        r.avatar = r.saved ? null : c.getAvatar();
         r.pinned = c.getPinned();
         r.muted = c.getMuted();
         r.archived = c.getArchived();

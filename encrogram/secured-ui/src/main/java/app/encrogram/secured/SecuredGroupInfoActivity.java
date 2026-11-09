@@ -535,7 +535,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
                     case T_MEMBER: {
                         final GroupMember m = members.get(r.id);
                         final boolean last = r.id == members.size() - 1;
-                        ((SecuredMemberRow) holder.itemView).set(m.getMemberId(), m.getDisplayName(), memberSub(c, m), false, !last);
+                        ((SecuredMemberRow) holder.itemView).set(m.getMemberId(), m.getDisplayName(), memberSub(c, m), false, !last, m.getAvatar());
                         break;
                     }
                     default:

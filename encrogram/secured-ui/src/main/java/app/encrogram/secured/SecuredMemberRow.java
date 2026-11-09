@@ -27,6 +27,7 @@ import org.telegram.ui.Components.LayoutHelper;
 final class SecuredMemberRow extends FrameLayout {
 
     private final AvatarDrawable avatar = new AvatarDrawable(SecuredResourcesProvider.get());
+    private AvatarImage.CircleView avatarView;
     private final TextView nameView;
     private final TextView subView;
     private final CheckBox2 check;
@@ -39,13 +40,7 @@ final class SecuredMemberRow extends FrameLayout {
         setBackgroundColor(Kit.color(Theme.key_windowBackgroundWhite));
         divider.setColor(Kit.color(Theme.key_divider));
 
-        final View avatarView = new View(context) {
-            @Override
-            protected void onDraw(@NonNull Canvas canvas) {
-                avatar.setBounds(0, 0, getWidth(), getHeight());
-                avatar.draw(canvas);
-            }
-        };
+        avatarView = new AvatarImage.CircleView(context, avatar);
         addView(avatarView, LayoutHelper.createFrame(40, 40, Gravity.LEFT | Gravity.CENTER_VERTICAL, 16, 0, 0, 0));
 
         final LinearLayout texts = new LinearLayout(context);
@@ -72,6 +67,13 @@ final class SecuredMemberRow extends FrameLayout {
     }
 
     void set(long id, String name, CharSequence sub, boolean checked, boolean showDivider) {
+        set(id, name, sub, checked, showDivider, null);
+    }
+
+    /** [photo] is the engine's avatar (untrusted bytes); null or undecodable keeps the letters. */
+    void set(long id, String name, CharSequence sub, boolean checked, boolean showDivider,
+             @androidx.annotation.Nullable app.encrogram.core.api.MediaPreview photo) {
+        avatarView.setPhoto(AvatarPhotos.bitmap(photo));
         // AvatarDrawable takes initials from first and last name: split at the last space, as the chat header does.
         final String shown = name == null ? "" : name.trim();
         Kit.setAvatar(avatar, id, shown);
