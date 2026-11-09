@@ -97,7 +97,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     private FrameLayout root;
     private FrameLayout body;
     private View startingView, failedView, profileView, listFrame;
-    private TextView failedText, profileError;
+    private TextView failedText, profileError, resetButton;
     private EditText nameInput;
     private TextView profileButton;
     private RecyclerListView listView;
@@ -441,6 +441,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         labels = new ChatRowMapper.Labels(context.getString(R.string.sec_connecting), context.getString(R.string.sec_no_messages_yet),
                 org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages))
                 .withGroup(context.getString(R.string.secgroup_row_invited), context.getString(R.string.secgroup_row_sender_message));
+        labels.pausedDirect = context.getString(R.string.secpause_row_direct);
+        labels.pausedGroup = context.getString(R.string.secpause_row_group);
         labels.events = (e, k) -> SecuredMessageMapper.eventText(context, k, e);
         labels.media = (k, t) -> MediaText.listPreview(context, k, t);
         final ChatsSwitcherView switcher = new ChatsSwitcherView(context, owner);
@@ -522,6 +524,17 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         final TextView retry = Kit.button(context, context.getString(R.string.sec_try_again), true);
         retry.setOnClickListener(v -> retry());
         l.addView(retry, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 0, 20, 0, 0));
+        resetButton = Kit.button(context, context.getString(R.string.secpause_reset), false);
+        resetButton.setTextColor(Theme.getColor(Theme.key_text_RedBold));
+        resetButton.setVisibility(View.GONE);
+        resetButton.setOnClickListener(v -> SecuredResetSheet.confirm(this, engine, err -> {
+            if (err != null) {
+                failedText.setText(failedText.getContext().getString(R.string.secpause_reset_failed, err));
+            } else {
+                retry();   // the engine is now in NEEDS_PROFILE: updateMode shows the create-profile screen (restore link included)
+            }
+        }));
+        l.addView(resetButton, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 0, 8, 0, 0));
         return l;
     }
 
@@ -825,7 +838,15 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                         ? c.getString(R.string.sec_engine_missing) + " (" + SecuredUi.engineError() + ")"
                         : c.getString(R.string.sec_engine_missing);
             }
+            boolean keyLost = false;
+            try {
+                final SecuredError f = engine != null && !engineThrew ? engine.failure() : null;
+                keyLost = f != null && f.getKind() == SecuredError.Kind.KEY_LOST;
+            } catch (Throwable ignored) {
+            }
+            if (keyLost) message = c.getString(R.string.secpause_keylost_text);
             failedText.setText(message != null ? message : c.getString(R.string.sec_engine_failed_unknown));
+            if (resetButton != null) resetButton.setVisibility(keyLost ? View.VISIBLE : View.GONE);
         }
     }
 

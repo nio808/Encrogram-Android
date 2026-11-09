@@ -50,7 +50,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
 
     private static final int T_PROFILE = 0, T_SHADOW = 1, T_ACTION = 2, T_INFO = 3, T_HEADER = 4, T_MEMBER = 5;
     private static final int A_ADD = 1, A_LINK = 2, A_LEAVE = 3, A_DELETE = 4;
-    private static final int I_FACTS = 1, I_MEMBERS_ERROR = 2;
+    private static final int I_FACTS = 1, I_MEMBERS_ERROR = 2, I_PAUSED = 3;
 
     private static final class Row {
         final int type;
@@ -183,6 +183,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         rows.add(new Row(T_INFO, I_FACTS));
         rows.add(new Row(T_SHADOW, 0));
         rows.add(new Row(T_HEADER, 1));
+        if (admin() && hasForeignMember()) rows.add(new Row(T_INFO, I_PAUSED));
         if (membersError != null) {
             rows.add(new Row(T_INFO, I_MEMBERS_ERROR));
         } else {
@@ -194,6 +195,11 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         rows.add(new Row(T_SHADOW, 0));
         if (header != null) header.bind(chatId, displayName(), subtitle(header.getContext()));
         if (adapter != null) adapter.notifyDataSetChanged();
+    }
+
+    private boolean hasForeignMember() {
+        for (GroupMember m : members) if (m.getForeignRelay()) return true;
+        return false;
     }
 
     private String displayName() {
@@ -355,7 +361,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         }
         final String status = m.getStatus() == MemberStatus.INVITED ? c.getString(R.string.secgroup_member_invited)
                 : m.getStatus() == MemberStatus.CONNECTING ? c.getString(R.string.secgroup_member_connecting) : null;
-        final String first = status != null ? status : role;
+        final String first = m.getForeignRelay() ? c.getString(R.string.secpause_member_sub) : status != null ? status : role;
         return m.isMe() ? c.getString(R.string.secgroup_member_sub, c.getString(R.string.secgroup_member_you), first) : first;
     }
 
@@ -446,7 +452,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
                     }
                     case T_INFO: {
                         final TextInfoPrivacyCell cell = (TextInfoPrivacyCell) holder.itemView;
-                        cell.setText(r.id == I_FACTS ? facts(c) : c.getString(R.string.secgroup_action_failed, membersError));
+                        cell.setText(r.id == I_FACTS ? facts(c) : r.id == I_PAUSED ? c.getString(R.string.secpause_admin_notice) : c.getString(R.string.secgroup_action_failed, membersError));
                         cell.setBackgroundColor(Kit.color(Theme.key_windowBackgroundWhite));
                         break;
                     }

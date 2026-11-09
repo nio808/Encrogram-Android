@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secured: chats paused by a foreign relay, and the "key lost" reset. Own file so list work never conflicts with other screens. -->
+<resources>
+    <string name="secpause_row_direct">Paused: uses a server Encrogram doesn\'t run</string>
+    <string name="secpause_row_group">Paused: a member uses a server Encrogram doesn\'t run</string>
+    <string name="secpause_member_sub">Uses a server Encrogram doesn\'t run</string>
+    <string name="secpause_admin_notice">Sending is paused in this group until this member is removed.</string>
+
+    <string name="secpause_keylost_text">Secured can\'t unlock its data on this phone. The phone\'s key store lost the key, which can happen after a system update or a security change.</string>
+    <string name="secpause_reset">Reset Secured</string>
+    <string name="secpause_reset_title">Reset Secured?</string>
+    <string name="secpause_reset_text">This deletes Secured chats on this phone. If you wrote down your 12 words, you can bring your chats back with them after the reset.</string>
+    <string name="secpause_reset_confirm">Reset</string>
+    <string name="secpause_reset_failed">Could not reset Secured: %1$s</string>
+</resources>

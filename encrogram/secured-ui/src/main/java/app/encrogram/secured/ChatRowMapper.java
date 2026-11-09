@@ -39,6 +39,8 @@ final class ChatRowMapper {
         String senderFormat = "%1$s: %2$s";
         /** Groups: words a service row ("Ann joined") for the preview; null leaves "No messages yet". */
         EventWords events;
+        /** A contact or a group member is on a relay Encrogram does not run: sending is paused. */
+        String pausedDirect = "Paused", pausedGroup = "Paused";
 
         interface EventWords {
             String text(app.encrogram.core.api.GroupEvent event, app.encrogram.core.api.ChatKind kind);
@@ -120,6 +122,8 @@ final class ChatRowMapper {
         }
         if (r.invited) {
             r.message = labels.invitation;   // no preview of anything before you join
+        } else if (c.getForeignRelay() && !r.saved) {
+            r.message = r.group ? labels.pausedGroup : labels.pausedDirect;   // honest status instead of a preview
         } else if (!c.getReady() && !r.saved) {
             r.message = labels.connecting;
         } else if (text == null && c.getLastEvent() != null && labels.events != null) {
