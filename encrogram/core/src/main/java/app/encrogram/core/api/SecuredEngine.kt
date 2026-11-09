@@ -410,6 +410,8 @@ data class SecuredMessage @JvmOverloads constructor(
      * group, as in SimpleX and Telegram; the UI may highlight it.
      */
     val mentionsMe: Boolean = false,
+    /** Received and not yet read when this copy was made (the core's rcvNew, not history): the chat opens at the first one, under "Unread messages". */
+    val unread: Boolean = false,
 ) {
     /** Ids and status only: text and quotes are user content and must never reach a log. */
     override fun toString() = "SecuredMessage($chatId/$messageId, $status${media?.let { ", $it" } ?: ""})"

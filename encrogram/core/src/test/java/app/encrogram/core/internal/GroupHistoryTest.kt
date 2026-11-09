@@ -156,6 +156,8 @@ class GroupHistoryTest {
         )
         val items = CoreJson.parseChatItemsOfChat(page)
         assertEquals(listOf(true, false), items.map { it.history })
+        // The UI opens the chat at the first unread message: history never is, a live rcvNew is.
+        assertEquals(listOf(false, true), items.map { MessageMapper.toMessage(it).unread })
         val list = JSONObject(
             """{"chats":[{"chatInfo":{"type":"group","groupInfo":${groupInfo()}},"chatItems":[${item(23, "2026-11-08T09:00:00Z")}],
                 "chatStats":{"unreadCount":1}}]}""",

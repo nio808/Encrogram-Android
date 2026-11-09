@@ -54,6 +54,7 @@ internal object MessageMapper {
             history = i.history,
             mentions = if (deleted || service) emptyMap() else i.mentions,
             mentionsMe = i.mentionsMe && !i.outgoing && !deleted,
+            unread = i.unread,
         )
     }
 
