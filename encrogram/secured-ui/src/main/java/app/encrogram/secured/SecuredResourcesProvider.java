@@ -65,7 +65,10 @@ public final class SecuredResourcesProvider implements Theme.ResourcesProvider {
                 || key == Theme.key_chats_unreadCounterText
                 || key == Theme.key_featuredStickers_buttonText) {
             return 0xFFFFFFFF;
-        } else if (key == Theme.key_windowBackgroundWhiteBlueText) {
+        } else if (key == Theme.key_windowBackgroundWhiteBlueText
+                || key == Theme.key_windowBackgroundWhiteBlueHeader
+                || key == Theme.key_windowBackgroundWhiteValueText
+                || key == Theme.key_dialogButton) {
             return accentText();
         } else if (key == Theme.key_chat_outBubble) {
             return d ? 0xFF4448A8 : 0xFFE8E7FF;

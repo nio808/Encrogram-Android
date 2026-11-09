@@ -28,10 +28,18 @@ final class SecuredResetSheet {
         b.setMessage(activity.getString(R.string.secpause_reset_text));
         b.setPositiveButton(activity.getString(R.string.secpause_reset_confirm), (d, w) -> {
             try {
-                engine.resetSecured(result -> AndroidUtilities.runOnUIThread(() ->
-                        done.accept(result instanceof SecuredResult.Err ? ((SecuredResult.Err) result).getError().getMessage() : null)));
+                engine.resetSecured(result -> AndroidUtilities.runOnUIThread(() -> {
+                    if (result instanceof SecuredResult.Err) {
+                        done.accept(((SecuredResult.Err) result).getError().getMessage());
+                        return;
+                    }
+                    // The UI's own per-profile traces go with the data: backup offer flags, recent emoji.
+                    SecuredBackupUi.forget(activity);
+                    SecuredEmojiPanel.forgetRecents(activity);
+                    done.accept(null);
+                }));
             } catch (Throwable t) {
-                done.accept(t.getClass().getSimpleName());
+                done.accept(activity.getString(R.string.sec_bk_err_unknown));
             }
         });
         b.setNegativeButton(activity.getString(R.string.sec_list_cancel), null);

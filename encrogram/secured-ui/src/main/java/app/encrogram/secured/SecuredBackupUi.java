@@ -24,6 +24,14 @@ final class SecuredBackupUi {
         }
     }
 
+    /** After "Reset Secured": the new profile is offered the backup again, like a first one. */
+    static void forget(Context c) {
+        try {
+            prefs(c).edit().remove(KEY_OFFERED).remove(KEY_BANNER_DISMISSED).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
     static void markOffered(Context c) {
         try {
             prefs(c).edit().putBoolean(KEY_OFFERED, true).apply();

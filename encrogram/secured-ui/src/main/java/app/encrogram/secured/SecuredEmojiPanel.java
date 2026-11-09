@@ -252,6 +252,15 @@ final class SecuredEmojiPanel extends FrameLayout implements NotificationCenter.
         }
     }
 
+    /** After "Reset Secured": the old profile's recent emoji and skin tones go with it. */
+    static void forgetRecents(Context c) {
+        try {
+            c.getApplicationContext().getSharedPreferences(SecuredUi.UI_PREFS, Context.MODE_PRIVATE).edit()
+                    .remove(KEY_RECENT).remove(KEY_TONES).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void saveRecent() {
         prefs.edit().putString(KEY_RECENT, TextUtils.join("\n", recent)).apply();
     }
