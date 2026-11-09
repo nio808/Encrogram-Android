@@ -4,11 +4,14 @@ import static org.telegram.messenger.AndroidUtilities.dp;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.drawable.Animatable;
 import android.graphics.drawable.AnimatedImageDrawable;
 import android.graphics.drawable.Drawable;
@@ -45,9 +48,15 @@ final class SecuredPhotoCell extends SecuredMediaCell {
     private final TextPaint pillText = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final MediaActionDrawable action = new MediaActionDrawable();
     private final Path clip = new Path();
+    // U18: the rounded shape is rebuilt only when the rect or the corners change; the picture is painted through a
+    // BitmapShader along that path, so no clipPath runs per frame for still pictures.
+    private final RectF clipRect = new RectF();
+    private final float[] clipRadii = new float[8];
+    private final Matrix shaderMatrix = new Matrix();
+    private BitmapShader shader;
+    private Bitmap shaderBitmap;
     private final float[] radii = new float[8];
     private final RectF tmp = new RectF();
-    private final Rect src = new Rect();
     private final Rect dst = new Rect();
 
     /** Preview dimensions of the bound message, or null when unknown. */
@@ -287,14 +296,14 @@ final class SecuredPhotoCell extends SecuredMediaCell {
         radii[2] = tr; radii[3] = tr;
         radii[4] = br; radii[5] = br;
         radii[6] = bl; radii[7] = bl;
-        clip.reset();
         tmp.set(l, t, r, b);
-        clip.addRoundRect(tmp, radii, Path.Direction.CW);
-
-        canvas.save();
-        canvas.clipPath(clip);
+        if (!tmp.equals(clipRect) || !java.util.Arrays.equals(radii, clipRadii)) {
+            clipRect.set(tmp);
+            System.arraycopy(radii, 0, clipRadii, 0, 8);
+            clip.reset();
+            clip.addRoundRect(tmp, radii, Path.Direction.CW);
+        }
         drawPicture(canvas);
-        canvas.restore();
 
         drawButton(canvas);
         drawPill(canvas);
@@ -310,6 +319,7 @@ final class SecuredPhotoCell extends SecuredMediaCell {
             // Scaled to cover the rect, like a bitmap (the clip trims the overflow).
             final float scale = Math.max(w / (float) iw, h / (float) ih);
             canvas.save();
+            canvas.clipPath(clip);   // animated pictures are drawables: they still need the clip
             canvas.translate(dst.left + (w - iw * scale) / 2f, dst.top + (h - ih * scale) / 2f);
             canvas.scale(scale, scale);
             animated.setBounds(0, 0, iw, ih);
@@ -323,19 +333,29 @@ final class SecuredPhotoCell extends SecuredMediaCell {
             final int bw = pic.getWidth();
             final int bh = pic.getHeight();
             if (bw > 0 && bh > 0) {
-                // Centre-crop: take the part of the bitmap with the rect's shape.
+                // Centre-crop, painted through the shader along the rounded path.
+                if (pic != shaderBitmap || shader == null) {
+                    shader = new BitmapShader(pic, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+                    shaderBitmap = pic;
+                    bitmapPaint.setShader(shader);
+                }
                 final float scale = Math.max(w / (float) bw, h / (float) bh);
-                final int sw = Math.min(bw, Math.round(w / scale));
-                final int sh = Math.min(bh, Math.round(h / scale));
-                src.set((bw - sw) / 2, (bh - sh) / 2, (bw - sw) / 2 + sw, (bh - sh) / 2 + sh);
-                canvas.drawBitmap(pic, src, dst, bitmapPaint);
+                shaderMatrix.setScale(scale, scale);
+                shaderMatrix.postTranslate(dst.left + (w - bw * scale) / 2f, dst.top + (h - bh * scale) / 2f);
+                shader.setLocalMatrix(shaderMatrix);
+                canvas.drawPath(clip, bitmapPaint);
                 return;
             }
         }
-        // No picture yet: a calm neutral fill.
+        // No picture yet: a calm neutral fill (and the shader lets go of its bitmap).
+        if (shader != null) {
+            bitmapPaint.setShader(null);
+            shader = null;
+            shaderBitmap = null;
+        }
         fillPaint.setColor(color(out ? Theme.key_chat_outMediaIcon : Theme.key_chat_inMediaIcon));
         fillPaint.setAlpha(48);
-        canvas.drawRect(dst, fillPaint);
+        canvas.drawPath(clip, fillPaint);
     }
 
     /** The icon the centre button shows, or -1 for none. */

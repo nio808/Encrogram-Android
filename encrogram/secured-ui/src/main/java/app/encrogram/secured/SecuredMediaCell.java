@@ -116,6 +116,13 @@ abstract class SecuredMediaCell extends View {
     private final RectF tmp = new RectF();
     private final Rect bounds = new Rect();
 
+    // U18: the header layouts survive re-measures: rebuilt only when the message, the width or what they show changes.
+    private final Rect insetsBuf = new Rect();
+    private SecuredMessage headerFor;
+    private long headerId = Long.MIN_VALUE;
+    private int headerWidth = -1;
+    private boolean headerAvatar, headerPinned;
+    private String headerWho;
     private StaticLayout nameLayout;
     private StaticLayout forwardLayout;
     private StaticLayout quoteNameLayout;
@@ -291,7 +298,7 @@ abstract class SecuredMediaCell extends View {
         int bw = Math.max(dp(100), Math.min(bodyWidth(room), room));
         final int textWidth = bw - dp(20);
         buildHeader(textWidth);
-        final Rect insets = new Rect();
+        final Rect insets = insetsBuf;
         contentInsets(insets);
         final int header = headerHeight();
         final int top = pinnedTop ? dp(1) : dp(4);
@@ -305,6 +312,18 @@ abstract class SecuredMediaCell extends View {
     }
 
     private void buildHeader(int width) {
+        final QuotePreview quote = message.getReplyTo();
+        final String who = quote != null && !message.getDeleted() && host != null ? host.quoteAuthor(message) : null;
+        if (headerFor == message && headerId == message.getMessageId() && headerWidth == width
+                && headerAvatar == (drawAvatar && !pinnedTop) && headerPinned == pinnedTop && TextUtils.equals(headerWho, who)) {
+            return;
+        }
+        headerFor = message;
+        headerId = message.getMessageId();
+        headerWidth = width;
+        headerAvatar = drawAvatar && !pinnedTop;
+        headerPinned = pinnedTop;
+        headerWho = who;
         nameLayout = null;
         forwardLayout = null;
         quoteNameLayout = null;
@@ -318,7 +337,6 @@ abstract class SecuredMediaCell extends View {
         }
         final QuotePreview q = message.getReplyTo();
         if (q != null && !message.getDeleted()) {
-            final String who = host != null ? host.quoteAuthor(message) : "";
             quoteNameLayout = oneLine(who != null ? who : "", quoteNamePaint, width - dp(10));
             String text = q.getText();
             if (text == null || text.isEmpty()) {

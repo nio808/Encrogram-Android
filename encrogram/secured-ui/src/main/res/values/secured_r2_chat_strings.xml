@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Search bar: position among the matches loaded so far; the plus sign means older pages may hold more. -->
+    <string name="sec_r2c_of">%1$d of %2$d</string>
+    <string name="sec_r2c_of_more">%1$d of %2$d+</string>
+    <string name="sec_r2c_results_list">Show results as a list</string>
+</resources>

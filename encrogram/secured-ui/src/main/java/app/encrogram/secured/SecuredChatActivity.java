@@ -53,6 +53,7 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.ActionBar;
+import org.telegram.ui.ActionBar.AdjustPanLayoutHelper;
 import org.telegram.ui.ActionBar.ActionBarMenu;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
 import org.telegram.ui.ActionBar.ActionBarMenuSubItem;
@@ -98,6 +99,7 @@ import app.encrogram.core.api.ChatKind;
 import app.encrogram.core.api.MemberRole;
 import app.encrogram.core.api.MessageSender;
 import app.encrogram.core.api.ChatSummary;
+import app.encrogram.core.api.MediaPreview;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.GroupMember;
 import app.encrogram.core.api.ItemAction;
@@ -204,6 +206,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private boolean searchMore;
     private boolean searchLoadingMore;
     private TextView searchCount;
+    /** U9: the bottom bar, and "in place" mode: the chat itself is shown and the arrows jump between matches. */
+    private View searchBar;
+    private ImageView searchUp, searchDown, searchList;
+    private boolean searchBrowse;
+    private int searchCursor = -1;
     // AR9: the reply target of a restored draft, applied once the first page is in.
     private Long draftReplyId;
     // AR12: the header's lock and timer icons.
@@ -281,6 +288,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private FrameLayout emojiContainer;
     private SecuredEmojiPanel emojiPanel;
     private boolean emojiShown;
+    private MediaPreview avatarPhoto;
+    private android.graphics.Bitmap avatarPhotoBitmap;
+    /** U8: Telegram's helper slides the chat with the keyboard (UI only: it touches no Telegram network code). */
+    private AdjustPanLayoutHelper panHelper;
+    private ValueAnimator panelAnim;
     private boolean hidePanelWhenKeyboardOpens;
     private int keyboardHeightPort, keyboardHeightLand;
     /** When the panel asked for the keyboard: size reports from the keyboard that was still closing are older. */
@@ -342,7 +354,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public void onMessageReceived(SecuredMessage message) {
             if (message.getChatId() != chatId || destroyed) return;
-            if (!message.getOutgoing() && !searching && indexOf(message.getMessageId()) < 0 && (hasNewer || !isAtBottom())) {
+            if (!message.getOutgoing() && !resultsShown() && indexOf(message.getMessageId()) < 0 && (hasNewer || !isAtBottom())) {
                 unreadBelow++;
             }
             upsertMessage(message, true);
@@ -463,6 +475,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         AndroidUtilities.cancelRunOnUIThread(hideFloatingDate);
         AndroidUtilities.cancelRunOnUIThread(runSearch);
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        if (panelAnim != null) panelAnim.cancel();
+        if (panHelper != null) panHelper.onDetach();
+        panHelper = null;
+        avatarPhoto = null;
+        avatarPhotoBitmap = null;
         if (emojiPanel != null) emojiPanel.dismissPopups();
         if (voice != null) voice.destroy();
         NotificationCenter.getGlobalInstance().removeObserver(emojiLoaded, NotificationCenter.emojiLoaded);
@@ -567,6 +584,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         column.addView(buildReplyStrip(context), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 8, 4, 8, 0));
         composerView = buildComposer(context);
         column.addView(composerView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        searchBar = buildSearchBar(context);
+        column.addView(searchBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48));
         if (groupChat) {
             invitedBar = buildInvitedBar(context);
             cantPostBar = buildCantPostBar(context);
@@ -579,6 +598,18 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         emojiContainer.setVisibility(View.GONE);
         column.addView(emojiContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0));
         root.setDelegate(this::onKeyboardSize);
+        panHelper = new AdjustPanLayoutHelper(root);
+        root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View v) {
+                if (panHelper != null) panHelper.onAttach();
+            }
+
+            @Override
+            public void onViewDetachedFromWindow(View v) {
+                if (panHelper != null) panHelper.onDetach();
+            }
+        });
         if (!notes) {
             // Saved Messages takes text only in v1, so it has no recorder.
             voice = new SecuredVoiceRecorder(voiceHost);
@@ -751,11 +782,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             public void onItemClick(View view, int position, float x, float y) {
                 if (view instanceof SecuredReactionsView) {
                     // A tap on a reaction chip (not while selecting or searching): toggles our own reaction.
-                    if (selectedIds.isEmpty() && !searching) ((SecuredReactionsView) view).onTap(x, y);
+                    if (selectedIds.isEmpty() && !resultsShown()) ((SecuredReactionsView) view).onTap(x, y);
                     return;
                 }
                 final SecuredMessage m = view instanceof ChatMessageCell || view instanceof SecuredMediaCell ? messageAt(position) : null;
-                if (m != null && searching) {
+                if (m != null && resultsShown()) {
                     openMatch(m);
                 } else if (m != null && !selectedIds.isEmpty()) {
                     toggleSelection(m);
@@ -817,13 +848,6 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         olderSpinner.setVisibility(View.GONE);
         olderSpinner.setContentDescription(context.getString(R.string.sec_au_older_loading));
         listFrame.addView(olderSpinner, LayoutHelper.createFrame(28, 28, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 0, 8, 0, 0));
-        // AR13: "N found" while searching.
-        searchCount = Kit.text(context, "", 13, chatResources.getColor(Theme.key_chat_serviceText), false);
-        searchCount.setGravity(Gravity.CENTER);
-        searchCount.setPadding(dp(12), dp(5), dp(12), dp(5));
-        searchCount.setBackground(Kit.roundRect(chatResources.getColor(Theme.key_chat_serviceBackground), 14));
-        searchCount.setVisibility(View.GONE);
-        listFrame.addView(searchCount, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12));
         emptyView.setOnClickListener(v -> {
             if (loadFailed) loadMessages();   // "Tap to retry"
         });
@@ -1087,6 +1111,20 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             Kit.setAvatar(avatarDrawable, ChatRowMapper.colorId(chatId), name);
         }
         avatarContainer.getAvatarImageView().setImageDrawable(avatarDrawable);
+        // The chat's photo, when the engine has one: untrusted bytes, decoded with bounds, in memory only (no loader, no cache).
+        final MediaPreview photo = !notes && s != null ? s.getAvatar() : null;
+        if (photo != null) {
+            if (photo != avatarPhoto) {
+                avatarPhoto = photo;
+                avatarPhotoBitmap = MediaBitmaps.decodePreview(photo, dp(42), dp(42));
+            }
+            if (avatarPhotoBitmap != null && !avatarPhotoBitmap.isRecycled()) {
+                avatarContainer.getAvatarImageView().setImageBitmap(avatarPhotoBitmap);
+            }
+        } else {
+            avatarPhoto = null;
+            avatarPhotoBitmap = null;
+        }
 
         // No last seen, no presence: the subtitle states only what the engine reports.
         final EngineState state = engine != null ? engine.state() : EngineState.FAILED;
@@ -1571,10 +1609,16 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
         hidePanelWhenKeyboardOpens = false;
         emojiShown = true;
+        // The keyboard-to-panel swap is height-neutral, so the keyboard slide must not run for it.
+        if (panHelper != null) panHelper.setEnabled(false);
+        final boolean keyboardUp = root != null && root.measureKeyboardHeight() > dp(50);
+        final boolean grow = !keyboardUp && emojiContainer.getVisibility() != View.VISIBLE;
+        if (panelAnim != null) panelAnim.cancel();
         final ViewGroup.LayoutParams lp = emojiContainer.getLayoutParams();
-        lp.height = panelHeight();
+        lp.height = grow ? 0 : panelHeight();
         emojiContainer.setLayoutParams(lp);
         emojiContainer.setVisibility(View.VISIBLE);
+        if (grow) animatePanelHeight(0, panelHeight(), null);
         emojiPanel.onShow();
         emojiButton.setState(ChatActivityEnterViewAnimatedIconView.State.KEYBOARD, true);
         emojiButton.setContentDescription(emojiButton.getContext().getString(R.string.secemoji_keyboard));
@@ -1594,6 +1638,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             return;
         }
         hidePanelWhenKeyboardOpens = true;
+        if (panHelper != null) panHelper.setEnabled(false);
         keyboardRequestedAt = android.os.SystemClock.elapsedRealtime();
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
         AndroidUtilities.runOnUIThread(panelFallback, 700);
@@ -1604,14 +1649,59 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (!emojiShown && !hidePanelWhenKeyboardOpens) return;
         emojiShown = false;
         setEmojiIcon();
-        closePanelView();
+        // No keyboard behind it (Back, attach): the panel slides down; otherwise it just leaves.
+        final boolean slide = !hidePanelWhenKeyboardOpens && emojiContainer != null && emojiContainer.getVisibility() == View.VISIBLE
+                && emojiContainer.getHeight() > 0 && (root == null || root.measureKeyboardHeight() <= dp(50)) && !searching;
+        if (slide) {
+            AndroidUtilities.cancelRunOnUIThread(panelFallback);
+            hidePanelWhenKeyboardOpens = false;
+            if (emojiPanel != null) emojiPanel.dismissPopups();
+            animatePanelHeight(emojiContainer.getHeight(), 0, () -> {
+                if (emojiContainer != null && !emojiShown) emojiContainer.setVisibility(View.GONE);
+                if (panHelper != null && !emojiShown) panHelper.setEnabled(true);
+            });
+        } else {
+            closePanelView();
+        }
+    }
+
+    /** U8: 200 ms height change of the panel, Telegram's default curve. */
+    private void animatePanelHeight(int from, int to, Runnable end) {
+        if (panelAnim != null) panelAnim.cancel();
+        final ValueAnimator a = ValueAnimator.ofInt(from, to);
+        panelAnim = a;
+        a.setDuration(200);
+        a.setInterpolator(CubicBezierInterpolator.DEFAULT);
+        a.addUpdateListener(v -> {
+            if (emojiContainer == null) return;
+            final ViewGroup.LayoutParams lp = emojiContainer.getLayoutParams();
+            lp.height = (Integer) v.getAnimatedValue();
+            emojiContainer.setLayoutParams(lp);
+        });
+        a.addListener(new android.animation.AnimatorListenerAdapter() {
+            private boolean canceled;
+
+            @Override
+            public void onAnimationCancel(android.animation.Animator animation) {
+                canceled = true;
+            }
+
+            @Override
+            public void onAnimationEnd(android.animation.Animator animation) {
+                if (panelAnim == a) panelAnim = null;
+                if (!canceled && end != null) end.run();
+            }
+        });
+        a.start();
     }
 
     private void closePanelView() {
         hidePanelWhenKeyboardOpens = false;
         AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        if (panelAnim != null) panelAnim.cancel();
         if (emojiPanel != null) emojiPanel.dismissPopups();
         if (emojiContainer != null) emojiContainer.setVisibility(View.GONE);
+        if (panHelper != null) panHelper.setEnabled(true);
     }
 
     private final Runnable panelFallback = () -> {
@@ -2359,7 +2449,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public boolean canPerformActions() {
             // In selection mode taps go to the list (toggle), not to links or replies.
-            return selectedIds.isEmpty() && !searching;
+            return selectedIds.isEmpty() && !resultsShown();
         }
 
         @Override
@@ -2383,7 +2473,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         public void didPressReplyMessage(ChatMessageCell cell, int id, float x, float y, boolean longpress) {
             // The cell still reports quote taps in selection mode; there they toggle selection like any tap.
             final SecuredMessage m = messageFor(cell);
-            if (searching) {
+            if (resultsShown()) {
                 if (m != null) openMatch(m);
             } else if (!selectedIds.isEmpty()) {
                 if (m != null) toggleSelection(m);
@@ -2422,7 +2512,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private void onMessageLongPress(View cell) {
         final SecuredMessage m = messageFor(cell);
-        if (m == null || searching) return;
+        if (m == null || resultsShown()) return;
         if (!selectedIds.isEmpty()) {
             toggleSelection(m);
         } else {
@@ -2521,7 +2611,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (engine == null) return;
         try {
             engine.messages(chatId, new MessagePage(PAGE_SIZE, null, null, id, null), result -> {
-                if (destroyed || searching) return;
+                if (destroyed || resultsShown()) return;
                 if (!(result instanceof SecuredResult.Ok)) {
                     showError(((SecuredResult.Err) result).getError());
                     return;
@@ -2578,7 +2668,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (engine == null) return;
         try {
             engine.messages(chatId, new MessagePage(PAGE_SIZE, null, null, null, null), result -> {
-                if (destroyed || searching) return;
+                if (destroyed || resultsShown()) return;
                 if (!(result instanceof SecuredResult.Ok)) {
                     showError(((SecuredResult.Err) result).getError());
                     return;
@@ -2598,7 +2688,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     }
 
     private void checkLoadNewer() {
-        if (!hasNewer || loadingNewer || searching || messages.isEmpty() || engine == null || listView == null) return;
+        if (!hasNewer || loadingNewer || resultsShown() || messages.isEmpty() || engine == null || listView == null) return;
         if (System.currentTimeMillis() - newerFailedAt < 5000) return;
         final int last = layoutManager.findLastVisibleItemPosition();
         if (last == RecyclerView.NO_POSITION || last < rows.size() - 7) return;
@@ -2813,6 +2903,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         searchResults.clear();
         searchMore = false;
         searchLoadingMore = false;
+        searchBrowse = false;
+        searchCursor = -1;
         updateSearchCount();
         updateSpinners();
         clearSelection();
@@ -2828,7 +2920,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     }
 
     private void endSearch() {
+        final boolean stayInPlace = searchBrowse;   // closing search while looking at a match leaves the chat where it is
         searching = false;
+        searchBrowse = false;
+        searchCursor = -1;
         searchDone = false;
         searchSeq++;
         searchText = "";
@@ -2847,6 +2942,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         pendingJump = null;
         if (jump != null) {
             goTo(jump);
+        } else if (stayInPlace) {
+            updateJumpButton(false);
         } else {
             scrollToBottom(false);
         }
@@ -2861,6 +2958,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         searchLoadingMore = false;
         if (searchText.isEmpty()) {
             searchResults.clear();
+            searchBrowse = false;
+            searchCursor = -1;
             searchDone = false;
             searchMore = false;
             updateSearchCount();
@@ -2882,6 +2981,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             engine.messages(chatId, new MessagePage(PAGE_SIZE, null, null, null, searchText), result -> {
                 if (destroyed || !searching || seq != searchSeq) return;
                 searchResults.clear();
+                searchBrowse = false;
+                searchCursor = -1;
                 searchDone = true;
                 searchMore = false;
                 if (result instanceof SecuredResult.Ok) {
@@ -2903,24 +3004,104 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     }
 
-    /** AR13: "N found", or "N+ found" while older pages may still hold matches (never claims a complete count then). */
+    /** AR13: "N found", or "N+ found" while older pages may still hold matches (never claims a complete count then).
+     *  U9: in place, "N of M" (M with a plus while more pages may exist); 1 is the newest match, like Telegram. */
     private void updateSearchCount() {
-        if (searchCount == null) return;
-        if (!searching || !searchDone || searchResults.isEmpty()) {
-            searchCount.setVisibility(View.GONE);
+        if (searchBar == null) return;
+        final boolean show = searching && searchDone && !searchResults.isEmpty();
+        searchBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (!show) return;
+        final Context c = searchBar.getContext();
+        final int size = searchResults.size();
+        if (searchBrowse && searchCursor >= 0) {
+            searchCount.setText(c.getString(searchMore ? R.string.sec_r2c_of_more : R.string.sec_r2c_of, size - searchCursor, size));
+        } else {
+            searchCount.setText(c.getString(searchMore ? R.string.sec_au_found_more : R.string.sec_au_found, size));
+        }
+        final boolean canOlder = searchCursor != 0 || searchMore;
+        final boolean canNewer = searchCursor < 0 || searchCursor < size - 1;
+        searchUp.setEnabled(canOlder);
+        searchUp.setAlpha(canOlder ? 1f : 0.4f);
+        searchDown.setEnabled(canNewer);
+        searchDown.setAlpha(canNewer ? 1f : 0.4f);
+        searchList.setVisibility(searchBrowse ? View.VISIBLE : View.GONE);
+    }
+
+    /** The bar of Telegram's chat search (count, previous, next, list), from Telegram's own icons and colours. */
+    private View buildSearchBar(Context context) {
+        final FrameLayout bar = new FrameLayout(context);
+        bar.setBackgroundColor(chatResources.getColor(Theme.key_chat_messagePanelBackground));
+        bar.setClickable(true);   // taps on the bar never reach the chat behind it
+        bar.setVisibility(View.GONE);
+        searchCount = Kit.text(context, "", 15, chatResources.getColor(Theme.key_chat_searchPanelText), true);
+        searchCount.setGravity(Gravity.CENTER_VERTICAL);
+        bar.addView(searchCount, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.LEFT | Gravity.CENTER_VERTICAL, 16, 0, 0, 0));
+        searchList = searchButton(context, org.telegram.messenger.R.drawable.msg_list, context.getString(R.string.sec_r2c_results_list));
+        searchUp = searchButton(context, org.telegram.messenger.R.drawable.msg_go_up, tg(org.telegram.messenger.R.string.AccDescrSearchPrev));
+        searchDown = searchButton(context, org.telegram.messenger.R.drawable.msg_go_down, tg(org.telegram.messenger.R.string.AccDescrSearchNext));
+        bar.addView(searchList, LayoutHelper.createFrame(48, 48, Gravity.RIGHT | Gravity.CENTER_VERTICAL, 0, 0, 100, 0));
+        bar.addView(searchUp, LayoutHelper.createFrame(48, 48, Gravity.RIGHT | Gravity.CENTER_VERTICAL, 0, 0, 52, 0));
+        bar.addView(searchDown, LayoutHelper.createFrame(48, 48, Gravity.RIGHT | Gravity.CENTER_VERTICAL, 0, 0, 4, 0));
+        searchList.setVisibility(View.GONE);
+        searchList.setOnClickListener(v -> showSearchList());
+        searchUp.setOnClickListener(v -> stepSearch(-1));
+        searchDown.setOnClickListener(v -> stepSearch(1));
+        return bar;
+    }
+
+    private ImageView searchButton(Context context, int icon, String description) {
+        final ImageView b = new ImageView(context);
+        b.setScaleType(ImageView.ScaleType.CENTER);
+        b.setImageResource(icon);
+        b.setColorFilter(new PorterDuffColorFilter(chatResources.getColor(Theme.key_chat_searchPanelIcons), PorterDuff.Mode.MULTIPLY));
+        b.setBackground(Theme.createSelectorDrawable(chatResources.getColor(Theme.key_actionBarActionModeDefaultSelector), 1));
+        b.setContentDescription(description);
+        return b;
+    }
+
+    /** U9: up goes to an older match, down to a newer one; the chat shows the match in place (goTo). */
+    private void stepSearch(int dir) {
+        if (!searching || !searchDone || searchResults.isEmpty() || searchLoadingMore) return;
+        int c = searchCursor < 0 ? searchResults.size() - 1 : searchCursor + dir;
+        if (c < 0) {
+            // Past the oldest loaded match: one more page of matches, then the same step again.
+            if (searchMore) loadMoreSearchPage(() -> stepSearch(dir));
             return;
         }
-        final Context c = searchCount.getContext();
-        searchCount.setText(c.getString(searchMore ? R.string.sec_au_found_more : R.string.sec_au_found, searchResults.size()));
-        searchCount.setVisibility(View.VISIBLE);
+        if (c >= searchResults.size()) return;
+        searchCursor = c;
+        final boolean entering = !searchBrowse;
+        searchBrowse = true;
+        if (entering) rebuildRows(false);
+        updateSearchCount();
+        goTo(searchResults.get(c).getMessageId());
+    }
+
+    /** Back to the list of results (AR13 paging and count wording unchanged). */
+    private void showSearchList() {
+        if (!searchBrowse) return;
+        searchBrowse = false;
+        searchCursor = -1;
+        rebuildRows(false);
+        scrollToLast(false);
+        updateSearchCount();
+    }
+
+    /** True while the list shows the search results (not the chat itself). */
+    private boolean resultsShown() {
+        return searching && !searchBrowse;
     }
 
     /** AR13: scrolling up in the results loads the next older page of matches (beforeId + search). */
     private void checkLoadMoreSearch() {
-        if (!searching || !searchDone || !searchMore || searchLoadingMore || searchResults.isEmpty() || engine == null) return;
-        if (System.currentTimeMillis() - olderFailedAt < 5000) return;
         final int first = layoutManager.findFirstVisibleItemPosition();
         if (first == RecyclerView.NO_POSITION || first > 6) return;
+        loadMoreSearchPage(null);
+    }
+
+    private void loadMoreSearchPage(Runnable loaded) {
+        if (!searching || !searchDone || !searchMore || searchLoadingMore || searchResults.isEmpty() || engine == null) return;
+        if (System.currentTimeMillis() - olderFailedAt < 5000) return;
         searchLoadingMore = true;
         updateSpinners();
         final int seq = searchSeq;
@@ -2950,9 +3131,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 searchMore = page.size() >= PAGE_SIZE && !older.isEmpty();
                 if (!older.isEmpty()) {
                     searchResults.addAll(0, older);
+                    if (searchCursor >= 0) searchCursor += older.size();
                     rebuildRows(true);
                 }
                 updateSearchCount();
+                if (loaded != null && !older.isEmpty()) loaded.run();
             });
         } catch (Throwable t) {
             searchLoadingMore = false;
@@ -3035,8 +3218,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     /** AR10: first-load spinner and the older-pages spinner follow the loading flags. */
     private void updateSpinners() {
-        if (loadingView != null) loadingView.setVisibility(!initialLoaded && !loadFailed && !searching ? View.VISIBLE : View.GONE);
-        if (olderSpinner != null) olderSpinner.setVisibility((loadingOlder && !searching) || (searching && searchLoadingMore) ? View.VISIBLE : View.GONE);
+        if (loadingView != null) loadingView.setVisibility(!initialLoaded && !loadFailed && !resultsShown() ? View.VISIBLE : View.GONE);
+        if (olderSpinner != null) olderSpinner.setVisibility((loadingOlder && !resultsShown()) || (resultsShown() && searchLoadingMore) ? View.VISIBLE : View.GONE);
     }
 
     private void loadMessages() {
@@ -3102,11 +3285,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     }
 
     private void checkLoadOlder() {
-        if (searching) {
+        if (resultsShown()) {
             checkLoadMoreSearch();
             return;
         }
-        if (!initialLoaded || loadingOlder || endReached || searching || messages.isEmpty() || engine == null) return;
+        if (!initialLoaded || loadingOlder || endReached || resultsShown() || messages.isEmpty() || engine == null) return;
         if (System.currentTimeMillis() - olderFailedAt < 5000) return;
         final int first = layoutManager.findFirstVisibleItemPosition();
         if (first == RecyclerView.NO_POSITION || first > 6) return;
@@ -3141,7 +3324,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     }
 
     private ArrayList<SecuredMessage> shown() {
-        return searching ? searchResults : messages;
+        return resultsShown() ? searchResults : messages;
     }
 
     private int indexOf(long messageId) {
@@ -3165,7 +3348,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             messages.set(idx, m);
         } else if (mayInsert && hasNewer) {
             // The window ends before the newest messages: do not leave a gap. Our own message jumps to the newest page.
-            if (m.getOutgoing() && !searching) loadNewest();
+            if (m.getOutgoing() && !resultsShown()) loadNewest();
             return;
         } else if (mayInsert) {
             insertSorted(m);
@@ -3179,13 +3362,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (editing != null && editing.getMessageId() == m.getMessageId() && (m.getDeleted() || !m.getCanEdit())) {
             cancelStrip();
         }
-        if (searching) {
+        if (searching) {   // results are kept fresh in both modes
             for (int i = 0; i < searchResults.size(); i++) {
                 if (searchResults.get(i).getMessageId() == m.getMessageId()) searchResults.set(i, m);
             }
         }
         rebuildRows(true);
-        if (idx < 0 && !searching && (atBottom || m.getOutgoing())) {
+        if (idx < 0 && !resultsShown() && (atBottom || m.getOutgoing())) {
             scrollToBottom(true);
         }
     }
@@ -3372,7 +3555,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 next.add(new Row(ROW_DATE, DATE_ID_BASE + day, null, day));
                 lastDay = day;
             }
-            if (m.getMessageId() == unreadDividerBefore && !searching) {
+            if (m.getMessageId() == unreadDividerBefore && !resultsShown()) {
                 next.add(new Row(ROW_UNREAD, UNREAD_ROW_ID, null, sec));
             }
             if (m.getEvent() != null) {
@@ -3445,7 +3628,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         updateSearchCount();
         if (emptyView != null) {
-            emptyView.setVisibility((loadFailed || (searching ? searchDone : initialLoaded)) && rows.isEmpty() ? View.VISIBLE : View.GONE);
+            emptyView.setVisibility((loadFailed || (resultsShown() ? searchDone : initialLoaded)) && rows.isEmpty() ? View.VISIBLE : View.GONE);
         }
         if (listView != null) {
             listView.post(() -> {
@@ -3499,7 +3682,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     /** To the newest message; when the loaded window ends earlier, loads the newest page first. */
     private void scrollToBottom(boolean smooth) {
-        if (hasNewer && !searching) {
+        if (hasNewer && !resultsShown()) {
             loadNewest();
         } else {
             scrollToLast(smooth);
@@ -3533,7 +3716,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             jumpCounter.setText(unreadBelow > 99 ? "99+" : String.valueOf(unreadBelow));
             jumpCounter.setVisibility(unreadBelow > 0 ? View.VISIBLE : View.GONE);
         }
-        final boolean show = !searching && !rows.isEmpty() && (hasNewer
+        final boolean show = !resultsShown() && !rows.isEmpty() && (hasNewer
                 || last != RecyclerView.NO_POSITION && last < rows.size() - 2 && listView.canScrollVertically(1));
         if (show == jumpShown) return;
         jumpShown = show;
