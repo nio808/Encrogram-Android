@@ -28,6 +28,38 @@ class SecuredDiagTest {
         f.delete()
     }
 
+    /** Review of 8c89dfd6, finding 4: a log call that took the buffer before diagStop() can't recreate the file. */
+    @Test
+    fun aLineFromBeforeTheStopCantTurnDiagnosticsBackOn() {
+        val f = tmp()
+        val b = SecuredLog.DiagBuffer(f)
+        b.add("on")
+        assertTrue(f.isFile)
+        // Diagnostics turned off between a log call taking the buffer and its append.
+        b.clear()
+        b.add("late")
+        assertFalse(f.exists())
+        assertTrue(b.lines().isEmpty())
+
+        // Through the logger: started, stopped, then a line.
+        SecuredLog.diagStart(f)
+        SecuredLog.i(SecuredLog.Ev.STATE, "running")
+        assertTrue(f.isFile)
+        SecuredLog.diagStop()
+        SecuredLog.i(SecuredLog.Ev.STATE, "running")
+        assertFalse(f.exists())
+        assertFalse(SecuredLog.diagActive())
+
+        // Clearing the lines while diagnostics stays on keeps the buffer working.
+        val kept = SecuredLog.DiagBuffer(f)
+        kept.add("x")
+        kept.clear(keepFile = true)
+        kept.add("y")
+        assertEquals(1, kept.lines().size)
+        assertTrue(f.readText().contains("y"))
+        f.delete()
+    }
+
     @Test
     fun reloadsEarlierLines() {
         val f = tmp()

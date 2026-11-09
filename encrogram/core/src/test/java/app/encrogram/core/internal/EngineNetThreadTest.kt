@@ -1,18 +1,22 @@
 package app.encrogram.core.internal
 
+import app.encrogram.core.api.ChatAction
 import app.encrogram.core.api.EngineState
 import app.encrogram.core.api.SecuredError
 import app.encrogram.core.api.SecuredInvite
 import app.encrogram.core.api.SecuredMessage
+import app.encrogram.core.api.SecuredResult
 import app.encrogram.core.internal.FakeCore.Companion.CLOSE
 import app.encrogram.core.internal.FakeCore.Companion.chatsReply
 import app.encrogram.core.internal.FakeCore.Companion.contact
+import app.encrogram.core.internal.FakeCore.Companion.groupChat
 import app.encrogram.core.internal.FakeCore.Companion.group
 import app.encrogram.core.internal.FakeCore.Companion.groupInfo
 import app.encrogram.core.internal.FakeCore.Companion.newItems
 import app.encrogram.core.internal.FakeCore.Companion.rcv
 import app.encrogram.core.internal.FakeCore.Companion.result
 import app.encrogram.core.internal.FakeCore.Companion.storeError
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -21,6 +25,8 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * A6: the commands that reach a relay before the core answers run their native call on the network thread; the
@@ -142,10 +148,149 @@ class EngineNetThreadTest {
         h.awaitIdle()
 
         assertEquals(SecuredError.Kind.UNAPPROVED_RELAY, link.error().kind)
-        assertEquals("test-engine", core.sent("/_get link #3").single().thread)
+        // Read and created in one network-thread task (review of 8c89dfd6, finding 3).
+        assertEquals("test-net", core.sent("/_get link #3").single().thread)
         assertEquals(setOf("test-net"), netCalls("/_create link #3"))
         assertEquals(setOf("test-net"), netCalls("/_delete link #3"))
         assertTrue(core.indexOf("/_delete link #3") > core.indexOf("/_create link #3"))
+    }
+
+    // ---- group links: read and create as one task (review of 8c89dfd6, finding 3) ---------------------------------
+
+    private val fp = "7fc79ge_ADax0g_Lwu6YYwI1hFH6KwOG0y11w1YVORg"
+    private val groupChatId = CoreJson.groupChatId(3)
+
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    /** A full group link on our relay (GroupLinksTest's shape), told apart by its [queue]. */
+    private fun ourGroupLink(queue: String) =
+        "simplex:/contact#/?v=2-7&smp=${enc("smp://$fp@encrogram.nytmanager.com:5223/$queue#/?v=1-4&dh=MCowBQYDK2VuAyEA")}" +
+            "&data=${enc("""{"groupLinkId":"AAECAwQFBgcICQoLDA0ODw=="}""")}"
+
+    private fun linkReply(type: String, link: String) =
+        result(type, """"groupLink":{"connLinkContact":{"connFullLink":"$link"},"acceptMemberRole":"member"}""")
+
+    /** `/_get link #3`, `/_create link #3 member` and `/_delete link #3` over one stored link, as the core keeps it. */
+    private fun linkStore(initial: String?): AtomicReference<String?> {
+        val stored = AtomicReference(initial)
+        core.exact("/_get link #3") { stored.get()?.let { linkReply("groupLink", it) } ?: storeError("groupLinkNotFound") }
+        core.exact("/_create link #3 member") {
+            val made = ourGroupLink("q${core.sent("/_create link #3").size}q2q3q4")
+            stored.set(made)
+            linkReply("groupLinkCreated", made)
+        }
+        core.exact("/_delete link #3") {
+            stored.set(null)
+            result("groupLinkDeleted")
+        }
+        return stored
+    }
+
+    @Test
+    fun twoGroupLinkCallsCloseTogetherMakeOneLink() {
+        core.chats = chatsReply(contact(5, "Bob", last = rcv(40)), group(groupInfo(id = 3)))
+        h.startRunning()
+        linkStore(null)
+        val slow = core.hold("/_create link #3")
+        val first = Answer<SecuredInvite>()
+        val second = Answer<SecuredInvite>()
+        h.engine.groupLink(groupChatId, first)
+        slow.awaitEntered()
+        h.engine.groupLink(groupChatId, second)
+        h.waitFor("the second call queued behind the first") { h.netThread.pending.get() == 2 }
+        assertEquals("nothing read while the first link is being made", 1, core.sent("/_get link #3").size)
+        slow.release()
+        h.awaitIdle()
+
+        assertEquals("one queue on our relay", 1, core.sent("/_create link #3").size)
+        assertTrue(first.value().link.contains("q1q2q3q4"))
+        assertEquals(first.value().link, second.value().link)
+        assertEquals(setOf("test-net"), netCalls("/_get link #3"))
+        assertTrue(core.calls.indexOfLast { it.cmd == "/_get link #3" } > core.indexOf("/_create link #3"))
+    }
+
+    @Test
+    fun aGroupLinkAskedForWhileADeleteIsUnderWayIsANewOne() {
+        core.chats = chatsReply(contact(5, "Bob", last = rcv(40)), group(groupInfo(id = 3)))
+        h.startRunning()
+        linkStore(ourGroupLink("old1old2"))
+        val slow = core.hold("/_delete link #3")
+        val deleted = Answer<Unit>()
+        val link = Answer<SecuredInvite>()
+        h.engine.deleteGroupLink(groupChatId, deleted)
+        slow.awaitEntered()
+        h.engine.groupLink(groupChatId, link)
+        h.waitFor("the link call queued behind the delete") { h.netThread.pending.get() == 2 }
+        assertTrue("the link being deleted is never read", core.sent("/_get link #3").isEmpty())
+        slow.release()
+        h.awaitIdle()
+
+        deleted.value()
+        assertFalse(link.value().link.contains("old1old2"))
+        assertTrue(link.value().link.contains("q1q2q3q4"))
+        assertTrue(core.indexOf("/_delete link #3") < core.indexOf("/_get link #3"))
+        assertTrue(core.indexOf("/_get link #3") < core.indexOf("/_create link #3"))
+    }
+
+    // ---- group profile updates (review of 8c89dfd6, finding 1) --------------------------------------------------
+
+    @Test
+    fun groupProfileUpdatesWaitOnTheNetworkThreadOneAfterTheOther() {
+        val info = groupInfo(id = 3)
+        core.chats = chatsReply(contact(5, "Bob", last = rcv(40)), group(info))
+        core.exact("/_get chat #3 count=1", groupChat(info))
+        h.startRunning()
+        core.groupProfiles(3, info, result("groupUpdated"))
+        val slow = core.hold("/_group_profile #3 ")
+        val photo = Answer<Unit>()
+        h.engine.setGroupPhoto(groupChatId, AvatarsTest.JPEG, photo)
+        slow.awaitEntered()
+        val timer = Answer<Unit>()
+        h.engine.chatAction(groupChatId, ChatAction.SetDisappearing(86400), timer)
+
+        // While the relay is slow: a page loads, and the timer waits its turn.
+        val page = Answer<List<SecuredMessage>>()
+        h.engine.messages(5, 20, page)
+        h.waitFor("a page while the photo waits") { page.results.isNotEmpty() }
+        h.waitFor("the timer queued behind the photo") { h.netThread.pending.get() == 2 }
+        assertTrue(photo.results.isEmpty() && timer.results.isEmpty())
+        slow.release()
+        h.awaitIdle()
+
+        photo.value()
+        timer.value()
+        assertEquals(setOf("test-net"), netCalls("/_group_profile #3 "))
+        assertEquals(setOf("test-net"), netCalls("/_get chat #3 count=1"))
+        // The timer's update read the profile after the photo was stored: it keeps the photo.
+        val sent = core.sent("/_group_profile #3 ").map { JSONObject(it.cmd.removePrefix("/_group_profile #3 ")) }
+        assertEquals(2, sent.size)
+        assertEquals(Avatars.dataUrl(AvatarsTest.JPEG), sent[1].getString("image"))
+        assertEquals(86400, sent[1].getJSONObject("groupPreferences").getJSONObject("timedMessages").getInt("ttl"))
+        assertEquals(86400, h.engine.chats().single { it.chatId == groupChatId }.disappearingTtlSeconds)
+    }
+
+    @Test
+    fun aGroupPhotoThatTimedOutIsSentAgainOnRetry() {
+        val info = groupInfo(id = 3)
+        core.chats = chatsReply(contact(5, "Bob", last = rcv(40)), group(info))
+        core.exact("/_get chat #3 count=1", groupChat(info))
+        h.startRunning()
+        core.groupProfiles(3, info, Samples.AGENT_BROKER_TIMEOUT, Samples.AGENT_BROKER_TIMEOUT, result("groupUpdated"))
+        val failed = Answer<Unit>()
+        h.engine.setGroupPhoto(groupChatId, AvatarsTest.JPEG, failed)
+        h.awaitIdle()
+        assertTrue(failed.results.single() is SecuredResult.Err)
+        assertEquals(listOf(0, 1), core.sent("/_group_profile #3 ").map { it.retryNum })
+        val reloads = core.calls.count { it.cmd == "/_get chats 1" }
+
+        // This phone kept the photo; the same photo again still goes out, and reaches the members this time.
+        val retried = Answer<Unit>()
+        h.engine.setGroupPhoto(groupChatId, AvatarsTest.JPEG, retried)
+        h.awaitIdle()
+        retried.value()
+        assertEquals(3, core.sent("/_group_profile #3 ").size)
+        assertEquals(Avatars.dataUrl(AvatarsTest.JPEG), JSONObject(core.sent("/_group_profile #3 ").last().cmd.removePrefix("/_group_profile #3 ")).getString("image"))
+        assertTrue(core.calls.count { it.cmd == "/_get chats 1" } > reloads)
     }
 
     @Test

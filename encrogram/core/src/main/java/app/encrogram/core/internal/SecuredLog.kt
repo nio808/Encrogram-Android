@@ -109,10 +109,15 @@ internal object SecuredLog {
         diag = DiagBuffer(file)
     }
 
-    /** Stops and deletes the file. */
+    /**
+     * Stops and deletes the file. A log call that took the buffer just before this can still reach [DiagBuffer.add]
+     * afterwards: the buffer is closed first, so that call appends nothing and can't recreate the file (which would
+     * turn diagnostics back on at the next launch, SecuredDiagnostics.install).
+     */
     internal fun diagStop() {
-        diag?.clear()
+        val d = diag
         diag = null
+        d?.clear()
     }
 
     internal fun diagActive(): Boolean = diag != null
@@ -135,6 +140,8 @@ internal object SecuredLog {
     internal class DiagBuffer(private val file: File?, private val max: Int = 300) {
         private val buf = ArrayDeque<String>()
         private var appended = 0
+        /** Set by [clear] without keepFile (diagnostics turned off), before the delete: [add] then does nothing, for good. */
+        private var closed = false
 
         init {
             // Keep what an earlier run left (the crash lines), so one file tells the whole story.
@@ -146,6 +153,7 @@ internal object SecuredLog {
 
         @Synchronized
         fun add(line: String) {
+            if (closed) return
             val stamped = STAMP.format(LocalTime.now()) + " " + line
             buf.addLast(stamped)
             while (buf.size > max) buf.removeFirst()
@@ -166,8 +174,10 @@ internal object SecuredLog {
         @Synchronized
         fun lines(): List<String> = buf.toList()
 
+        /** [keepFile] false: diagnostics is off; the buffer is closed before the file goes, so no late line brings it back. */
         @Synchronized
         fun clear(keepFile: Boolean = false) {
+            if (!keepFile) closed = true
             buf.clear()
             appended = 0
             try {

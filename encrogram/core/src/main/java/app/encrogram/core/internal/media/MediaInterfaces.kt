@@ -52,6 +52,9 @@ internal interface MediaHost {
     fun running(): Boolean
 
     fun nowMs(): Long
+
+    /** SystemClock.elapsedRealtime: time since boot, deep sleep included; nobody can set it ([RetentionClock]). */
+    fun elapsedMs(): Long
 }
 
 /** Sending, receiving and cancelling files. Today SimplexMediaTransport (XFTP through the SimpleX core). Engine thread. */

@@ -15,6 +15,7 @@ import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import java.security.SecureRandom
 import java.util.Arrays
 
@@ -307,6 +308,25 @@ internal class MediaVault(
         } catch (e: SecurityException) {
             false
         } catch (e: UnsupportedOperationException) {
+            false
+        }
+    }
+
+    /**
+     * Dates [f] [toMs] in place (retention, for a file written while the phone's clock was unset), only when it is still
+     * the very file that was listed, as [expire] checks. False when it changed, vanished or couldn't be dated.
+     */
+    fun redate(f: StoredFile, toMs: Long): Boolean {
+        val file = resolve(f.name) ?: return false
+        val p = file.toPath()
+        return try {
+            val a = Files.readAttributes(p, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            if (!a.isRegularFile || a.size() != f.bytes || a.lastModifiedTime().toMillis() != f.modifiedMs) return false
+            Files.setLastModifiedTime(p, FileTime.fromMillis(toMs))
+            true
+        } catch (e: IOException) {
+            false
+        } catch (e: SecurityException) {
             false
         }
     }

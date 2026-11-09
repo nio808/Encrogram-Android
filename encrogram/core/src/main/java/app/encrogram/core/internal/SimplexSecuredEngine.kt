@@ -3,6 +3,7 @@ package app.encrogram.core.internal
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import app.encrogram.core.background.SecuredNotifier
 import app.encrogram.core.api.BackupInfo
 import app.encrogram.core.api.BackupState
@@ -84,8 +85,8 @@ import kotlin.concurrent.write
  *  - one receive thread ("encrogram-secured-recv") blocks in chat_recv_msg_wait and hands each event to the
  *    engine thread;
  *  - one network thread ("encrogram-secured-net") runs only the native call of the commands that reach a relay before
- *    the core answers (connect, invites, joins, group links, adding members: [sendNetAsync]); their checks before and
- *    everything after stay on the engine thread;
+ *    the core answers (connect, invites, joins, group links, adding members, group profile updates: [sendNetAsync],
+ *    [netScript]); their checks before and everything after stay on the engine thread;
  *  - every callback and listener call is posted to the Android main thread.
  *
  * Fail closed: the engine reaches RUNNING only after the relay configuration has been applied and read back.
@@ -186,8 +187,8 @@ internal class SimplexSecuredEngine internal constructor(
 
     /** "Keep media" checks ([startRetentionChecks]): bumped at each start and stop, so only the current chain runs. */
     private var retentionGen = 0L
-    /** Wall clock of the last retention pass (engine thread). */
-    private var lastRetentionMs = 0L
+    /** SystemClock.elapsedRealtime of the last retention pass (engine thread): a wall clock set back can't stall them. */
+    private var lastRetentionElapsed = 0L
 
     /** Our own group messages sent with nobody to send them to ([NoRecipientCheck]): engine thread. */
     private val noRecipients = NoRecipientCheck(
@@ -320,6 +321,7 @@ internal class SimplexSecuredEngine internal constructor(
         override fun onEngine(task: () -> Unit) = post(task)
         override fun running() = state == EngineState.RUNNING && ctrl != 0L
         override fun nowMs() = System.currentTimeMillis()
+        override fun elapsedMs() = SystemClock.elapsedRealtime()
     }
 
     // =============================================================================================================
@@ -781,7 +783,7 @@ internal class SimplexSecuredEngine internal constructor(
 
     /** Engine thread: a retention pass now (nothing when the setting is forever). Never throws. */
     private fun runRetention() {
-        lastRetentionMs = System.currentTimeMillis()
+        lastRetentionElapsed = SystemClock.elapsedRealtime()
         try {
             media.applyRetention()
         } catch (t: Throwable) {
@@ -790,8 +792,9 @@ internal class SimplexSecuredEngine internal constructor(
     }
 
     /**
-     * Engine thread, at each start: a fresh chain of hourly checks that runs a pass once a day of wall-clock time (an
-     * uptime timer alone would stretch "a day" while the phone sleeps). A stop, or the next start, ends the old chain.
+     * Engine thread, at each start: a fresh chain of hourly checks that runs a pass once a day of elapsedRealtime (deep
+     * sleep included, unlike an uptime timer; and unlike the wall clock, set back it can't stall the passes). A stop, or
+     * the next start, ends the old chain. What a pass measures file ages against is [MediaCoordinator.applyRetention]'s.
      */
     private fun startRetentionChecks() {
         val gen = ++retentionGen
@@ -800,7 +803,7 @@ internal class SimplexSecuredEngine internal constructor(
 
     private fun retentionCheck(gen: Long) {
         if (gen != retentionGen || state != EngineState.RUNNING) return
-        if (System.currentTimeMillis() - lastRetentionMs >= MediaRetention.DAY_MS) runRetention()
+        if (SystemClock.elapsedRealtime() - lastRetentionElapsed >= MediaRetention.DAY_MS) runRetention()
         main.postDelayed({ post { retentionCheck(gen) } }, RETENTION_CHECK_MS)
     }
 
@@ -1011,44 +1014,49 @@ internal class SimplexSecuredEngine internal constructor(
      * Both the link and the connection request behind it (what a joiner's core reads from the short link) must be
      * on our relay, else the link is deleted and nothing is handed out. The short link is compacted like our invites
      * (`https://<relay>/g#<key>`, the relay's `?p=..&c=..` dropped); without a short link the full link is returned.
+     *
+     * The read and the create run as one task on the network thread (review of 8c89dfd6, finding 3): its tasks run one
+     * at a time in the order issued, so a second call close behind reads the link the first one made (never a second
+     * queue on our relay), and a call after [deleteGroupLink] reads only once the delete went through, so it never
+     * hands out the link being deleted.
      */
     override fun groupLink(chatId: Long, callback: SecuredCallback<SecuredInvite>) = post(callback) {
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
         GroupRules.linkRefusal(g)?.let { return@post refuse(callback, "link_role", it) }
         val role = if (g.channel) Commands.ROLE_OBSERVER else Commands.ROLE_MEMBER
-        var link: CoreGroupLink? = when (val r = send(Commands.getGroupLink(g.groupId))) {
+        netScript(callback, { net ->
+            val got = net(Commands.getGroupLink(g.groupId), false)
+            // No link yet (StoreError SEGroupLinkNotFound, Store/Groups.hs:342-345): a new one is a new queue on our relay.
             // A link exists: never create a second one (the core would make an unused connection, then refuse).
-            is CoreReply.Result ->
-                if (r.type == "groupLink") CoreJson.parseGroupLink(r.body) ?: return@post err(callback, ErrorMapper.engine("group_link.reply"))
-                else return@post err(callback, unexpected(r))
-            // No link yet (StoreError SEGroupLinkNotFound, Store/Groups.hs:342-345): create one below.
-            is CoreReply.Error ->
-                if (r.error.type == "errorStore" && r.error.detail == "groupLinkNotFound") null
-                else return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
-            CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
-        }
-        if (link == null) {
-            // A new link is a new queue on our relay (A6: the network thread).
-            return@post sendNetAsync(Commands.createGroupLink(g.groupId, role), callback) { r ->
-                when (r) {
-                    is CoreReply.Result ->
-                        if (r.type == "groupLinkCreated") handOutGroupLink(g, CoreJson.parseGroupLink(r.body), role, created = true, callback)
-                        else err(callback, unexpected(r))
-                    is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
-                    CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
-                }
+            if (got is CoreReply.Error && got.error.type == "errorStore" && got.error.detail == "groupLinkNotFound") {
+                net(Commands.createGroupLink(g.groupId, role), true) to true
+            } else {
+                got to false
             }
-        }
-        if (CoreJson.roleWord(link.role) != role) {
-            link = when (val r = send(Commands.setGroupLinkRole(g.groupId, role))) {
-                is CoreReply.Result -> if (r.type == "groupLink") CoreJson.parseGroupLink(r.body) else return@post err(callback, unexpected(r))
-                is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
-                CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+        }) { (r, created) -> groupLinkReplied(g, role, r, created, callback) }
+    }
+
+    /** Engine thread: [groupLink]'s answer from the core, the existing link ([created] false) or a new one. */
+    private fun groupLinkReplied(g: CoreGroup, role: String, r: CoreReply, created: Boolean, callback: SecuredCallback<SecuredInvite>) {
+        val existing: CoreGroupLink = when (r) {
+            is CoreReply.Result -> when {
+                created && r.type == "groupLinkCreated" -> return handOutGroupLink(g, CoreJson.parseGroupLink(r.body), role, created = true, callback)
+                !created && r.type == "groupLink" -> CoreJson.parseGroupLink(r.body) ?: return err(callback, ErrorMapper.engine("group_link.reply"))
+                else -> return err(callback, unexpected(r))
             }
-            SecuredLog.i(Ev.GROUP_ACTION, "link_role_fixed")
+            is CoreReply.Error -> return err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+            CoreReply.Invalid -> return err(callback, ErrorMapper.engine("invalid_reply"))
         }
-        handOutGroupLink(g, link, role, created = false, callback)
+        if (CoreJson.roleWord(existing.role) == role) return handOutGroupLink(g, existing, role, created = false, callback)
+        // Stored on this phone only (APIGroupLinkMemberRole, Commands.hs:3255-3264): no relay, so the engine thread.
+        val fixed = when (val f = send(Commands.setGroupLinkRole(g.groupId, role))) {
+            is CoreReply.Result -> if (f.type == "groupLink") CoreJson.parseGroupLink(f.body) else return err(callback, unexpected(f))
+            is CoreReply.Error -> return err(callback, ErrorMapper.fromCore(f.error, Op.INVITE))
+            CoreReply.Invalid -> return err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        SecuredLog.i(Ev.GROUP_ACTION, "link_role_fixed")
+        handOutGroupLink(g, fixed, role, created = false, callback)
     }
 
     /**
@@ -1076,7 +1084,8 @@ internal class SimplexSecuredEngine internal constructor(
     /**
      * `/_delete link #g`. No role or membership check, like the core (APIDeleteGroupLink, Commands.hs:3265-3268): the
      * link is our own, so an admin who was made a member again can still delete the link they made (review #6).
-     * No link is not an error: the result is the same.
+     * No link is not an error: the result is the same. A [groupLink] call made after this reads the link only once the
+     * delete went through (both on the one network thread, in order).
      */
     override fun deleteGroupLink(chatId: Long, callback: SecuredCallback<Unit>) = post(callback) {
         if (!ensureRunning(callback)) return@post
@@ -1132,11 +1141,10 @@ internal class SimplexSecuredEngine internal constructor(
             bytes?.let { Avatars.outgoingRefusal(it) }?.let { return@post err(callback, it) }
             // Every member gets the new profile (b1).
             foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
-            val info = groupInfoOrErr(chatId, callback) ?: return@post
-            val current = info.optJSONObject("groupProfile")?.takeIf { !it.str("displayName").isNullOrEmpty() }
-                ?: return@post err(callback, ErrorMapper.engine("group_profile"))
-            val update = CoreJson.groupProfileUpdate(current, bytes?.let { Avatars.dataUrl(it) }) ?: return@post ok(callback, Unit)
-            chatCommand(if (bytes == null) "group_photo_remove" else "group_photo_set", Commands.updateGroupProfile(g.groupId, update), "groupUpdated", callback)
+            val image = bytes?.let { Avatars.dataUrl(it) }
+            updateGroupProfile(if (bytes == null) "group_photo_remove" else "group_photo_set", g, callback) {
+                CoreJson.groupProfileUpdate(it, image)
+            }
         }
     }
 
@@ -1151,11 +1159,57 @@ internal class SimplexSecuredEngine internal constructor(
         GroupRules.timerRefusal(g)?.let { return refuse(callback, "disappearing_group", it) }
         // Every member gets the new profile (b1).
         foreignRefusal(chatId)?.let { return refuseForeign(callback, it) }
-        val info = groupInfoOrErr(chatId, callback) ?: return
-        val current = info.optJSONObject("groupProfile")?.takeIf { !it.str("displayName").isNullOrEmpty() }
-            ?: return err(callback, ErrorMapper.engine("group_profile"))
-        val update = CoreJson.groupTimerUpdate(current, ttl) ?: return ok(callback, Unit)
-        chatCommand(if (ttl == null) "disappearing_group_off" else "disappearing_group", Commands.updateGroupProfile(g.groupId, update), "groupUpdated", callback)
+        updateGroupProfile(if (ttl == null) "disappearing_group_off" else "disappearing_group", g, callback) {
+            CoreJson.groupTimerUpdate(it, ttl)
+        }
+    }
+
+    /**
+     * Engine thread, after the owner's checks: `/_group_profile #g` with [edit] applied to the group's profile as stored
+     * now (review of 8c89dfd6, finding 1). For a group with a link the core first saves the new profile
+     * (runUpdateGroupProfile, Commands.hs:4025), then writes it into the link's data on our relay (setGroupLinkData',
+     * :4043; Internal.hs:1454-1469), and only then sends it to the members. So:
+     * - it runs on the network thread (A6) with [NetRetry]'s retry: the relay can take its full timeout;
+     * - the profile is read in the same task, so two updates of one group (a photo, a timer) run one after the other
+     *   and neither puts back what the other changed;
+     * - it is always sent, even when the profile already holds that value: after a relay timeout this phone keeps the
+     *   change while the members never got it, and the owner's retry must still send it;
+     * - on any failure the chat list is reloaded, so the row shows what this phone stored.
+     */
+    private fun updateGroupProfile(tag: String, g: CoreGroup, callback: SecuredCallback<Unit>, edit: (JSONObject) -> JSONObject) {
+        val ref = ChatRef.group(g.groupId)
+        netScript(callback, { net ->
+            val read = net(Commands.getChat(ref, 1), false)
+            val current = (read as? CoreReply.Result)?.takeIf { it.type == "apiChat" }
+                ?.let { CoreJson.groupInfoOfChat(it.body)?.optJSONObject("groupProfile") }
+                ?.takeIf { !it.str("displayName").isNullOrEmpty() }
+            read to current?.let { net(Commands.updateGroupProfile(g.groupId, edit(it)), true) }
+        }) { (read, update) ->
+            if (update == null) {
+                // Not sent: the profile couldn't be read.
+                return@netScript when (read) {
+                    is CoreReply.Result ->
+                        err(callback, if (read.type == "apiChat") ErrorMapper.engine("group_profile") else unexpected(read))
+                    is CoreReply.Error -> err(callback, ErrorMapper.fromCore(read.error, Op.CHAT))
+                    CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+                }
+            }
+            when (update) {
+                is CoreReply.Result ->
+                    if (update.type == "groupUpdated") {
+                        SecuredLog.i(Ev.CHAT_ACTION, tag)
+                        ok(callback, Unit)
+                        refreshChats(notify = true)
+                        return@netScript
+                    } else {
+                        err(callback, unexpected(update))
+                    }
+                is CoreReply.Error -> err(callback, ErrorMapper.fromCore(update.error, Op.CHAT))
+                CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
+            }
+            // The core may have kept the change (a relay timeout comes after its save): show what it stored.
+            refreshSoon()
+        }
     }
 
     /**
@@ -4330,16 +4384,27 @@ internal class SimplexSecuredEngine internal constructor(
         onNetThread(listOf(cmd), retry = true, callback) { then(it.single()) }
 
     /** [sendNetAsync] for several commands, one after the other; [retry] false: one attempt each (no [NetRetry]). */
-    private fun <T> onNetThread(cmds: List<String>, retry: Boolean, callback: SecuredCallback<T>, then: (List<CoreReply>) -> Unit) {
+    private fun <T> onNetThread(cmds: List<String>, retry: Boolean, callback: SecuredCallback<T>, then: (List<CoreReply>) -> Unit) =
+        netScript(callback, { net -> cmds.map { net(it, retry) } }, then)
+
+    /**
+     * Engine thread, RUNNING: [work] on the network thread, then [then] with its result back on the engine thread, under
+     * [sendNetAsync]'s rules (a stopped or closed store: NOT_RUNNING, and [then] never runs). For commands where each
+     * depends on the reply before: [work] gets `net(cmd, retry)`, one command with [NetRetry]'s retry when [retry]. It
+     * only sends and parses: no engine state. The network thread is a single thread, so scripts and [sendNetAsync]
+     * commands run whole, one after the other, in the order the engine thread issued them.
+     */
+    private fun <T, R> netScript(callback: SecuredCallback<T>, work: (net: (String, Boolean) -> CoreReply) -> R, then: (R) -> Unit) {
         val gen = netGen
+        val net: (String, Boolean) -> CoreReply = { cmd, retry ->
+            if (retry) NetRetry.run({ retryAllowed(gen) }) { n -> sendOnNet(gen, cmd, n) } else sendOnNet(gen, cmd, 0)
+        }
         val task = Runnable {
             try {
-                val replies = cmds.map { cmd ->
-                    if (retry) NetRetry.run({ retryAllowed(gen) }) { n -> sendOnNet(gen, cmd, n) } else sendOnNet(gen, cmd, 0)
-                }
+                val result = work(net)
                 post(callback) {
                     if (gen != netGen || state != EngineState.RUNNING || ctrl == 0L) return@post err(callback, ErrorMapper.notRunning(state))
-                    then(replies)
+                    then(result)
                 }
             } catch (t: Throwable) {
                 SecuredLog.crash(Ev.TASK_CRASHED, t)
@@ -4531,7 +4596,7 @@ internal class SimplexSecuredEngine internal constructor(
         val KEY_LOST_REASONS = setOf("key_unreadable", "key_missing")
         /** [applyNetwork]: reconnect once the default network has stayed the same this long. */
         const val RECONNECT_SETTLE_MS = 2_000L
-        /** How often a running engine checks whether a day of wall-clock time has passed since the last retention pass. */
+        /** How often a running engine checks whether a day (elapsedRealtime) has passed since the last retention pass. */
         const val RETENTION_CHECK_MS = 60L * 60L * 1000L
         /** Saved Messages is read for its files in pages of this many rows, at most [SAVED_MAX_PAGES] of them. */
         const val SAVED_PAGE = 200

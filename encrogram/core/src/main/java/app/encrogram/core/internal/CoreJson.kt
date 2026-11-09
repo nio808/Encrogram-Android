@@ -529,11 +529,12 @@ internal object CoreJson {
      * current one ([groupProfile], GroupInfo.groupProfile as stored now) with only its image set to [image] (null
      * removes it). The core replaces the whole profile (runUpdateGroupProfile, :4019-4057; omitted Maybe fields become
      * Nothing), so every other field (groupPreferences with history, fullDelete, reactions and our channel marker,
-     * memberAdmission, description...) is copied as it is. Null when the image is already that.
+     * memberAdmission, description...) is copied as it is. Also when the image is already that: the owner's retry after
+     * a relay timeout must still reach the members (the engine's updateGroupProfile).
      */
-    fun groupProfileUpdate(groupProfile: JSONObject, image: String?): JSONObject? {
+    fun groupProfileUpdate(groupProfile: JSONObject, image: String?): JSONObject {
         val p = groupProfile.deepCopy()
-        if (!setImage(p, image)) return null
+        setImage(p, image)
         if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
         return p
     }
@@ -541,16 +542,12 @@ internal object CoreJson {
     /**
      * The GroupProfile for `/_group_profile` with the group's disappearing-message timer set: groupPreferences
      * timedMessages (TimedMessagesGroupPreference {enable, ttl}, Preferences.hs:675-678) on with [ttlSeconds], or off
-     * (null). Like [groupProfileUpdate], every other field and preference is copied as it is. Null when the timer is
-     * already that (a profile without timedMessages has it off, the core's default).
+     * (null). Like [groupProfileUpdate], every other field and preference is copied as it is, and it is built also when
+     * the timer is already that (a retry after a relay timeout must still reach the members).
      */
-    fun groupTimerUpdate(groupProfile: JSONObject, ttlSeconds: Int?): JSONObject? {
+    fun groupTimerUpdate(groupProfile: JSONObject, ttlSeconds: Int?): JSONObject {
         val p = groupProfile.deepCopy()
         val prefs = p.optJSONObject("groupPreferences") ?: JSONObject().also { p.put("groupPreferences", it) }
-        val current = prefs.optJSONObject("timedMessages")
-        val on = current?.str("enable") == "on"
-        val currentTtl = if (on && current != null && current.has("ttl") && !current.isNull("ttl")) current.optInt("ttl", 0) else null
-        if (if (ttlSeconds == null) !on else on && currentTtl == ttlSeconds) return null
         val timed = JSONObject().put("enable", if (ttlSeconds == null) "off" else "on")
         if (ttlSeconds != null) timed.put("ttl", ttlSeconds)
         prefs.put("timedMessages", timed)

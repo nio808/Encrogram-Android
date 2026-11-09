@@ -11,6 +11,7 @@ import app.encrogram.core.api.SecuredError
 import app.encrogram.core.api.SecuredListener
 import app.encrogram.core.api.SecuredMessage
 import app.encrogram.core.api.SecuredResult
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import java.io.File
 import java.net.URLEncoder
@@ -268,8 +269,38 @@ internal class FakeCore : NativeApi {
     fun prefix(p: String, reply: String) = prefix(p) { reply }
     fun prefix(p: String, reply: (Call) -> String) = rules.add(Rule({ it.startsWith(p) }, reply))
 
-    /** The next call starting with [prefix] waits inside the core until the hold is released. */
+    /** The next call starting with [prefix] waits inside the core until the hold is released (a slow relay). */
     fun hold(prefix: String): Hold = Hold { it.startsWith(prefix) }.also { holds.add(it) }
+
+    /**
+     * Calls starting with [p] get [replies] in turn, then the last one for good (a relay that times out, then answers).
+     * Each call runs [stored] first: what the core keeps whatever the reply (it saves a group profile before the relay).
+     */
+    fun replies(p: String, vararg replies: String, stored: (Call) -> Unit = {}) {
+        val next = AtomicInteger()
+        prefix(p) { c ->
+            stored(c)
+            replies[minOf(next.getAndIncrement(), replies.size - 1)]
+        }
+    }
+
+    /**
+     * `/_group_profile #<groupId>` as the core runs it: the profile sent is stored ([chats] and `/_get chat #<id>
+     * count=1` read it back from then on, on top of [info]), then each call answers [replies] in turn, then the last
+     * one for good: a relay timeout comes after the save (runUpdateGroupProfile, Commands.hs:4025, :4043).
+     */
+    fun groupProfiles(groupId: Long, info: String, vararg replies: String) {
+        val p = "/_group_profile #$groupId "
+        replies(p, *replies) { c ->
+            val sent = JSONObject(c.cmd.removePrefix(p))
+            val g = JSONObject(info).put("groupProfile", sent)
+            // The merged preferences the row reads follow the profile's.
+            sent.optJSONObject("groupPreferences")?.optJSONObject("timedMessages")
+                ?.let { g.getJSONObject("fullGroupPreferences").put("timedMessages", it) }
+            chats = chatsReply(contact(5, "Bob", last = rcv(40)), group(g.toString()))
+            exact("/_get chat #$groupId count=1", groupChat(g.toString()))
+        }
+    }
 
     fun push(vararg raw: String) {
         for (e in raw) {

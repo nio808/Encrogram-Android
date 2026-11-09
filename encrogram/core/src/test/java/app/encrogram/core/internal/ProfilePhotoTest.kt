@@ -85,7 +85,7 @@ class ProfilePhotoTest {
     @Test
     fun theGroupsPhotoKeepsItsPreferencesAndEverythingElse() {
         val current = JSONObject(groupProfile)
-        val update = CoreJson.groupProfileUpdate(current, photo)!!
+        val update = CoreJson.groupProfileUpdate(current, photo)
         assertEquals(photo, update.getString("image"))
         // Everything but the image, exactly as it was.
         val before = JSONObject(groupProfile).apply { remove("image") }
@@ -105,14 +105,15 @@ class ProfilePhotoTest {
     }
 
     @Test
-    fun removingTheGroupsPhotoAndNoChange() {
-        val removed = CoreJson.groupProfileUpdate(JSONObject(groupProfile), null)!!
+    fun removingTheGroupsPhotoAndTheSamePhotoAgain() {
+        val removed = CoreJson.groupProfileUpdate(JSONObject(groupProfile), null)
         assertFalse(removed.has("image"))
         assertTrue(JSONObject(groupProfile).getJSONObject("groupPreferences").similar(removed.getJSONObject("groupPreferences")))
-        assertNull(CoreJson.groupProfileUpdate(removed, null))
-        assertNull(CoreJson.groupProfileUpdate(JSONObject(groupProfile), "data:image/jpg;base64,QUJD"))
+        // Unchanged is still built: a retry after a relay timeout must reach the members (review of 8c89dfd6, finding 1).
+        assertTrue(removed.similar(CoreJson.groupProfileUpdate(removed, null)))
+        assertTrue(JSONObject(groupProfile).similar(CoreJson.groupProfileUpdate(JSONObject(groupProfile), "data:image/jpg;base64,QUJD")))
         // A profile without fullName (required by the core) gets an empty one.
-        val bare = CoreJson.groupProfileUpdate(JSONObject("""{"displayName":"G"}"""), photo)!!
+        val bare = CoreJson.groupProfileUpdate(JSONObject("""{"displayName":"G"}"""), photo)
         assertEquals("", bare.getString("fullName"))
     }
 

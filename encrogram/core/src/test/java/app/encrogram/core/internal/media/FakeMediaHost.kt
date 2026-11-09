@@ -62,4 +62,9 @@ internal class FakeMediaHost(var now: Long) : MediaHost {
     override fun running(): Boolean = running
 
     override fun nowMs(): Long = now
+
+    /** SystemClock.elapsedRealtime as the fake phone has it (retention's trusted clock). */
+    var elapsed: Long = 0
+
+    override fun elapsedMs(): Long = elapsed
 }

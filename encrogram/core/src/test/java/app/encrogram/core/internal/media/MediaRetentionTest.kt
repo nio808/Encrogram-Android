@@ -56,6 +56,9 @@ class MediaRetentionTest {
     /** The fake clock: the host's and the vault's. */
     private var now = NOW
 
+    /** The fake phone's elapsedRealtime: moves with [tick]; a wall clock set by hand ([setWall]) leaves it. */
+    private var elapsed = HOUR
+
     private var queueRead = false
     private val readQueue = ArrayDeque<Runnable>()
     private val logs: MutableList<String> = Collections.synchronizedList(ArrayList())
@@ -80,7 +83,7 @@ class MediaRetentionTest {
         native = FakeNativeFiles()
         vault = MediaVault(files, media, native, clock = { now })
         ledger = MediaLedger(File(data, "media_ledger"))
-        host = FakeMediaHost(now)
+        host = FakeMediaHost(now).also { it.elapsed = elapsed }
         transport = FakeTransport()
         coordinator = MediaCoordinator(
             host, transport, vault, ledger,
@@ -93,9 +96,25 @@ class MediaRetentionTest {
         host.coordinator = coordinator
     }
 
+    /** Time passes: the wall clock and elapsedRealtime move together. */
     private fun tick(ms: Long) {
         now += ms
         host.now = now
+        elapsed += ms
+        host.elapsed = elapsed
+    }
+
+    /** The wall clock is set to [wallMs] (by hand, or a phone booting with it unset); elapsedRealtime doesn't move. */
+    private fun setWall(wallMs: Long) {
+        now = wallMs
+        host.now = now
+    }
+
+    /** The phone restarts after [offMs] switched off: elapsedRealtime starts again; the wall clock is [wallMs]. */
+    private fun reboot(offMs: Long, wallMs: Long = now + offMs) {
+        elapsed = MIN
+        host.elapsed = elapsed
+        setWall(wallMs)
     }
 
     // ---- samples ------------------------------------------------------------------------------------------------
@@ -257,6 +276,113 @@ class MediaRetentionTest {
         assertEquals(0, coordinator.clearAll())
         assertTrue(present("future.bin"))
     }
+
+    // ---- the clock retention trusts (review of 8c89dfd6, finding 2) ----------------------------------------------
+
+    @Test
+    fun aWallClockSetAheadAgesNothing() {
+        setDays(7)
+        received(1, "old.bin", 8 * DAY)
+        received(2, "young.bin", 3 * DAY)
+        assertEquals(1, coordinator.applyRetention())
+
+        // Set a month ahead by hand: only an hour really passed, so nothing is older than it was.
+        setWall(now + 30 * DAY)
+        tick(HOUR)
+        received(3, "after.bin", 0)   // dated by the clock set ahead
+        assertEquals(0, coordinator.applyRetention())
+        assertTrue(present("young.bin") && present("after.bin"))
+        // Kept across a restart of the app (the trusted time is on disk).
+        build()
+        assertEquals(0, coordinator.applyRetention())
+        assertTrue(present("young.bin"))
+
+        // Five real days later young.bin is eight days old and goes; the file dated ahead stays until its own time.
+        tick(5 * DAY)
+        assertEquals(1, coordinator.applyRetention())
+        assertFalse(present("young.bin"))
+        assertTrue(present("after.bin"))
+    }
+
+    @Test
+    fun aWallClockSetBackRemovesNothingAndTheTrustedTimeNeverGoesBack() {
+        setDays(7)
+        received(1, "aging.bin", 6 * DAY)
+        assertEquals(0, coordinator.applyRetention())
+
+        // Set a year back, then two real days pass: the pass counts from the earlier clock, so it removes less, never more.
+        setWall(now - 365 * DAY)
+        tick(2 * DAY)
+        assertEquals(0, coordinator.applyRetention())
+        assertTrue(present("aging.bin"))
+        // The trusted time kept counting, and didn't follow the wall clock back.
+        assertEquals(RetentionClock.State(NOW + 2 * DAY, HOUR + 2 * DAY), RetentionClock.parse(clockFile().readText()))
+
+        // Set right again: aging.bin is eight days old by real time and goes.
+        setWall(now + 365 * DAY)
+        assertEquals(1, coordinator.applyRetention())
+        assertFalse(present("aging.bin"))
+    }
+
+    @Test
+    fun aPhoneThatBootsAt1970DatesNothingDecadesBack() {
+        setDays(7)
+        received(1, "aging.bin", 6 * DAY + 12 * HOUR)
+        assertEquals(0, coordinator.applyRetention())
+
+        // Restarted after a day off with its clock unset: what is written now is dated 1970, and no pass runs on it.
+        reboot(DAY, wallMs = 86_400_000L)
+        received(2, "booted.bin", 0)
+        assertTrue(File(files, "booted.bin").lastModified() < RetentionClock.FLOOR_MS)
+        assertEquals(0, coordinator.applyRetention())
+        assertTrue(present("booted.bin") && present("aging.bin"))
+
+        // Network time sets it right. aging.bin is seven and a half days old and goes; booted.bin is dated now, first
+        // seen, and kept.
+        setWall(NOW + DAY)
+        tick(MIN)
+        assertEquals(1, coordinator.applyRetention())
+        assertFalse(present("aging.bin"))
+        assertTrue(present("booted.bin"))
+        assertEquals(now, File(files, "booted.bin").lastModified())
+        assertTrue(logs.contains("MEDIA_WIPED kind=redated n=1"))
+
+        // It goes only once it is really older than the setting, counted from then.
+        tick(6 * DAY)
+        assertEquals(0, coordinator.applyRetention())
+        assertTrue(present("booted.bin"))
+        tick(2 * DAY)
+        assertEquals(1, coordinator.applyRetention())
+        assertFalse(present("booted.bin"))
+    }
+
+    @Test
+    fun theTrustedTimeFollowsRealTime() {
+        val start = RetentionClock.step(null, NOW, HOUR)
+        assertEquals(NOW, start.nowMs)
+        val s = start.state!!
+        // Same boot: exactly the elapsed time, whatever the wall clock says.
+        val ahead = RetentionClock.step(s, NOW + 30 * DAY, HOUR + DAY)
+        assertEquals(NOW + DAY, ahead.nowMs)
+        assertEquals(RetentionClock.State(NOW + DAY, HOUR + DAY), ahead.state)
+        val back = RetentionClock.step(s, NOW - 365 * DAY, HOUR + DAY)
+        assertEquals(NOW - 365 * DAY, back.nowMs)
+        assertEquals(NOW + DAY, back.state!!.trustedMs)
+        // A restart (elapsedRealtime below the stored one): the wall clock's step, at most two days, at least the uptime.
+        assertEquals(NOW + 9 * HOUR, RetentionClock.step(s, NOW + 9 * HOUR, MIN).nowMs)
+        assertEquals(NOW + 2 * DAY, RetentionClock.step(s, NOW + 30 * DAY, MIN).nowMs)
+        assertEquals(NOW + 3 * DAY, RetentionClock.step(s.copy(elapsedMs = 9 * DAY), NOW + 30 * DAY, 3 * DAY).nowMs)
+        // An unset clock: nothing removed, nothing stored.
+        val unset = RetentionClock.step(s, 86_400_000L, HOUR + DAY)
+        assertNull(unset.nowMs)
+        assertEquals(s, unset.state)
+        assertNull(RetentionClock.step(null, 0L, HOUR).state)
+        // A state file that can't be read starts again.
+        for (junk in listOf("", "x", "1 2", "${NOW}", "$NOW -1", "$NOW 1 2")) assertNull(junk, RetentionClock.parse(junk))
+        assertEquals(s, RetentionClock.parse("$NOW $HOUR\n"))
+    }
+
+    private fun clockFile() = File(data, MediaCoordinator.CLOCK_FILE)
 
     @Test
     fun settingTheLimitAppliesItAtOnceWhileRunning() {

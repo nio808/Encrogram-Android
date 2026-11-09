@@ -2,6 +2,7 @@ package app.encrogram.core.internal
 
 import app.encrogram.core.api.ChatAction
 import app.encrogram.core.api.SecuredError
+import app.encrogram.core.api.SecuredResult
 import app.encrogram.core.internal.FakeCore.Companion.chatsReply
 import app.encrogram.core.internal.FakeCore.Companion.contact
 import app.encrogram.core.internal.FakeCore.Companion.group
@@ -48,7 +49,7 @@ class GroupTimerTest {
     @Test
     fun theTimerChangesOnlyTimedMessages() {
         val current = profile(groupInfo(timedTtl = null))
-        val on = CoreJson.groupTimerUpdate(current, 86400)!!
+        val on = CoreJson.groupTimerUpdate(current, 86400)
         assertEquals("""{"enable":"on","ttl":86400}""", on.getJSONObject("groupPreferences").getJSONObject("timedMessages").toString())
         // Everything else as stored: other preferences, description, admission, name.
         assertEquals("on", on.getJSONObject("groupPreferences").getJSONObject("history").getString("enable"))
@@ -58,20 +59,27 @@ class GroupTimerTest {
         assertEquals("Team", on.getString("displayName"))
         assertEquals("the stored profile is not touched", "off", current.getJSONObject("groupPreferences").getJSONObject("timedMessages").getString("enable"))
 
-        val off = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 604800)), null)!!
+        val off = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 604800)), null)
         assertEquals("""{"enable":"off"}""", off.getJSONObject("groupPreferences").getJSONObject("timedMessages").toString())
-        val changed = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 604800)), 86400)!!
+        val changed = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 604800)), 86400)
         assertEquals(86400, changed.getJSONObject("groupPreferences").getJSONObject("timedMessages").getInt("ttl"))
     }
 
     @Test
-    fun anUnchangedTimerSendsNothing() {
-        assertNull(CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 86400)), 86400))
-        assertNull(CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = null)), null))
-        // No timedMessages at all is the core's default: off.
+    fun anUnchangedTimerIsStillBuilt() {
+        // Review of 8c89dfd6, finding 1: after a relay timeout the owner's phone holds the timer and the members don't;
+        // the retry must send it again.
+        val same = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = 86400)), 86400)
+        assertEquals("""{"enable":"on","ttl":86400}""", same.getJSONObject("groupPreferences").getJSONObject("timedMessages").toString())
+        assertTrue(profile(groupInfo(timedTtl = 86400)).similar(same))
+        val stillOff = CoreJson.groupTimerUpdate(profile(groupInfo(timedTtl = null)), null)
+        assertEquals("""{"enable":"off"}""", stillOff.getJSONObject("groupPreferences").getJSONObject("timedMessages").toString())
+        // No timedMessages at all is the core's default, off: written out as off, everything else kept.
         val bare = JSONObject("""{"displayName":"Team","fullName":"","groupPreferences":{"history":{"enable":"on"}}}""")
-        assertNull(CoreJson.groupTimerUpdate(bare, null))
-        val noPrefs = CoreJson.groupTimerUpdate(JSONObject("""{"displayName":"Team"}"""), 3600)!!
+        val bareOff = CoreJson.groupTimerUpdate(bare, null).getJSONObject("groupPreferences")
+        assertEquals("off", bareOff.getJSONObject("timedMessages").getString("enable"))
+        assertEquals("on", bareOff.getJSONObject("history").getString("enable"))
+        val noPrefs = CoreJson.groupTimerUpdate(JSONObject("""{"displayName":"Team"}"""), 3600)
         assertEquals("", noPrefs.getString("fullName"))
         assertEquals(3600, noPrefs.getJSONObject("groupPreferences").getJSONObject("timedMessages").getInt("ttl"))
     }
@@ -124,7 +132,7 @@ class GroupTimerTest {
     }
 
     @Test
-    fun theOwnerTurnsItOffAndAnUnchangedTimerSendsNothing() {
+    fun theOwnerTurnsItOffAndTheSameTimerIsSentAgain() {
         startWithGroup("owner", timedTtl = 604800)
         assertEquals(604800, h.engine.chats().single { it.chatId == groupChatId }.disappearingTtlSeconds)
         core.prefix("/_group_profile #3 ", result("groupUpdated"))
@@ -132,14 +140,49 @@ class GroupTimerTest {
         h.engine.chatAction(groupChatId, ChatAction.SetDisappearing(604800), same)
         h.awaitIdle()
         same.value()
-        assertTrue(core.sent("/_group_profile").isEmpty())
+        val again = JSONObject(core.sent("/_group_profile #3 ").single().cmd.removePrefix("/_group_profile #3 "))
+        assertEquals(604800, again.getJSONObject("groupPreferences").getJSONObject("timedMessages").getInt("ttl"))
 
         val off = Answer<Unit>()
         h.engine.chatAction(groupChatId, ChatAction.SetDisappearing(null), off)
         h.awaitIdle()
         off.value()
-        val sent = JSONObject(core.sent("/_group_profile #3 ").single().cmd.removePrefix("/_group_profile #3 "))
+        val sent = JSONObject(core.sent("/_group_profile #3 ").last().cmd.removePrefix("/_group_profile #3 "))
         assertEquals("off", sent.getJSONObject("groupPreferences").getJSONObject("timedMessages").getString("enable"))
+    }
+
+    /**
+     * Review of 8c89dfd6, finding 1: the core saves the new profile, then times out writing the group link's data on our
+     * relay, so the members never get it. The owner sees the error and the row the core kept; a retry sends it again.
+     */
+    @Test
+    fun aRelayTimeoutShowsWhatThisPhoneKeptAndARetrySendsItAgain() {
+        startWithGroup("owner")
+        core.groupProfiles(3, groupInfo(), Samples.AGENT_BROKER_TIMEOUT)
+        val failed = Answer<Unit>()
+        h.engine.chatAction(groupChatId, ChatAction.SetDisappearing(86400), failed)
+        h.awaitIdle()
+
+        assertTrue(failed.results.single() is SecuredResult.Err)
+        // On the network thread, with NetRetry's one retry; the profile read there too.
+        assertEquals(listOf(0, 1), core.sent("/_group_profile #3 ").map { it.retryNum })
+        assertEquals(setOf("test-net"), core.sent("/_group_profile #3 ").map { it.thread }.toSet())
+        assertEquals("test-net", core.sent("/_get chat #3 count=1").last().thread)
+        // The list is reloaded after the failure: the row shows the timer this phone stored.
+        assertTrue(core.calls.indexOfLast { it.cmd == "/_get chats 1" } > core.calls.indexOfLast { it.cmd.startsWith("/_group_profile #3 ") })
+        assertEquals(86400, h.engine.chats().single { it.chatId == groupChatId }.disappearingTtlSeconds)
+        assertTrue(h.listener.log.contains("chats"))
+
+        // The relay answers again. The profile already holds the timer, and the owner's retry still sends it.
+        core.groupProfiles(3, groupInfo(), result("groupUpdated"))
+        val retried = Answer<Unit>()
+        h.engine.chatAction(groupChatId, ChatAction.SetDisappearing(86400), retried)
+        h.awaitIdle()
+        retried.value()
+        val sent = core.sent("/_group_profile #3 ")
+        assertEquals(3, sent.size)
+        assertEquals(86400, JSONObject(sent.last().cmd.removePrefix("/_group_profile #3 "))
+            .getJSONObject("groupPreferences").getJSONObject("timedMessages").getInt("ttl"))
     }
 
     @Test

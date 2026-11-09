@@ -69,6 +69,8 @@ internal class MediaCoordinator(
     private val retention: RetentionSetting = RetentionSetting(File(ledger.folder, RETENTION_FILE)),
     /** Our uploads that haven't ended: their files are never removed. Next to the ledger. */
     private val pins: UploadPins = UploadPins(File(ledger.folder, PINS_FILE)),
+    /** What retention passes measure file ages against: never ahead of the time that really passed. Next to the ledger. */
+    private val retentionClock: RetentionClock = RetentionClock(File(ledger.folder, CLOCK_FILE), host::nowMs, host::elapsedMs),
 ) {
     private val lock = Any()
     private var generation = 0L
@@ -725,10 +727,20 @@ internal class MediaCoordinator(
      * were removed, or null when Saved Messages couldn't be listed (then nothing was). Their messages stay and show
      * NOT_ON_DEVICE; nothing downloads them again (the core's record says complete, and /freceive refuses anything but
      * a new offer).
+     *
+     * Ages are measured against [RetentionClock] (a wall clock set ahead can't age anything); every pass steps it, even
+     * with the setting at forever, so it is current when the user turns retention on. While the wall clock is unset
+     * (before [RetentionClock.FLOOR_MS]) nothing is removed. A file dated before that floor was written while it was
+     * unset: it is dated now, in place, and counted from this pass ([redateUnset]).
      */
-    fun applyRetention(nowMs: Long = host.nowMs()): Int? {
+    fun applyRetention(): Int? {
+        val now = retentionClock.passNow()
         val days = retention.days() ?: return 0
-        return removeFiles(nowMs, days, "retention")
+        if (now == null) {
+            SecuredLog.w(Ev.MEDIA_WIPED, "clock_unset")
+            return 0
+        }
+        return removeFiles(now, days, "retention")
     }
 
     /**
@@ -773,12 +785,27 @@ internal class MediaCoordinator(
         val keep: (String) -> Boolean = { name ->
             name in saved || name in inUse || (pinned.isNotEmpty() && MediaRetention.nameHash(name) in pinned)
         }
-        val due = MediaRetention.select(vault.storedFiles(), nowMs, days, keep)
+        val listed = vault.storedFiles()
+        val due = MediaRetention.select(if (days == null) listed else redateUnset(listed, nowMs), nowMs, days, keep)
         val gone = due.filter { vault.expire(it) }
         if (gone.size < due.size) SecuredLog.w(Ev.MEDIA_IO_FAILED, "expire", due.size - gone.size)
         SecuredLog.i(Ev.MEDIA_WIPED, tag, gone.size)
         tellRemoved(gone)
         return gone.size
+    }
+
+    /**
+     * Retention only: [files] without those dated before [RetentionClock.FLOOR_MS]. Such a file was written while the
+     * phone's clock was unset (a phone that booted at 1970) and is not decades old: it is dated [nowMs] in place, so this
+     * and every later pass count its age from when retention first saw it.
+     */
+    private fun redateUnset(files: List<StoredFile>, nowMs: Long): List<StoredFile> {
+        val (unset, dated) = files.partition { it.bytes > 0 && it.modifiedMs < RetentionClock.FLOOR_MS }
+        if (unset.isEmpty()) return files
+        val done = unset.count { vault.redate(it, nowMs) }
+        SecuredLog.i(Ev.MEDIA_WIPED, "redated", done)
+        if (done < unset.size) SecuredLog.w(Ev.MEDIA_IO_FAILED, "redate", unset.size - done)
+        return dated
     }
 
     /** Sends again the shown messages whose files [gone] held, as the store holds them now (NOT_ON_DEVICE). */
@@ -976,6 +1003,7 @@ internal class MediaCoordinator(
         /** Next to the ledger in the engine's no-backup folder (never in `files/`, so never in a backup). */
         const val RETENTION_FILE = "media_retention"
         const val PINS_FILE = "media_upload_pins"
+        const val CLOCK_FILE = "media_retention_clock"
 
         private const val RETENTION_INVALID = "Choose how many days to keep media."
 
