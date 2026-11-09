@@ -665,9 +665,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             avatarContainer.setOnClickListener(v -> openGroupInfo());
         } else if (!notes) {
             avatarContainer.setTitleIcons(titleLock, null);
-            // Tapping the header opens the security code sheet (a note folder has no contact to verify).
+            // Tapping the header opens contact info (security code, mute, timer, delete), like Telegram's profile.
             avatarContainer.setEnabled(true);
-            avatarContainer.setOnClickListener(v -> openVerify());
+            avatarContainer.setOnClickListener(v -> SecuredContactInfoActivity.open(this, chatId));
         } else {
             avatarContainer.setEnabled(false);
         }
@@ -2455,7 +2455,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         options.addIf(!deleted && ready && !media, org.telegram.messenger.R.drawable.msg_forward, tg(org.telegram.messenger.R.string.Forward), () -> pickForwardTarget(Collections.singletonList(m)));
         options.add(org.telegram.messenger.R.drawable.msg_select, tg(org.telegram.messenger.R.string.Select), () -> toggleSelection(m));
         options.add(org.telegram.messenger.R.drawable.msg_delete, tg(org.telegram.messenger.R.string.Delete), true, () -> confirmDelete(Collections.singletonList(m)));
-        // shortcut: message info (delivery details, disappearing timer) plugs in here.
+        options.addIf(!deleted && m.getEvent() == null && !notes, org.telegram.messenger.R.drawable.msg_info, getContext().getString(R.string.sec_r2i_details_title),
+                () -> SecuredMessageDetailsSheet.show(this, engine, chatId, m.getMessageId()));
         options.setGravity(m.getOutgoing() ? Gravity.RIGHT : Gravity.LEFT);
         openMenu = options;
         options.show();

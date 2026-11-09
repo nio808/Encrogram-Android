@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_r2s_set_photo">Set photo</string>
+    <string name="sec_r2s_remove_photo">Remove photo</string>
+    <string name="sec_r2s_photo_info">Your photo is shown to your Secured contacts and groups. It is resized and saved as a new image, so the original\'s details (such as location) are not kept.</string>
+    <string name="sec_r2s_group_photo_info">The group photo is shown to the group\'s members.</string>
+    <string name="sec_r2s_photo_failed">This photo can\'t be used. Pick another one.</string>
+    <string name="sec_r2s_no_picker">No photo picker is available on this phone.</string>
+    <string name="sec_r2s_storage_header">Data and storage</string>
+    <string name="sec_r2s_keep_media">Keep media</string>
+    <string name="sec_r2s_keep_3d">3 days</string>
+    <string name="sec_r2s_keep_1w">1 week</string>
+    <string name="sec_r2s_keep_1m">1 month</string>
+    <string name="sec_r2s_keep_forever">Forever</string>
+    <string name="sec_r2s_keep_info">Older photos, videos, voice messages and files are removed from this phone. The messages stay.</string>
+    <string name="sec_r2s_on_phone">Media on this phone</string>
+    <string name="sec_r2s_on_phone_value">%1$s</string>
+    <string name="sec_r2s_unknown">Unknown</string>
+    <string name="sec_r2s_clear">Clear media</string>
+    <string name="sec_r2s_clear_title">Clear media?</string>
+    <string name="sec_r2s_clear_text">All photos, videos, voice messages and files will be removed from this phone. The messages stay, but the removed files can\'t be downloaded again.</string>
+    <string name="sec_r2s_clear_confirm">Clear</string>
+    <string name="sec_r2s_clear_done">Media removed from this phone.</string>
+    <string name="sec_r2s_failed">%1$s</string>
+</resources>

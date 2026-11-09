@@ -3,6 +3,8 @@ package app.encrogram.secured;
 import static org.telegram.messenger.AndroidUtilities.dp;
 
 import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -34,6 +36,7 @@ import app.encrogram.core.api.ChatAction;
 import app.encrogram.core.api.ChatKind;
 import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.GroupMember;
+import app.encrogram.core.api.MediaPreview;
 import app.encrogram.core.api.MemberRole;
 import app.encrogram.core.api.MemberStatus;
 import app.encrogram.core.api.SecuredResult;
@@ -51,6 +54,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     private static final int T_PROFILE = 0, T_SHADOW = 1, T_ACTION = 2, T_INFO = 3, T_HEADER = 4, T_MEMBER = 5;
     private static final int A_ADD = 1, A_LINK = 2, A_LEAVE = 3, A_DELETE = 4;
     private static final int I_FACTS = 1, I_MEMBERS_ERROR = 2, I_PAUSED = 3;
+    private static final int A_PHOTO = 5, A_PHOTO_REMOVE = 6, REQUEST_PHOTO = 0x5EC4;
 
     private static final class Row {
         final int type;
@@ -70,6 +74,8 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     private RecyclerListView.SelectionAdapter adapter;
     private ProfileHeader header;
     private boolean busy;
+    private MediaPreview shownPreview;
+    private Bitmap shownBitmap;
 
     SecuredGroupInfoActivity(long chatId) {
         this.chatId = chatId;
@@ -173,6 +179,10 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     private void rebuild() {
         rows.clear();
         rows.add(new Row(T_PROFILE, 0));
+        if (admin()) {
+            rows.add(new Row(T_ACTION, A_PHOTO));
+            if (summary != null && summary.getAvatar() != null) rows.add(new Row(T_ACTION, A_PHOTO_REMOVE));
+        }
         rows.add(new Row(T_SHADOW, 0));
         if (admin()) {
             rows.add(new Row(T_ACTION, A_ADD));
@@ -193,8 +203,60 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
         rows.add(new Row(T_ACTION, A_LEAVE));
         if (owner()) rows.add(new Row(T_ACTION, A_DELETE));
         rows.add(new Row(T_SHADOW, 0));
-        if (header != null) header.bind(chatId, displayName(), subtitle(header.getContext()));
+        if (header != null) header.bind(chatId, displayName(), subtitle(header.getContext()), groupPhoto());
         if (adapter != null) adapter.notifyDataSetChanged();
+    }
+
+    /** The group photo, decoded with bounds and kept while the bytes are unchanged. */
+    private Bitmap groupPhoto() {
+        final MediaPreview av = summary != null ? summary.getAvatar() : null;
+        if (av == null) {
+            shownPreview = null;
+            shownBitmap = null;
+        } else if (!av.equals(shownPreview)) {
+            shownPreview = av;
+            shownBitmap = MediaBitmaps.decodePreview(av, AvatarImage.SIZE, AvatarImage.SIZE);
+        }
+        return shownBitmap;
+    }
+
+    private void pickPhoto() {
+        try {
+            startActivityForResult(AvatarImage.pickIntent(), REQUEST_PHOTO);
+        } catch (RuntimeException e) {
+            showError(getParentActivity().getString(R.string.sec_r2s_no_picker));
+        }
+    }
+
+    @Override
+    public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
+        super.onActivityResultFragment(requestCode, resultCode, data);
+        if (requestCode != REQUEST_PHOTO || destroyed || busy || getParentActivity() == null) return;
+        if (resultCode != android.app.Activity.RESULT_OK || data == null || data.getData() == null) return;
+        final Context c = getParentActivity();
+        busy = true;
+        AvatarImage.prepare(c, data.getData(), jpeg -> {
+            busy = false;
+            if (destroyed) return;
+            if (jpeg == null) showError(c.getString(R.string.sec_r2s_photo_failed));
+            else storePhoto(jpeg);
+        });
+    }
+
+    private void storePhoto(byte[] jpeg) {
+        if (engine == null || destroyed) return;
+        busy = true;
+        try {
+            engine.setGroupPhoto(chatId, jpeg, result -> ui(() -> {
+                busy = false;
+                if (destroyed) return;
+                if (result instanceof SecuredResult.Err) showError(errorText((SecuredResult.Err) result));
+                refreshSummary();
+            }));
+        } catch (Throwable t) {
+            busy = false;
+            showThrown(t, R.string.secgroup_action_failed);
+        }
     }
 
     private boolean hasForeignMember() {
@@ -218,7 +280,11 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
 
     private void onAction(int id) {
         if (engine == null || destroyed || busy) return;
-        if (id == A_ADD) {
+        if (id == A_PHOTO) {
+            pickPhoto();
+        } else if (id == A_PHOTO_REMOVE) {
+            storePhoto(null);
+        } else if (id == A_ADD) {
             presentFragment(new SecuredNewGroupActivity(chatId, channel()));
         } else if (id == A_LINK) {
             SecuredGroupLinkSheet.show(this, engine, chatId, channel());
@@ -381,7 +447,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     @Override
     RecyclerListView.SelectionAdapter buildAdapter(Context context) {
         header = new ProfileHeader(context);
-        header.bind(chatId, displayName(), subtitle(context));
+        header.bind(chatId, displayName(), subtitle(context), groupPhoto());
         adapter = new RecyclerListView.SelectionAdapter() {
             @Override
             public boolean isEnabled(RecyclerView.ViewHolder holder) {
@@ -436,7 +502,13 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
                         final TextCell cell = (TextCell) holder.itemView;
                         final boolean nextIsAction = position + 1 < rows.size() && rows.get(position + 1).type == T_ACTION;
                         final boolean ch = channel();
-                        if (r.id == A_ADD) {
+                        if (r.id == A_PHOTO) {
+                            cell.setTextAndIcon(c.getString(R.string.sec_r2s_set_photo), org.telegram.messenger.R.drawable.msg_addphoto, nextIsAction);
+                            cell.setColors(Theme.key_windowBackgroundWhiteBlueIcon, Theme.key_windowBackgroundWhiteBlueText4);
+                        } else if (r.id == A_PHOTO_REMOVE) {
+                            cell.setTextAndIcon(c.getString(R.string.sec_r2s_remove_photo), org.telegram.messenger.R.drawable.msg_delete, nextIsAction);
+                            cell.setColors(Theme.key_text_RedBold, Theme.key_text_RedBold);
+                        } else if (r.id == A_ADD) {
                             cell.setTextAndIcon(c.getString(ch ? R.string.secgroup_add_subscribers : R.string.secgroup_add_members), org.telegram.messenger.R.drawable.msg_addcontact, nextIsAction);
                             cell.setColors(Theme.key_windowBackgroundWhiteBlueIcon, Theme.key_windowBackgroundWhiteBlueText4);
                         } else if (r.id == A_LINK) {
@@ -478,6 +550,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
 
     private static final class ProfileHeader extends LinearLayout {
         private final AvatarDrawable avatar = new AvatarDrawable(SecuredResourcesProvider.get());
+        private final AvatarImage.CircleView avatarView;
         private final TextView title;
         private final TextView sub;
 
@@ -487,13 +560,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
             setGravity(Gravity.CENTER_HORIZONTAL);
             setBackgroundColor(Kit.color(Theme.key_windowBackgroundWhite));
             setPadding(dp(16), dp(20), dp(16), dp(16));
-            final View avatarView = new View(context) {
-                @Override
-                protected void onDraw(@NonNull Canvas canvas) {
-                    avatar.setBounds(0, 0, getWidth(), getHeight());
-                    avatar.draw(canvas);
-                }
-            };
+            avatarView = new AvatarImage.CircleView(context, avatar);
             addView(avatarView, LayoutHelper.createLinear(96, 96, Gravity.CENTER_HORIZONTAL));
             title = Kit.text(context, "", 20, Kit.color(Theme.key_windowBackgroundWhiteBlackText), true);
             title.setGravity(Gravity.CENTER);
@@ -505,9 +572,10 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
             addView(sub, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
         }
 
-        void bind(long chatId, String name, CharSequence subtitle) {
+        void bind(long chatId, String name, CharSequence subtitle, Bitmap photo) {
             final String shown = name == null ? "" : name.trim();
             Kit.setAvatar(avatar, ChatRowMapper.colorId(chatId), shown);
+            avatarView.setPhoto(photo);
             title.setText(shown);
             sub.setText(subtitle);
             invalidate();

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sec_r2i_contact_title">Contact info</string>
+    <string name="sec_r2i_verified">Verified by you</string>
+    <string name="sec_r2i_not_verified">Not verified</string>
+    <string name="sec_r2i_security_code">Security code</string>
+    <string name="sec_r2i_security_value_verified">Verified</string>
+    <string name="sec_r2i_security_value_open">Compare</string>
+    <string name="sec_r2i_notifications">Notifications</string>
+    <string name="sec_r2i_disappearing">Disappearing messages</string>
+    <string name="sec_r2i_disappearing_off">Off</string>
+    <string name="sec_r2i_clear">Clear history</string>
+    <string name="sec_r2i_delete">Delete contact</string>
+    <string name="sec_r2i_connecting">Still connecting</string>
+    <string name="sec_r2i_failed">That did not work: %1$s</string>
+    <string name="sec_r2i_not_running">Secured is still connecting. Try again in a moment.</string>
+    <string name="sec_r2i_contact_note">Muting is your own setting. The timer works only if your contact\u2019s app allows disappearing messages too.</string>
+
+    <string name="sec_r2i_details_title">Message details</string>
+    <string name="sec_r2i_sent">Sent</string>
+    <string name="sec_r2i_received">Received on this phone</string>
+    <string name="sec_r2i_status">Status</string>
+    <string name="sec_r2i_status_received">Received</string>
+    <string name="sec_r2i_delivery_header">Members</string>
+    <string name="sec_r2i_delivery_none">This group does not report delivery per member.</string>
+    <string name="sec_r2i_versions_header">Earlier versions</string>
+    <string name="sec_r2i_loading">Loading</string>
+    <string name="sec_r2i_unavailable">Details are not available yet.</string>
+    <string name="sec_r2i_error">Could not load details: %1$s</string>
+</resources>
