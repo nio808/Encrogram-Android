@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secured media (docs/tasks.md, Media phase 2). Wording rules: AGENTS.md rule 6 and research/gaps-audit.md §3.3. -->
+<resources>
+    <!-- What a message carries -->
+    <string name="secmedia_photo">Photo</string>
+    <string name="secmedia_gif">GIF</string>
+    <string name="secmedia_video">Video</string>
+    <string name="secmedia_voice">Voice message</string>
+    <string name="secmedia_file">File</string>
+
+    <!-- Chat list preview: no caption, then with a caption (%1$s) -->
+    <string name="secmedia_list_photo">🖼 Photo</string>
+    <string name="secmedia_list_gif">GIF</string>
+    <string name="secmedia_list_video">📹 Video</string>
+    <string name="secmedia_list_voice">🎤 Voice message</string>
+    <string name="secmedia_list_file">📎 File</string>
+    <string name="secmedia_list_photo_caption">🖼 %1$s</string>
+    <string name="secmedia_list_gif_caption">GIF, %1$s</string>
+    <string name="secmedia_list_video_caption">📹 %1$s</string>
+    <string name="secmedia_list_voice_caption">🎤 %1$s</string>
+    <string name="secmedia_list_file_caption">📎 %1$s</string>
+
+    <!-- Progress inside a bubble -->
+    <string name="secmedia_progress">%1$s of %2$s</string>
+    <string name="secmedia_waiting">Waiting…</string>
+
+    <!-- Short failure line inside a bubble (MediaFailure) -->
+    <string name="secmedia_fail_expired">No longer on the server</string>
+    <string name="secmedia_fail_server_full">File server full</string>
+    <string name="secmedia_fail_foreign">Not downloaded: outside Encrogram</string>
+    <string name="secmedia_fail_too_large">Too large</string>
+    <string name="secmedia_fail_check">Not downloaded: check failed</string>
+    <string name="secmedia_fail_cancelled">Cancelled</string>
+    <string name="secmedia_fail_send">Not sent</string>
+    <string name="secmedia_fail_receive">Download failed</string>
+    <string name="secmedia_fail_damaged">Arrived damaged</string>
+    <string name="secmedia_fail_unsupported">Transfer refused</string>
+    <string name="secmedia_fail_not_on_device">Not on this phone</string>
+
+    <!-- Full failure sentence, shown on tap. Same words as the engine's ErrorMapper media sentences. -->
+    <string name="secmedia_why_expired">This file is no longer on the server (files are kept 48 hours). Ask the sender to send it again.</string>
+    <string name="secmedia_why_server_full">The Secured file server is full right now. Try again later.</string>
+    <string name="secmedia_why_foreign">This file is stored on a server outside Encrogram, so it wasn\'t downloaded.</string>
+    <string name="secmedia_why_too_large">This file is too large. Secured files can be up to 100 MB.</string>
+    <string name="secmedia_why_check">This file couldn\'t be checked, so it wasn\'t downloaded. Ask the sender to send it again.</string>
+    <string name="secmedia_why_cancelled">This file transfer was cancelled.</string>
+    <string name="secmedia_why_send">This file couldn\'t be sent. Try sending it again.</string>
+    <string name="secmedia_why_receive">This file couldn\'t be downloaded.</string>
+    <string name="secmedia_why_damaged">This file arrived damaged. Ask the sender to send it again.</string>
+    <string name="secmedia_why_unsupported">Encrogram moves files only through its own file server, so this transfer was refused.</string>
+    <string name="secmedia_why_not_on_device">This file isn\'t on this phone.</string>
+
+    <!-- Taps -->
+    <string name="secmedia_no_open_file">Files can\'t be opened in other apps in this version.</string>
+    <string name="secmedia_open_failed">This file couldn\'t be opened.</string>
+
+    <!-- Accessibility -->
+    <string name="secmedia_acc_download">Download</string>
+    <string name="secmedia_acc_cancel">Cancel</string>
+    <string name="secmedia_acc_open">Open</string>
+    <string name="secmedia_acc_play">Play</string>
+    <string name="secmedia_acc_pause">Pause</string>
+    <string name="secmedia_acc_close">Close</string>
+
+    <!-- Attach -->
+    <string name="secmedia_attach">Attach</string>
+    <string name="secmedia_attach_gallery">Photo or video</string>
+    <string name="secmedia_attach_file">File</string>
+    <string name="secmedia_preparing">Preparing…</string>
+    <string name="secmedia_caption_hint">Add a caption…</string>
+    <string name="secmedia_send">Send</string>
+    <string name="secmedia_sent_as_is">Sent exactly as it is.</string>
+    <!-- No "location removed" claim until it is tested on Samsung and Pixel (research/gaps-audit.md §3.3, MD10). -->
+    <string name="secmedia_photo_standard">Sent at standard quality.</string>
+    <string name="secmedia_no_picker">No app on this phone can pick files.</string>
+    <string name="secmedia_not_in_saved">Photos and files can\'t be added to Saved Messages in this version.</string>
+</resources>

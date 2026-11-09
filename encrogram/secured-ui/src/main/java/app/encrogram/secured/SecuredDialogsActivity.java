@@ -442,6 +442,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                 org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.SavedMessages))
                 .withGroup(context.getString(R.string.secgroup_row_invited), context.getString(R.string.secgroup_row_sender_message));
         labels.events = (e, k) -> SecuredMessageMapper.eventText(context, k, e);
+        labels.media = (k, t) -> MediaText.listPreview(context, k, t);
         final ChatsSwitcherView switcher = new ChatsSwitcherView(context, owner);
         actionBar.addView(switcher, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 48, Gravity.LEFT | Gravity.BOTTOM, 22, 0, 0, 4));
 

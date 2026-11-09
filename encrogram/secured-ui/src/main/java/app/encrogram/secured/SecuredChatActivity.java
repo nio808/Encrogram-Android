@@ -95,6 +95,10 @@ import app.encrogram.core.api.ChatSummary;
 import app.encrogram.core.api.EngineState;
 import app.encrogram.core.api.ItemAction;
 import app.encrogram.core.api.LinkCheck;
+import app.encrogram.core.api.MediaKind;
+import app.encrogram.core.api.MediaState;
+import app.encrogram.core.api.QuotePreview;
+import app.encrogram.core.api.SecuredMedia;
 import app.encrogram.core.api.MessagePage;
 import app.encrogram.core.api.MessageStatus;
 import app.encrogram.core.api.ReactionCount;
@@ -132,11 +136,15 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static final int VIEW_DATE = 1;
     private static final int VIEW_REACTIONS = 2;
     private static final int VIEW_EVENT = 3;
+    private static final int VIEW_PHOTO = 4;   // photo, GIF, video (SecuredPhotoCell)
+    private static final int VIEW_FILE = 5;
+    private static final int VIEW_VOICE = 6;
 
     private static final int ROW_DATE = 0;
     private static final int ROW_MESSAGE = 1;
     private static final int ROW_REACTIONS = 2;
     private static final int ROW_EVENT = 3;   // group service row ("X joined")
+    private static final int ROW_MEDIA = 4;   // the media bubble of a message; its caption is a joined ROW_MESSAGE
 
     private static final int PAGE_SIZE = 50;
     private static final int GROUP_SECONDS = 5 * 60;
@@ -235,6 +243,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private String name = "";
     private String selfNameShown;
 
+    // Media (docs/tasks.md, Media phase 2). Bitmaps live in memory only; one voice player per screen.
+    private MediaBitmaps bitmaps;
+    private SecuredAudioPlayer audio;
+    private SecuredAttach attach;
+    private ImageView attachButton;
+    /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
+    private final HashMap<Long, long[]> liveProgress = new HashMap<>();
+
     private final Runnable hideFloatingDate = () -> showFloatingDate(false);
 
     private boolean occupyStatusBar = !AndroidUtilities.isTablet();
@@ -298,6 +314,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public void onMessageChanged(SecuredMessage message) {
             if (message.getChatId() != chatId || destroyed) return;
+            // A new media state carries its own byte count: forget the live one.
+            liveProgress.remove(message.getMessageId());
             upsertMessage(message, false);
         }
 
@@ -305,6 +323,15 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         public void onMessagesRemoved(long cid, List<Long> messageIds) {
             if (cid != chatId || destroyed) return;
             removeMessages(messageIds);
+        }
+
+        @Override
+        public void onMediaProgress(long cid, long messageId, long transferredBytes, long totalBytes) {
+            if (cid != chatId || destroyed) return;
+            // Redraws the one visible cell; the list is not rebuilt per step (contract: onMediaProgress).
+            liveProgress.put(messageId, new long[]{transferredBytes, totalBytes});
+            final SecuredMediaCell cell = mediaCellFor(messageId);
+            if (cell != null) cell.setProgress(transferredBytes, totalBytes);
         }
 
         @Override
@@ -356,11 +383,18 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         super.onLowMemory();
         objects.clear();
         objectSources.clear();
+        if (bitmaps != null) bitmaps.clear();
     }
 
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        // Media: stop the player and the viewer (both release their decrypted playback), drop prepared attachments
+        // and the in-memory bitmaps.
+        SecuredMediaViewer.closeAll();
+        if (audio != null) audio.release();
+        if (attach != null) attach.destroy();
+        if (bitmaps != null) bitmaps.clear();
         if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.cancelRunOnUIThread(hideFloatingDate);
         AndroidUtilities.cancelRunOnUIThread(runSearch);
@@ -395,6 +429,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         name = notes ? tg(org.telegram.messenger.R.string.SavedMessages) : summary != null ? summary.getDisplayName() : "";
         selfNameShown = selfName();
         mapper = new SecuredMessageMapper(context, currentAccount);
+        if (bitmaps == null) bitmaps = new MediaBitmaps(engine);
+        if (attach == null) attach = new SecuredAttach(attachHost);
         mapper.setNames(name, selfNameShown);
         mapper.setAvatarResources(chatResources);
         mapper.setSenderLookup(this::senderNameOf);
@@ -457,7 +493,6 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             column.addView(deleteBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         }
 
-        // shortcut: attachments and media cells (step 5) plug in next to the composer field.
         loadMessages();
         return root;
     }
@@ -606,17 +641,19 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                     if (selectedIds.isEmpty() && !searching) ((SecuredReactionsView) view).onTap(x, y);
                     return;
                 }
-                final SecuredMessage m = view instanceof ChatMessageCell ? messageAt(position) : null;
+                final SecuredMessage m = view instanceof ChatMessageCell || view instanceof SecuredMediaCell ? messageAt(position) : null;
                 if (m != null && searching) {
                     openMatch(m);
                 } else if (m != null && !selectedIds.isEmpty()) {
                     toggleSelection(m);
+                } else if (view instanceof SecuredMediaCell) {
+                    onMediaTap((SecuredMediaCell) view, x, y);
                 }
             }
         });
         listView.setOnItemLongClickListener((view, position) -> {
-            if (!(view instanceof ChatMessageCell)) return false;
-            onMessageLongPress((ChatMessageCell) view);
+            if (!(view instanceof ChatMessageCell) && !(view instanceof SecuredMediaCell)) return false;
+            onMessageLongPress(view);
             return true;
         });
         listView.setOnScrollListener(new RecyclerView.OnScrollListener() {
@@ -991,6 +1028,19 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         input.setCursorWidth(1.5f);
         input.setHandlesColor(SecuredResourcesProvider.accentFill());
         field.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.BOTTOM));
+        if (!notes) {
+            // Attach (Media phase 2): Telegram's paperclip icon, our sheet (system photo and file pickers, no camera).
+            // Saved Messages takes text only in v1 (engine: NOT_ALLOWED), so it has no paperclip.
+            input.setPadding(dp(16), dp(11), dp(48), dp(11));
+            attachButton = new ImageView(context);
+            attachButton.setScaleType(ImageView.ScaleType.CENTER);
+            attachButton.setImageResource(org.telegram.messenger.R.drawable.msg_input_attach2);
+            attachButton.setColorFilter(new PorterDuffColorFilter(Kit.color(Theme.key_chat_messagePanelIcons), PorterDuff.Mode.SRC_IN));
+            attachButton.setContentDescription(context.getString(R.string.secmedia_attach));
+            attachButton.setBackground(Theme.createSelectorDrawable(chatResources.getColor(Theme.key_listSelector), Theme.RIPPLE_MASK_CIRCLE_20DP));
+            attachButton.setOnClickListener(v -> openAttach());
+            field.addView(attachButton, LayoutHelper.createFrame(48, 44, Gravity.RIGHT | Gravity.BOTTOM));
+        }
         row.addView(field, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
         // shortcut: the emoji-only EmojiView panel (stickers and GIFs off) plugs in next to the field.
 
@@ -1061,7 +1111,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         replyingTo = m;
         final String who = m.getOutgoing() ? mapper.selfName() : m.getSender() != null ? m.getSender().getDisplayName() : name;
-        showStrip(org.telegram.messenger.R.drawable.input_reply, input.getContext().getString(R.string.secchat_reply_to, who), m.getText());
+        showStrip(org.telegram.messenger.R.drawable.input_reply, input.getContext().getString(R.string.secchat_reply_to, who), previewText(m));
         openKeyboard();
     }
 
@@ -1214,7 +1264,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (c == null) return;
         final StringBuilder sb = new StringBuilder();
         for (SecuredMessage m : list) {
-            if (m.getDeleted()) continue;
+            if (m.getDeleted() || m.getText().isEmpty()) continue;   // a media message without a caption has no text
             if (sb.length() > 0) sb.append("\n\n");
             sb.append(m.getText());
         }
@@ -1400,6 +1450,204 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     }
 
+    // ---- media (docs/tasks.md, Media phase 2) ------------------------------------------------------------------
+
+    private final SecuredMediaCell.Host mediaHost = new SecuredMediaCell.Host() {
+        @Override
+        public MediaBitmaps bitmaps() {
+            return bitmaps;
+        }
+
+        @Override
+        public SecuredAudioPlayer audio() {
+            if (audio == null && engine != null && !destroyed) audio = new SecuredAudioPlayer(engine, audioListener);
+            return audio;
+        }
+
+        @Override
+        public String quoteAuthor(SecuredMessage m) {
+            final QuotePreview q = m.getReplyTo();
+            if (q == null) return "";
+            if (q.getOutgoing()) return mapper != null ? mapper.selfName() : "";
+            if (groupChat) {
+                final Long qid = q.getMessageId();
+                final String who = qid != null ? senderNameOf(qid) : null;
+                return who != null && !who.isEmpty() ? who : getContext() != null ? getContext().getString(R.string.secchat_quote_fallback) : "";
+            }
+            return name;
+        }
+    };
+
+    private final SecuredAudioPlayer.Listener audioListener = new SecuredAudioPlayer.Listener() {
+        @Override
+        public void onAudioChanged(long cid, long messageId) {
+            if (cid != chatId || destroyed) return;
+            final SecuredMediaCell cell = mediaCellFor(messageId);
+            if (cell != null) cell.invalidate();
+        }
+
+        @Override
+        public void onAudioFailed(SecuredError error) {
+            if (destroyed) return;
+            final Context c = getContext();
+            if (c == null) return;
+            showError(error != null ? error : new SecuredError(SecuredError.Kind.UNKNOWN, c.getString(R.string.secmedia_open_failed)));
+        }
+    };
+
+    private final SecuredAttach.Host attachHost = new SecuredAttach.Host() {
+        @Override
+        public BaseFragment fragment() {
+            return SecuredChatActivity.this;
+        }
+
+        @Override
+        public SecuredEngine engine() {
+            return engine;
+        }
+
+        @Override
+        public long chatId() {
+            return chatId;
+        }
+
+        @Override
+        public Theme.ResourcesProvider resources() {
+            return chatResources;
+        }
+
+        @Override
+        public MediaBitmaps bitmaps() {
+            return bitmaps;
+        }
+
+        @Override
+        public String composerText() {
+            return input != null && editing == null ? input.getText().toString().trim() : "";
+        }
+
+        @Override
+        public Long replyToId() {
+            return replyingTo != null ? replyingTo.getMessageId() : null;
+        }
+
+        @Override
+        public void onMediaSent(SecuredMessage m, boolean usedComposerText) {
+            if (destroyed) return;
+            if (usedComposerText && input != null && editing == null) input.setText("");
+            if (replyingTo != null) cancelStrip();
+            upsertMessage(m, true);
+        }
+
+        @Override
+        public void onMediaFailed(SecuredError e) {
+            if (!destroyed) showToast(e);
+        }
+    };
+
+    private void openAttach() {
+        if (attach == null || engine == null) return;
+        if (!engineRunning()) {
+            showNotRunning();
+            return;
+        }
+        if (!chatReady() || !canPostHere() || isInvited()) {
+            showError(null);
+            return;
+        }
+        if (editing != null) cancelStrip();
+        AndroidUtilities.hideKeyboard(input);
+        attach.showMenu();
+    }
+
+    /** A tap on a media bubble: what it does depends on where it landed and on the engine's state for the file. */
+    private void onMediaTap(SecuredMediaCell cell, float x, float y) {
+        final SecuredMessage m = cell.message();
+        final SecuredMedia media = m != null ? m.getMedia() : null;
+        if (media == null || engine == null) return;
+        final int hit = cell.hitTest(x, y);
+        if (hit == SecuredMediaCell.HIT_NONE) return;
+        if (hit == SecuredMediaCell.HIT_QUOTE) {
+            final Long qid = m.getReplyTo() != null ? m.getReplyTo().getMessageId() : null;
+            if (qid == null) showNotLoaded();
+            else goTo(qid);
+            return;
+        }
+        final MediaKind kind = media.getKind();
+        switch (media.getState()) {
+            case WAITING:
+                mediaCall(m, true);
+                break;
+            case DOWNLOADING:
+                mediaCall(m, false);
+                break;
+            case UPLOADING:
+                // The X stops the upload; a tap on a readable photo or a voice play opens it as usual.
+                if (hit == SecuredMediaCell.HIT_BUTTON || !media.getReadable() || kind == MediaKind.FILE) {
+                    mediaCall(m, false);
+                } else {
+                    openMedia(cell, m, hit);
+                }
+                break;
+            case READY:
+                openMedia(cell, m, hit);
+                break;
+            case FAILED:
+            default:
+                showMediaNote(MediaText.failureSentence(getContext(), media.getFailure()));
+                break;
+        }
+    }
+
+    private void openMedia(SecuredMediaCell cell, SecuredMessage m, int hit) {
+        final SecuredMedia media = m.getMedia();
+        if (media == null || !media.getReadable()) return;
+        switch (media.getKind()) {
+            case IMAGE:
+            case GIF:
+            case VIDEO:
+                SecuredMediaViewer.open(this, engine, bitmaps, m, authorOf(m), chatResources);
+                break;
+            case VOICE: {
+                final SecuredAudioPlayer player = mediaHost.audio();
+                if (player == null) return;
+                if (hit == SecuredMediaCell.HIT_SEEK) player.seek(m, cell.seekFraction());
+                else player.toggle(m);
+                break;
+            }
+            case FILE:
+            default:
+                // Opening a file in another app would hand its plain bytes out of Secured (no share-out in v1).
+                showMediaNote(getContext() != null ? getContext().getString(R.string.secmedia_no_open_file) : null);
+                break;
+        }
+    }
+
+    /** Download (accept) or stop a transfer. The new state arrives through onMessageChanged. */
+    private void mediaCall(SecuredMessage m, boolean accept) {
+        try {
+            final app.encrogram.core.api.SecuredCallback<kotlin.Unit> cb = result -> {
+                if (!destroyed && result instanceof SecuredResult.Err) showError(((SecuredResult.Err) result).getError());
+            };
+            if (accept) engine.acceptMedia(chatId, m.getMessageId(), cb);
+            else engine.cancelMedia(chatId, m.getMessageId(), cb);
+        } catch (Throwable t) {
+            showError(null);
+        }
+    }
+
+    private String authorOf(SecuredMessage m) {
+        if (m.getOutgoing()) return mapper != null ? mapper.selfName() : "";
+        if (m.getSender() != null) return m.getSender().getDisplayName();
+        return name;
+    }
+
+    private void showMediaNote(String text) {
+        final Context c = getContext();
+        if (c == null || destroyed || text == null) return;
+        BulletinFactory.of(this).createSimpleBulletin(org.telegram.messenger.R.raw.chats_infotip, text).show();
+    }
+
     // ---- message cell delegate: every click is ours ----------------------------------------------------------
 
     private final ChatMessageCell.ChatMessageCellDelegate cellDelegate = new ChatMessageCell.ChatMessageCellDelegate() {
@@ -1467,7 +1715,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     };
 
-    private void onMessageLongPress(ChatMessageCell cell) {
+    private void onMessageLongPress(View cell) {
         final SecuredMessage m = messageFor(cell);
         if (m == null || searching) return;
         if (!selectedIds.isEmpty()) {
@@ -1479,19 +1727,23 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private ItemOptions openMenu;
 
-    private void showMessageMenu(ChatMessageCell cell, SecuredMessage m) {
+    private void showMessageMenu(View cell, SecuredMessage m) {
         if (getParentActivity() == null || openMenu != null && openMenu.isShown()) return;
         final boolean deleted = m.getDeleted();
         final boolean ready = chatReady();
+        // Media in v1: Copy only when there is a caption; no Forward (the engine's forward path is not checked
+        // for files); no Edit (canEdit is false for media).
+        final boolean media = m.getMedia() != null;
+        final boolean hasText = !media || !m.getText().isEmpty();
         final ItemOptions options = ItemOptions.makeOptions(this, cell);
         if (!deleted && ready && !notes) {
             options.addView(buildReactionPicker(m, options));
             options.addGap();
         }
         options.addIf(!deleted && ready && !notes && canPostHere(), org.telegram.messenger.R.drawable.menu_reply, tg(org.telegram.messenger.R.string.Reply), () -> startReply(m));
-        options.addIf(!deleted, org.telegram.messenger.R.drawable.msg_copy, tg(org.telegram.messenger.R.string.Copy), () -> copyMessages(Collections.singletonList(m)));
+        options.addIf(!deleted && hasText, org.telegram.messenger.R.drawable.msg_copy, tg(org.telegram.messenger.R.string.Copy), () -> copyMessages(Collections.singletonList(m)));
         options.addIf(!deleted && m.getCanEdit(), org.telegram.messenger.R.drawable.msg_edit, tg(org.telegram.messenger.R.string.Edit), () -> startEdit(m));
-        options.addIf(!deleted && ready, org.telegram.messenger.R.drawable.msg_forward, tg(org.telegram.messenger.R.string.Forward), () -> pickForwardTarget(Collections.singletonList(m)));
+        options.addIf(!deleted && ready && !media, org.telegram.messenger.R.drawable.msg_forward, tg(org.telegram.messenger.R.string.Forward), () -> pickForwardTarget(Collections.singletonList(m)));
         options.add(org.telegram.messenger.R.drawable.msg_select, tg(org.telegram.messenger.R.string.Select), () -> toggleSelection(m));
         options.add(org.telegram.messenger.R.drawable.msg_delete, tg(org.telegram.messenger.R.string.Delete), true, () -> confirmDelete(Collections.singletonList(m)));
         // shortcut: message info (delivery details, disappearing timer) plugs in here.
@@ -1677,6 +1929,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 if (m != null && m.getMessageId() == messageId) {
                     ((ChatMessageCell) child).setHighlighted(value);
                 }
+            } else if (child instanceof SecuredMediaCell && ((SecuredMediaCell) child).messageId() == messageId) {
+                ((SecuredMediaCell) child).setHighlighted(value);
             }
         }
     }
@@ -1958,8 +2212,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             boolean anyText = false;
             boolean allLive = true;
             for (SecuredMessage m : selectedMessages()) {
-                if (m.getDeleted()) allLive = false;
-                else anyText = true;
+                if (m.getDeleted() || m.getMedia() != null) allLive = false;   // no Forward for media in v1
+                if (!m.getDeleted() && !m.getText().isEmpty()) anyText = true;
             }
             copyItem.setVisibility(anyText ? View.VISIBLE : View.GONE);
             forwardItem.setVisibility(allLive && chatReady() ? View.VISIBLE : View.GONE);
@@ -1973,6 +2227,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 final ChatMessageCell cell = (ChatMessageCell) child;
                 cell.setCheckBoxVisible(selecting, true);
                 cell.setChecked(sel, sel, true);
+            } else if (child instanceof SecuredMediaCell) {
+                final SecuredMediaCell cell = (SecuredMediaCell) child;
+                final boolean sel = selectedIds.contains(cell.messageId());
+                cell.setCheckBoxVisible(selecting, true);
+                cell.setChecked(sel, true);
             }
         }
     }
@@ -2099,6 +2358,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private void removeMessages(List<Long> ids) {
         final HashSet<Long> gone = new HashSet<>(ids);
+        // A removed media message: close its viewer, stop its voice and forget its bitmaps (the engine has already
+        // closed its playback and deleted the file).
+        SecuredMediaViewer.closeFor(chatId, gone);
+        for (Long id : gone) {
+            liveProgress.remove(id);
+            if (bitmaps != null) bitmaps.forget(chatId, id);
+            if (audio != null && audio.isPlaying(chatId, id)) audio.release();
+        }
         boolean changed = false;
         for (int i = messages.size() - 1; i >= 0; i--) {
             final long id = messages.get(i).getMessageId();
@@ -2120,7 +2387,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static SecuredMessage withStatus(SecuredMessage m, MessageStatus status) {
         return new SecuredMessage(m.getChatId(), m.getMessageId(), m.getOutgoing(), m.getText(), m.getTimeMs(), status,
                 m.getReplyTo(), m.getEdited(), m.getDeleted(), m.getCanEdit(), m.getCanDeleteForEveryone(),
-                m.getForwarded(), m.getReactions(), m.getExpiresAtMs(), m.getSender(), m.getEvent());
+                m.getForwarded(), m.getReactions(), m.getExpiresAtMs(), m.getSender(), m.getEvent(), m.getMedia());
     }
 
     private MessageObject objectFor(SecuredMessage m) {
@@ -2139,10 +2406,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static final class Row {
         final int kind;
         final long stableId;
-        final SecuredMessage message;   // null for date rows
+        final SecuredMessage message;   // null for date rows; the whole message (media included) for media and caption rows
         final int dateSec;
         boolean pinnedTop;
         boolean pinnedBottom;
+        /** ROW_MESSAGE that shows only the caption of a media message, joined under its ROW_MEDIA. */
+        boolean caption;
 
         Row(int kind, long stableId, SecuredMessage message, int dateSec) {
             this.kind = kind;
@@ -2192,12 +2461,48 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (i < 0 || adapter == null) return false;
         final Row old = rows.get(i);
         if (old.message == null || old.message.getEvent() != null) return false;
+        if (updated.getMedia() != null || old.message.getMedia() != null) {
+            // A media message has two rows (media and caption): patch both, or rebuild if the shape may change.
+            final int j = mediaRowIndexOf(messageId);
+            if (j < 0 || updated.getMedia() == null || updated.getDeleted()
+                    || old.message.getText().isEmpty() != updated.getText().isEmpty()) return false;
+            if (j != i) patchRow(j, updated);
+        }
+        patchRow(i, updated);
+        return true;
+    }
+
+    private void patchRow(int i, SecuredMessage updated) {
+        final Row old = rows.get(i);
         final Row r = new Row(old.kind, old.stableId, updated, old.dateSec);
         r.pinnedTop = old.pinnedTop;
         r.pinnedBottom = old.pinnedBottom;
+        r.caption = old.caption;
         rows.set(i, r);
         adapter.notifyItemChanged(i);
-        return true;
+    }
+
+    private int mediaRowIndexOf(long messageId) {
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            final Row r = rows.get(i);
+            if (r.kind == ROW_MEDIA && r.message.getMessageId() == messageId) return i;
+        }
+        return -1;
+    }
+
+    /** The caption of a media message as a plain text message for the one text mapper: no media, quote or label. */
+    private static SecuredMessage captionOf(SecuredMessage m) {
+        return new SecuredMessage(m.getChatId(), m.getMessageId(), m.getOutgoing(), m.getText(), m.getTimeMs(), m.getStatus(),
+                null, m.getEdited(), m.getDeleted(), false, m.getCanDeleteForEveryone(),
+                false, m.getReactions(), m.getExpiresAtMs(), m.getSender(), null, null);
+    }
+
+    /** One line for the reply strip and quotes: the text, or "Photo", "Video"... for media without a caption. */
+    private String previewText(SecuredMessage m) {
+        if (m.getMedia() != null && m.getText().isEmpty() && getContext() != null) {
+            return MediaText.kind(getContext(), m.getMedia().getKind());
+        }
+        return m.getText();
     }
 
     private static long senderKey(SecuredMessage m) {
@@ -2230,18 +2535,30 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 next.add(new Row(ROW_EVENT, m.getMessageId() * 4 + 3, m, sec));
                 continue;
             }
-            next.add(new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec));
+            if (m.getMedia() != null && !m.getDeleted()) {
+                // The media bubble, then its caption as its own joined text bubble (AGENTS.md "Media v1").
+                next.add(new Row(ROW_MEDIA, m.getMessageId() * 4, m, sec));
+                if (!m.getText().isEmpty()) {
+                    final Row cap = new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec);
+                    cap.caption = true;
+                    next.add(cap);
+                }
+            } else {
+                next.add(new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec));
+            }
             if (!notes && !m.getDeleted() && !m.getReactions().isEmpty()) {
                 next.add(new Row(ROW_REACTIONS, m.getMessageId() * 4 + 2, m, sec));
             }
         }
         for (int i = 0; i < next.size(); i++) {
             final Row r = next.get(i);
-            if (r.kind != ROW_MESSAGE) continue;
+            if (!isBubble(r)) continue;
             final Row prev = i > 0 ? next.get(i - 1) : null;
             final Row after = i + 1 < next.size() ? next.get(i + 1) : null;
-            r.pinnedTop = prev != null && prev.kind == ROW_MESSAGE && sameGroup(prev.message, r.message);
-            r.pinnedBottom = after != null && after.kind == ROW_MESSAGE && sameGroup(r.message, after.message);
+            // A caption is always joined to its media bubble above it.
+            r.pinnedTop = r.caption || prev != null && isBubble(prev) && sameGroup(prev.message, r.message);
+            r.pinnedBottom = after != null && (after.caption && after.message == r.message
+                    || isBubble(after) && sameGroup(r.message, after.message));
         }
 
         if (!animated || adapter == null) {
@@ -2289,10 +2606,26 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     }
 
+    private static boolean isBubble(Row r) {
+        return r.kind == ROW_MESSAGE || r.kind == ROW_MEDIA;
+    }
+
     private SecuredMessage messageAt(int position) {
         if (position < 0 || position >= rows.size()) return null;
         final Row r = rows.get(position);
-        return r.kind == ROW_MESSAGE ? r.message : null;
+        return isBubble(r) ? r.message : null;
+    }
+
+    /** The visible media cell of a message, or null. */
+    private SecuredMediaCell mediaCellFor(long messageId) {
+        if (listView == null) return null;
+        for (int i = 0; i < listView.getChildCount(); i++) {
+            final View child = listView.getChildAt(i);
+            if (child instanceof SecuredMediaCell && ((SecuredMediaCell) child).messageId() == messageId) {
+                return (SecuredMediaCell) child;
+            }
+        }
+        return null;
     }
 
     private SecuredMessage messageFor(View cell) {
@@ -2300,10 +2633,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         return messageAt(listView.getChildAdapterPosition(cell));
     }
 
+    /** The message's last bubble row: its text bubble, or a media message's caption, or its media bubble. */
     private int rowIndexOf(long messageId) {
         for (int i = rows.size() - 1; i >= 0; i--) {
             final Row r = rows.get(i);
-            if (r.kind == ROW_MESSAGE && r.message.getMessageId() == messageId) return i;
+            if (isBubble(r) && r.message.getMessageId() == messageId) return i;
         }
         return -1;
     }
@@ -2430,8 +2764,16 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     public void onPause() {
         super.onPause();
         isPaused = true;
+        if (audio != null) audio.pause();
+        SecuredMediaViewer.pauseAll();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
         SecuredBackground.setOpenChat(null);
+    }
+
+    @Override
+    public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
+        super.onActivityResultFragment(requestCode, resultCode, data);
+        if (attach != null && !destroyed) attach.onActivityResult(requestCode, resultCode, data);
     }
 
     @Override
@@ -2474,7 +2816,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
         @Override
         public int getItemViewType(int position) {
-            final int kind = rows.get(position).kind;
+            final Row r = rows.get(position);
+            final int kind = r.kind;
+            if (kind == ROW_MEDIA) {
+                final MediaKind k = r.message.getMedia() != null ? r.message.getMedia().getKind() : MediaKind.FILE;
+                return k == MediaKind.IMAGE || k == MediaKind.GIF || k == MediaKind.VIDEO ? VIEW_PHOTO
+                        : k == MediaKind.VOICE ? VIEW_VOICE : VIEW_FILE;
+            }
             return kind == ROW_DATE ? VIEW_DATE : kind == ROW_EVENT ? VIEW_EVENT : kind == ROW_REACTIONS ? VIEW_REACTIONS : VIEW_MESSAGE;
         }
 
@@ -2490,6 +2838,12 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 // setAllowAssistant stays off: it would hand message text to the system assistant (onProvideStructure).
                 cell.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
                 view = cell;
+            } else if (viewType == VIEW_PHOTO) {
+                view = new SecuredPhotoCell(context, chatResources, mediaHost);
+            } else if (viewType == VIEW_VOICE) {
+                view = new SecuredVoiceCell(context, chatResources, mediaHost);
+            } else if (viewType == VIEW_FILE) {
+                view = new SecuredFileCell(context, chatResources, mediaHost);
             } else if (viewType == VIEW_DATE || viewType == VIEW_EVENT) {
                 // Separate view types: a recycled date cell never receives event text and the other way round.
                 view = new ChatActionCell(context, false, chatResources);
@@ -2510,11 +2864,22 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 if (cell instanceof SecuredMessageCell) {
                     ((SecuredMessageCell) cell).setSecuredStatus(r.message.getOutgoing() ? r.message.getStatus() : null, notes);
                 }
-                cell.setMessageObject(objectFor(r.message), null, r.pinnedBottom, r.pinnedTop, false);
+                cell.setMessageObject(objectFor(r.caption ? captionOf(r.message) : r.message), null, r.pinnedBottom, r.pinnedTop, false);
                 final boolean selecting = !selectedIds.isEmpty();
                 final boolean sel = selectedIds.contains(r.message.getMessageId());
                 cell.setCheckBoxVisible(selecting, false);
                 cell.setChecked(sel, sel, false);
+                cell.setHighlighted(highlightId == r.message.getMessageId());
+            } else if (view instanceof SecuredMediaCell) {
+                final SecuredMediaCell cell = (SecuredMediaCell) view;
+                final boolean captionBelow = r.pinnedBottom && position + 1 < rows.size() && rows.get(position + 1).caption;
+                cell.bind(r.message, r.pinnedTop, captionBelow, groupChat, notes);
+                final long[] live = liveProgress.get(r.message.getMessageId());
+                if (live != null) cell.setProgress(live[0], live[1]);
+                final boolean selecting = !selectedIds.isEmpty();
+                final boolean sel = selectedIds.contains(r.message.getMessageId());
+                cell.setCheckBoxVisible(selecting, false);
+                cell.setChecked(sel, false);
                 cell.setHighlighted(highlightId == r.message.getMessageId());
             } else if (view instanceof ChatActionCell) {
                 if (r.kind == ROW_EVENT) {
@@ -2525,6 +2890,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             } else if (view instanceof SecuredReactionsView) {
                 ((SecuredReactionsView) view).bind(r.message, reactionListener);
             }
+        }
+
+        @Override
+        public void onViewRecycled(@NonNull RecyclerView.ViewHolder holder) {
+            if (holder.itemView instanceof SecuredMediaCell) ((SecuredMediaCell) holder.itemView).onRecycled();
         }
     }
 

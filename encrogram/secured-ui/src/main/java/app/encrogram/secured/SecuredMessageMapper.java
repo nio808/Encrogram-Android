@@ -235,7 +235,11 @@ public final class SecuredMessageMapper {
         final Long qid = quote.getMessageId();
         msg.id = qid != null ? localId(qid) : 0;
         final String text = quote.getText();
-        msg.message = text == null || text.isEmpty() ? quoteFallback : text;
+        if ((text == null || text.isEmpty()) && quote.getMediaKind() != null) {
+            msg.message = MediaText.kind(context, quote.getMediaKind());   // a reply to a photo without a caption: "Photo"
+        } else {
+            msg.message = text == null || text.isEmpty() ? quoteFallback : text;
+        }
         msg.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
         return new SecuredMessageObject(account, msg, null, false);
     }

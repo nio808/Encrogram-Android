@@ -44,6 +44,13 @@ final class ChatRowMapper {
             String text(app.encrogram.core.api.GroupEvent event, app.encrogram.core.api.ChatKind kind);
         }
 
+        /** Media: words the preview ("🖼 Photo", "🖼 caption", "📎 report.pdf"); null shows the text alone. */
+        MediaWords media;
+
+        interface MediaWords {
+            String text(app.encrogram.core.api.MediaKind kind, String text);
+        }
+
         /** Group wording (secured_group_strings.xml); the contact labels above are unchanged. */
         Labels withGroup(String invitation, String senderFormat) {
             this.invitation = invitation;
@@ -106,7 +113,11 @@ final class ChatRowMapper {
         final long t = c.getLastMessageTimeMs() > 0 ? c.getLastMessageTimeMs() : nowMs;
         r.dateSeconds = (int) (t / 1000L);
 
-        final String text = c.getLastMessageText();
+        String text = c.getLastMessageText();
+        if (c.getLastMessageMedia() != null && labels.media != null) {
+            // A photo without a caption has no text: the kind is the preview (never "No messages yet").
+            text = labels.media.text(c.getLastMessageMedia(), text);
+        }
         if (r.invited) {
             r.message = labels.invitation;   // no preview of anything before you join
         } else if (!c.getReady() && !r.saved) {
@@ -245,6 +256,13 @@ final class ChatRowMapper {
         r = map(g, labels, now);
         check(bad, "link join preview is worded", "JOINED_BY_LINK:null".equals(r.message));
         labels.events = null;
+
+        final ChatSummary photo = new ChatSummary(4, "Di", null, 1000, 0, false, true, false, null, false, false, false, null,
+                ChatKind.DIRECT, null, null, true, null, false, null, false, app.encrogram.core.api.MediaKind.IMAGE);
+        labels.media = (k, t) -> k + ":" + (t == null ? "" : t);
+        r = map(photo, labels, now);
+        check(bad, "media without caption is worded, not empty", "IMAGE:".equals(r.message));
+        labels.media = null;
         check(bad, "avatar colour key is the name, not an id", Kit.colorKey(" Ann ") == Kit.colorKey("Ann") && Kit.colorKey("Ann") != Kit.colorKey("Bob"));
         g = new ChatSummary(gBase + 2, "Club", "secret", 1000, 1, false, true, false, null, false, false, false, null,
                 ChatKind.GROUP, 3, app.encrogram.core.api.MemberRole.MEMBER, false, "Ann", true);
