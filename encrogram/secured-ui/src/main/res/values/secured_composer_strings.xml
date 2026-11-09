@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secured composer: the emoji panel and the voice recorder (Media phase 2, MU10 and MU11). -->
+<resources>
+    <!-- Emoji panel -->
+    <string name="secemoji_button">Emoji</string>
+    <string name="secemoji_keyboard">Keyboard</string>
+    <string name="secemoji_recent">Recently used</string>
+    <string name="secemoji_backspace">Delete</string>
+
+    <!-- Voice recorder -->
+    <string name="secvoice_record">Record a voice message</string>
+    <string name="secvoice_slide_cancel">Slide to cancel</string>
+    <string name="secvoice_cancel">Cancel</string>
+    <string name="secvoice_hold">Hold to record, release to send.</string>
+    <string name="secvoice_mic_needed">Encrogram needs the microphone to record voice messages. Turn it on in Settings, under Permissions.</string>
+    <string name="secvoice_open_settings">Settings</string>
+    <string name="secvoice_not_now">Not now</string>
+    <string name="secvoice_failed">The microphone couldn\'t record. Try again.</string>
+    <string name="secvoice_stopped">Recording stopped and deleted.</string>
+</resources>

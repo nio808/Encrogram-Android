@@ -67,6 +67,7 @@ import org.telegram.ui.ChatBackgroundDrawable;
 import org.telegram.ui.Components.AvatarDrawable;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.ChatActivityEnterView;
+import org.telegram.ui.Components.ChatActivityEnterViewAnimatedIconView;
 import org.telegram.ui.Components.ChatAvatarContainer;
 import org.telegram.ui.Components.CubicBezierInterpolator;
 import org.telegram.ui.Components.ItemOptions;
@@ -248,6 +249,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private SecuredAudioPlayer audio;
     private SecuredAttach attach;
     private ImageView attachButton;
+    // Emoji panel (MU11): our own panel under the composer, swapped with the keyboard.
+    private ChatActivityEnterViewAnimatedIconView emojiButton;
+    private FrameLayout emojiContainer;
+    private SecuredEmojiPanel emojiPanel;
+    private boolean emojiShown;
+    private boolean hidePanelWhenKeyboardOpens;
+    private int keyboardHeightPort, keyboardHeightLand;
     /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
     private final HashMap<Long, long[]> liveProgress = new HashMap<>();
 
@@ -406,6 +414,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (flagSecure != null) flagSecure.detach();
         AndroidUtilities.cancelRunOnUIThread(hideFloatingDate);
         AndroidUtilities.cancelRunOnUIThread(runSearch);
+        AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        if (emojiPanel != null) emojiPanel.dismissPopups();
         NotificationCenter.getGlobalInstance().removeObserver(emojiLoaded, NotificationCenter.emojiLoaded);
         if (engine != null) {
             engine.removeListener(listener);
@@ -500,6 +510,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             deleteBar = buildDeleteBar(context);
             column.addView(deleteBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         }
+        emojiContainer = new FrameLayout(context);
+        emojiContainer.setVisibility(View.GONE);
+        column.addView(emojiContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0));
+        root.setDelegate(this::onKeyboardSize);
 
         loadMessages();
         return root;
@@ -871,6 +885,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
         if (joinButton != null) joinButton.setAlpha(joining ? 0.5f : 1f);
         composerView.setVisibility(!searching && canPost ? View.VISIBLE : View.GONE);
+        if (composerView.getVisibility() != View.VISIBLE) hideEmojiPanel();
         if (invitedBar != null) invitedBar.setVisibility(!searching && invited ? View.VISIBLE : View.GONE);
         final boolean removed = isRemovedOrLeft();
         if (cantPostBar != null) cantPostBar.setVisibility(!searching && !canPost && !invited && !removed ? View.VISIBLE : View.GONE);
@@ -1036,10 +1051,25 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         input.setCursorWidth(1.5f);
         input.setHandlesColor(SecuredResourcesProvider.accentFill());
         field.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.BOTTOM));
+        // Emoji (MU11): Telegram's smile/keyboard icon on the left of the field, as in Telegram's composer.
+        emojiButton = new ChatActivityEnterViewAnimatedIconView(context);
+        emojiButton.setScaleType(ImageView.ScaleType.CENTER);
+        emojiButton.setColorFilter(new PorterDuffColorFilter(Kit.color(Theme.key_chat_messagePanelIcons), PorterDuff.Mode.SRC_IN));
+        emojiButton.setBackground(Theme.createSelectorDrawable(chatResources.getColor(Theme.key_listSelector), Theme.RIPPLE_MASK_CIRCLE_20DP));
+        emojiButton.setState(ChatActivityEnterViewAnimatedIconView.State.SMILE, false);
+        emojiButton.setContentDescription(context.getString(R.string.secemoji_button));
+        emojiButton.setOnClickListener(v -> toggleEmoji());
+        field.addView(emojiButton, LayoutHelper.createFrame(48, 44, Gravity.LEFT | Gravity.BOTTOM, 2, 0, 0, 0));
+        input.setPadding(dp(50), dp(11), dp(16), dp(11));
+        input.setOnTouchListener((v, e) -> {
+            // A tap in the box while the panel is up brings the keyboard back (the panel leaves when it is open).
+            if (e.getAction() == MotionEvent.ACTION_UP && emojiShown) openKeyboardFromEmoji();
+            return false;
+        });
         if (!notes) {
             // Attach (Media phase 2): Telegram's paperclip icon, our sheet (system photo and file pickers, no camera).
             // Saved Messages takes text only in v1 (engine: NOT_ALLOWED), so it has no paperclip.
-            input.setPadding(dp(16), dp(11), dp(48), dp(11));
+            input.setPadding(dp(50), dp(11), dp(48), dp(11));
             attachButton = new ImageView(context);
             attachButton.setScaleType(ImageView.ScaleType.CENTER);
             attachButton.setImageResource(org.telegram.messenger.R.drawable.msg_input_attach2);
@@ -1050,7 +1080,6 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             field.addView(attachButton, LayoutHelper.createFrame(48, 44, Gravity.RIGHT | Gravity.BOTTOM));
         }
         row.addView(field, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
-        // shortcut: the emoji-only EmojiView panel (stickers and GIFs off) plugs in next to the field.
 
         sendButton = new ChatActivityEnterView.SendButton(context, org.telegram.messenger.R.drawable.send_plane_24, SecuredResourcesProvider.get(), true) {
             @Override
@@ -1135,8 +1164,140 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private void openKeyboard() {
         if (input == null) return;
+        if (emojiShown) {
+            openKeyboardFromEmoji();
+            return;
+        }
         input.requestFocus();
         AndroidUtilities.showKeyboard(input);
+    }
+
+    // ---- emoji panel (MU11) ------------------------------------------------------------------------------------
+
+    private void toggleEmoji() {
+        if (emojiShown) {
+            openKeyboardFromEmoji();
+        } else {
+            showEmojiPanel();
+        }
+    }
+
+    /** The panel takes the keyboard's place, at the keyboard's last height. */
+    private void showEmojiPanel() {
+        if (emojiContainer == null || input == null || getParentActivity() == null) return;
+        if (emojiPanel == null) {
+            emojiPanel = new SecuredEmojiPanel(getParentActivity(), SecuredResourcesProvider.get(), new SecuredEmojiPanel.Listener() {
+                @Override
+                public void onEmoji(String emoji) {
+                    insertEmoji(emoji);
+                }
+
+                @Override
+                public void onBackspace() {
+                    if (input != null) input.dispatchKeyEvent(new android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_DEL));
+                }
+            });
+            emojiContainer.addView(emojiPanel, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        }
+        AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        hidePanelWhenKeyboardOpens = false;
+        emojiShown = true;
+        final ViewGroup.LayoutParams lp = emojiContainer.getLayoutParams();
+        lp.height = panelHeight();
+        emojiContainer.setLayoutParams(lp);
+        emojiContainer.setVisibility(View.VISIBLE);
+        emojiPanel.onShow();
+        emojiButton.setState(ChatActivityEnterViewAnimatedIconView.State.KEYBOARD, true);
+        emojiButton.setContentDescription(emojiButton.getContext().getString(R.string.secemoji_keyboard));
+        input.requestFocus();
+        AndroidUtilities.hideKeyboard(input);
+    }
+
+    /** Back to the keyboard: the panel stays until the keyboard is up, so the chat does not jump. */
+    private void openKeyboardFromEmoji() {
+        if (input == null) return;
+        emojiShown = false;
+        setEmojiIcon();
+        input.requestFocus();
+        AndroidUtilities.showKeyboard(input);
+        if (AndroidUtilities.usingHardwareInput || AndroidUtilities.isInMultiwindow) {
+            closePanelView();
+            return;
+        }
+        hidePanelWhenKeyboardOpens = true;
+        AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        AndroidUtilities.runOnUIThread(panelFallback, 400);
+    }
+
+    /** Closes the panel without opening the keyboard (Back, search, a bar replacing the composer). */
+    private void hideEmojiPanel() {
+        if (!emojiShown && !hidePanelWhenKeyboardOpens) return;
+        emojiShown = false;
+        setEmojiIcon();
+        closePanelView();
+    }
+
+    private void closePanelView() {
+        hidePanelWhenKeyboardOpens = false;
+        AndroidUtilities.cancelRunOnUIThread(panelFallback);
+        if (emojiPanel != null) emojiPanel.dismissPopups();
+        if (emojiContainer != null) emojiContainer.setVisibility(View.GONE);
+    }
+
+    private final Runnable panelFallback = () -> {
+        // The keyboard never reported a height (a hardware keyboard, a floating one): close the panel anyway.
+        if (hidePanelWhenKeyboardOpens) closePanelView();
+    };
+
+    private void setEmojiIcon() {
+        if (emojiButton == null) return;
+        emojiButton.setState(ChatActivityEnterViewAnimatedIconView.State.SMILE, true);
+        emojiButton.setContentDescription(emojiButton.getContext().getString(R.string.secemoji_button));
+    }
+
+    private void onKeyboardSize(int keyboardHeight, boolean landscape) {
+        if (keyboardHeight <= dp(50)) return;
+        if (!AndroidUtilities.isInMultiwindow) {
+            final int old = landscape ? keyboardHeightLand : keyboardHeightPort;
+            if (old != keyboardHeight) {
+                if (landscape) keyboardHeightLand = keyboardHeight;
+                else keyboardHeightPort = keyboardHeight;
+                final Context c = root != null ? root.getContext().getApplicationContext() : null;
+                if (c != null) {
+                    c.getSharedPreferences(SecuredUi.UI_PREFS, Context.MODE_PRIVATE).edit()
+                            .putInt(landscape ? "kbd_h_land" : "kbd_h", keyboardHeight).apply();
+                }
+            }
+        }
+        if (hidePanelWhenKeyboardOpens) closePanelView();
+    }
+
+    private int panelHeight() {
+        final boolean landscape = AndroidUtilities.displaySize.x > AndroidUtilities.displaySize.y;
+        int h = landscape ? keyboardHeightLand : keyboardHeightPort;
+        if (h <= 0 && root != null) {
+            h = root.getContext().getApplicationContext().getSharedPreferences(SecuredUi.UI_PREFS, Context.MODE_PRIVATE)
+                    .getInt(landscape ? "kbd_h_land" : "kbd_h", 0);
+        }
+        if (h <= 0) h = dp(landscape ? 200 : 270);
+        return Math.max(dp(180), Math.min(h, AndroidUtilities.displaySize.y - dp(220)));
+    }
+
+    /** Plain text at the cursor: the composer renders emoji with the system font (its filter drops image spans). */
+    private void insertEmoji(String emoji) {
+        if (input == null || emoji == null) return;
+        final Editable text = input.getText();
+        if (text == null) return;
+        int start = Math.max(0, input.getSelectionStart());
+        int end = Math.max(0, input.getSelectionEnd());
+        if (start > end) {
+            final int t = start;
+            start = end;
+            end = t;
+        }
+        text.replace(start, end, emoji);
+        final int at = Math.min(text.length(), start + emoji.length());
+        input.setSelection(at, at);
     }
 
     private void send() {
@@ -2108,6 +2269,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         clearSelection();
         if (avatarContainer != null) avatarContainer.setVisibility(View.GONE);
         if (composerView != null) composerView.setVisibility(View.GONE);
+        hideEmojiPanel();
         if (groupChat) updateBottomBars();
         if (emptyView != null) emptyView.setText((notes ? R.string.secnotes_empty : R.string.sec_chat_empty));
         rebuildRows(false);
@@ -2774,6 +2936,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         isPaused = true;
         if (audio != null) audio.pause();
         SecuredMediaViewer.pauseAll();
+        if (emojiPanel != null) emojiPanel.dismissPopups();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);
         SecuredBackground.setOpenChat(null);
     }
@@ -2786,6 +2949,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     @Override
     public boolean onBackPressed(boolean invoked) {
+        if (emojiShown) {
+            if (invoked) hideEmojiPanel();
+            return false;
+        }
         if (!selectedIds.isEmpty()) {
             if (invoked) clearSelection();
             return false;
