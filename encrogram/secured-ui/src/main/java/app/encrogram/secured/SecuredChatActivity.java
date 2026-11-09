@@ -61,6 +61,7 @@ import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.ChatActionCell;
 import org.telegram.ui.Cells.ChatMessageCell;
+import org.telegram.ui.Cells.ChatUnreadCell;
 import org.telegram.ui.Cells.CheckBoxCell;
 import org.telegram.ui.Cells.TextSelectionHelper;
 import org.telegram.ui.ChatBackgroundDrawable;
@@ -143,16 +144,21 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static final int VIEW_PHOTO = 4;   // photo, GIF, video (SecuredPhotoCell)
     private static final int VIEW_FILE = 5;
     private static final int VIEW_VOICE = 6;
+    private static final int VIEW_UNREAD = 7;
 
     private static final int ROW_DATE = 0;
     private static final int ROW_MESSAGE = 1;
     private static final int ROW_REACTIONS = 2;
     private static final int ROW_EVENT = 3;   // group service row ("X joined")
+    private static final int ROW_UNREAD = 5;  // Telegram's "Unread messages" bar above the first unread message
     private static final int ROW_MEDIA = 4;   // the media bubble of a message; its caption is a joined ROW_MESSAGE
 
     private static final int PAGE_SIZE = 50;
     private static final int GROUP_SECONDS = 5 * 60;
     private static final long DATE_ID_BASE = 0x4000_0000_0000_0000L;
+    private static final long UNREAD_ROW_ID = DATE_ID_BASE - 1;
+    /** The first page grows to hold this many unread messages at most, so the chat can open at the first of them. */
+    private static final int MAX_UNREAD_PAGE = 200;
 
     private static final int MENU_COPY = 10;
     private static final int MENU_FORWARD = 11;
@@ -273,6 +279,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private FrameLayout mentionButton;
     private TextView mentionCounter;
     private final ArrayList<Long> unreadMentions = new ArrayList<>();
+    // Jump to unread: how many were unread when the chat opened, and the message the "Unread messages" bar sits above.
+    private int unreadAtOpen;
+    private long unreadDividerBefore = Long.MIN_VALUE;
     /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
     private final HashMap<Long, long[]> liveProgress = new HashMap<>();
 
@@ -471,6 +480,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         hasOwnBackground = true;
         sharedResources = new ChatMessageSharedResources(context);
         final ChatSummary summary = summary();
+        unreadAtOpen = summary != null && !notes ? Math.max(0, summary.getUnreadCount()) : 0;
+        unreadDividerBefore = Long.MIN_VALUE;
         name = notes ? tg(org.telegram.messenger.R.string.SavedMessages) : summary != null ? summary.getDisplayName() : "";
         selfNameShown = selfName();
         mapper = new SecuredMessageMapper(context, currentAccount);
@@ -1255,6 +1266,49 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         AndroidUtilities.showKeyboard(input);
     }
 
+    // ---- jump to unread ---------------------------------------------------------------------------------------
+
+    /**
+     * Finds where the chat opens: 1 = at the first unread message (the bar goes above it), 2 = more unread than
+     * loaded (open at the oldest loaded message), 0 = nothing unread (open at the newest). Also counts the unread
+     * messages below for the go-down button and keeps the unread mentions of you for the "@" button.
+     */
+    private int placeUnreadDivider(List<SecuredMessage> page) {
+        unreadDividerBefore = Long.MIN_VALUE;
+        if (notes || unreadAtOpen <= 0) return 0;
+        long first = Long.MIN_VALUE;
+        int unread = 0;
+        for (SecuredMessage m : page) {
+            if (!m.getUnread() || m.getOutgoing()) continue;
+            if (first == Long.MIN_VALUE) first = m.getMessageId();
+            unread++;
+            if (m.getMentionsMe() && !unreadMentions.contains(m.getMessageId())) unreadMentions.add(m.getMessageId());
+        }
+        if (first == Long.MIN_VALUE) return 0;
+        unreadBelow = unread;
+        if (!endReached && unread < unreadAtOpen) return 2;
+        unreadDividerBefore = first;
+        return 1;
+    }
+
+    /** The bar near the top, like Telegram: the first unread message right under it. */
+    private void scrollToUnreadDivider() {
+        for (int i = 0; i < rows.size(); i++) {
+            if (rows.get(i).kind == ROW_UNREAD) {
+                layoutManager.scrollToPositionWithOffset(i, dp(6));
+                return;
+            }
+        }
+        scrollToBottom(false);
+    }
+
+    /** Sending something yourself means the unread part has been read: the bar goes, as in Telegram. */
+    private void clearUnreadDivider() {
+        if (unreadDividerBefore == Long.MIN_VALUE) return;
+        unreadDividerBefore = Long.MIN_VALUE;
+        rebuildRows(true);
+    }
+
     // ---- group mentions (RD2) -----------------------------------------------------------------------------------
 
     private void loadMembers() {
@@ -1542,6 +1596,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             sendEdit(editing, text);
             return;
         }
+        clearUnreadDivider();
         final SecuredMessage replyTarget = replyingTo;
         final Long replyId = replyTarget != null ? replyTarget.getMessageId() : null;
         // Mentions still in the text (the engine sends at most SecuredMentions.MAX_MENTIONS of them).
@@ -2728,8 +2783,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
 
     private void loadMessages() {
         if (engine == null) return;
+        // Enough of the newest messages to reach the first unread one (up to MAX_UNREAD_PAGE).
+        final int count = unreadAtOpen > PAGE_SIZE - 5 ? Math.min(MAX_UNREAD_PAGE, unreadAtOpen + 10) : PAGE_SIZE;
         try {
-            engine.messages(chatId, new MessagePage(PAGE_SIZE, null, null, null, null), result -> {
+            engine.messages(chatId, new MessagePage(count, null, null, null, null), result -> {
                 if (destroyed) return;
                 if (!(result instanceof SecuredResult.Ok)) {
                     // Show the engine's error, never the "no messages" text: the engine did not report an empty chat.
@@ -2748,10 +2805,19 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 for (SecuredMessage m : early) {
                     if (indexOf(m.getMessageId()) < 0) insertSorted(m);
                 }
-                endReached = page.size() < PAGE_SIZE;
+                endReached = page.size() < count;
                 initialLoaded = true;
+                final int firstUnread = placeUnreadDivider(page);
                 rebuildRows(false);
-                scrollToBottom(false);
+                if (firstUnread == 1) {
+                    scrollToUnreadDivider();
+                } else if (firstUnread == 2) {
+                    // More unread than loaded: start at the oldest loaded message (no bar: the first unread isn't here).
+                    layoutManager.scrollToPositionWithOffset(0, 0);
+                } else {
+                    scrollToBottom(false);
+                }
+                listView.post(this::updateMentionButton);
                 engine.markRead(chatId);
             });
         } catch (Throwable t) {
@@ -3018,6 +3084,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             if (day != lastDay) {
                 next.add(new Row(ROW_DATE, DATE_ID_BASE + day, null, day));
                 lastDay = day;
+            }
+            if (m.getMessageId() == unreadDividerBefore && !searching) {
+                next.add(new Row(ROW_UNREAD, UNREAD_ROW_ID, null, sec));
             }
             if (m.getEvent() != null) {
                 next.add(new Row(ROW_EVENT, m.getMessageId() * 4 + 3, m, sec));
@@ -3332,6 +3401,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 return k == MediaKind.IMAGE || k == MediaKind.GIF || k == MediaKind.VIDEO ? VIEW_PHOTO
                         : k == MediaKind.VOICE ? VIEW_VOICE : VIEW_FILE;
             }
+            if (kind == ROW_UNREAD) return VIEW_UNREAD;
             return kind == ROW_DATE ? VIEW_DATE : kind == ROW_EVENT ? VIEW_EVENT : kind == ROW_REACTIONS ? VIEW_REACTIONS : VIEW_MESSAGE;
         }
 
@@ -3356,6 +3426,11 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             } else if (viewType == VIEW_DATE || viewType == VIEW_EVENT) {
                 // Separate view types: a recycled date cell never receives event text and the other way round.
                 view = new ChatActionCell(context, false, chatResources);
+            } else if (viewType == VIEW_UNREAD) {
+                // Telegram's own "Unread messages" bar (theme colours and text only).
+                final ChatUnreadCell cell = new ChatUnreadCell(context, chatResources);
+                cell.setText(tg(org.telegram.messenger.R.string.UnreadMessages));
+                view = cell;
             } else {
                 view = new SecuredReactionsView(context, chatResources);
             }
