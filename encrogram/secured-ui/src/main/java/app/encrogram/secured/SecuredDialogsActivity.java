@@ -215,7 +215,30 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         if (!destroyed) openChat(SecuredEngineKt.SAVED_MESSAGES_CHAT_ID);
     }
 
+    /** Chat shown in the tablet's right pane; its row is highlighted. NO_CHAT when none. */
+    private long openedChatId = SecuredUi.NO_CHAT;
+    private static java.lang.ref.WeakReference<SecuredDialogsActivity> activeList;
+
+    /** Called by the chat screen when it closes, so the list drops the highlight. */
+    public static void chatClosed(long chatId) {
+        final SecuredDialogsActivity a = activeList != null ? activeList.get() : null;
+        if (a != null) a.setOpenedChat(a.openedChatId == chatId ? SecuredUi.NO_CHAT : a.openedChatId);
+    }
+
+    private void setOpenedChat(long id) {
+        if (id == openedChatId) return;
+        final long old = openedChatId;
+        openedChatId = id;
+        if (adapter == null) return;
+        for (int i = 0; i < items.size(); i++) {
+            final Item it = items.get(i);
+            if (it.type == T_CHAT && (it.id == old || it.id == id)) adapter.notifyItemChanged(i);
+        }
+    }
+
     private void openChat(long chatId) {
+        activeList = new java.lang.ref.WeakReference<>(this);
+        setOpenedChat(chatId);
         final SecuredChatActivity chat = new SecuredChatActivity(chatId);
         if (host != null) {
             presentFragment(new INavigationLayout.NavigationParams(chat.inRightPane()).forceRightLayout());
@@ -346,6 +369,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onResume() {
         super.onResume();
         resumed = true;
+        SecuredUi.setDraftListener(draftRefresh);
         SecuredUi.debugSelfCheck(getParentActivity(), currentAccount);
         // Secured screens stay out of Recents thumbnails and screenshots (SPEC: protect screen, on by default).
         if (flagSecure == null && getParentActivity() != null) {
@@ -390,6 +414,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
+        SecuredUi.clearDraftListener(draftRefresh);
+        if (activeList != null && activeList.get() == this) activeList = null;
         AndroidUtilities.cancelRunOnUIThread(refreshRunnable);
         if (flagSecure != null) flagSecure.detach();
         if (host == null) {
@@ -852,6 +878,9 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
 
     private static final long REFRESH_COALESCE_MS = 60;
     private boolean refreshScheduled;
+    /** A draft changed in a chat: its row shows or drops "Draft:" (also while both panes show on a tablet). */
+    private final Runnable draftRefresh = this::scheduleRefresh;
+
     private final Runnable refreshRunnable = () -> {
         refreshScheduled = false;
         refreshChats();
@@ -880,6 +909,9 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         }
         chats.clear();
         chats.addAll(fresh);
+        final java.util.HashSet<Long> live = new java.util.HashSet<>();
+        for (ChatSummary c : fresh) live.add(c.getChatId());
+        if (!live.isEmpty()) SecuredUi.pruneDrafts(live);   // an empty list may be a not-yet-loaded engine
         rebuildAndNotify();
         // Saved Messages is always listed once a profile exists: the invite/connect hint shows while it is the only chat.
         boolean onlyNotes = true;
@@ -1451,6 +1483,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
                     final SecuredDialogCell cell = (SecuredDialogCell) holder.itemView;
                     cell.bind(it.row, showingArchived, true);
                     cell.setChecked(selected.contains(it.id), false);
+                    cell.setDialogSelected(AndroidUtilities.isTablet() && it.id == openedChatId);
                     break;
                 }
                 case T_ARCHIVE:

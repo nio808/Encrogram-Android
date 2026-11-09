@@ -72,6 +72,10 @@ public final class SecuredResourcesProvider implements Theme.ResourcesProvider {
             return accentText();
         } else if (key == Theme.key_chat_outBubble) {
             return d ? 0xFF4448A8 : 0xFFE8E7FF;
+        } else if (key == Theme.key_chats_sentCheck
+                || key == Theme.key_chats_sentReadCheck
+                || key == Theme.key_chats_sentClock) {
+            return d ? 0xFFC9CBFF : 0xFF5357CC;
         } else if (key == Theme.key_chat_outBubbleSelected) {
             return d ? 0xFF3B3E94 : 0xFFD9D7FF;
         } else if (key == Theme.key_chat_messageTextOut) {

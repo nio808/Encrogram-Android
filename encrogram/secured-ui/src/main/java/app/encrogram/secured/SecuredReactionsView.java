@@ -44,6 +44,7 @@ final class SecuredReactionsView extends LinearLayout {
         this.resourcesProvider = resourcesProvider;
         setOrientation(HORIZONTAL);
         setPadding(dp(10), 0, dp(10), dp(4));
+        setMinimumHeight(dp(40)); // touch height: the whole row takes the tap (onTap), the 26 dp pills stay as drawn
     }
 
     void bind(SecuredMessage message, Listener listener) {
@@ -80,12 +81,12 @@ final class SecuredReactionsView extends LinearLayout {
     }
 
     /**
-     * A tap at (x, y) in this row's own coordinates. The hit box is the chip widened by 6 dp on each side and the
-     * full row height, so a finger does not have to land on the 26 dp pill exactly. Returns true when a chip took it.
+     * A tap at (x, y) in this row's own coordinates. The hit box is the chip widened by 10 dp on each side and the
+     * full row height (40 dp), so a finger does not have to land on the 26 dp pill exactly. Returns true when a chip took it.
      */
     boolean onTap(float x, float y) {
         if (bound == null || listener == null) return false;
-        final int slop = dp(6);
+        final int slop = dp(10);
         for (int i = 0; i < getChildCount(); i++) {
             final android.view.View chip = getChildAt(i);
             if (x >= chip.getLeft() - slop && x <= chip.getRight() + slop && chip.getTag() instanceof ReactionCount) {

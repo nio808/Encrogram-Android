@@ -112,7 +112,8 @@ final class SecuredMessageCell extends ChatMessageCell {
         }
     }
 
-    private static int wordFor(MessageStatus s) {
+    /** Also read by the media bubbles' TalkBack text (AR12). */
+    static int wordFor(MessageStatus s) {
         switch (s) {
             case SENDING:
                 return R.string.secchat_status_sending;

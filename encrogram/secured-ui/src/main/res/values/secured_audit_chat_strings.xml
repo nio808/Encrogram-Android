@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Secured chat screen fixes (research/ui-enhancements.md, AR9-AR13). Own file so other screens never conflict. -->
+<resources>
+    <string name="sec_au_draft">Draft:</string>
+    <string name="sec_au_tap_retry">Tap to retry</string>
+    <string name="sec_au_send_again">Send again</string>
+    <string name="sec_au_you">You</string>
+    <string name="sec_au_found">%1$d found</string>
+    <string name="sec_au_found_more">%1$d+ found</string>
+    <string name="sec_au_older_loading">Loading earlier messages</string>
+</resources>

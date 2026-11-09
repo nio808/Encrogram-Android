@@ -261,6 +261,26 @@ public final class SecuredMessageMapper {
         return msg;
     }
 
+    /** True when both messages draw the same bubble apart from the delivery status (reactions, canEdit, history, unread are not drawn by it). */
+    public static boolean sameBubble(SecuredMessage a, SecuredMessage b) {
+        return a == b || (a.getMessageId() == b.getMessageId() && a.getChatId() == b.getChatId()
+                && a.getOutgoing() == b.getOutgoing() && a.getTimeMs() == b.getTimeMs()
+                && a.getEdited() == b.getEdited() && a.getDeleted() == b.getDeleted()
+                && a.getForwarded() == b.getForwarded() && a.getMentionsMe() == b.getMentionsMe()
+                && java.util.Objects.equals(a.getText(), b.getText())
+                && java.util.Objects.equals(a.getReplyTo(), b.getReplyTo())
+                && java.util.Objects.equals(a.getExpiresAtMs(), b.getExpiresAtMs())
+                && java.util.Objects.equals(a.getSender(), b.getSender())
+                && java.util.Objects.equals(a.getEvent(), b.getEvent())
+                && java.util.Objects.equals(a.getMedia(), b.getMedia())
+                && java.util.Objects.equals(a.getMentions(), b.getMentions()));
+    }
+
+    /** A status-only change: patches the send state of an already mapped object, with no new layout. Main thread only. */
+    public void applyStatus(MessageObject mo, SecuredMessage m) {
+        if (mo.messageOwner instanceof TLRPC.TL_message) applyStatus((TLRPC.TL_message) mo.messageOwner, m);
+    }
+
     /** Honest status: see the class comment. The cell draws ticks only from these four fields. */
     private void applyStatus(TLRPC.TL_message msg, SecuredMessage m) {
         final int lid = localId(m.getMessageId());

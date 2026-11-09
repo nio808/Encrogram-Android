@@ -289,6 +289,7 @@ final class SecuredRestoreActivity extends SecuredBackupScreen {
                 change.setEnabled(true);
                 restore.setText(R.string.sec_rs_restore);
                 if (result instanceof SecuredResult.Ok) {
+                    SecuredUi.clearDrafts();   // the restored profile starts without the old one's drafts
                     showDone(c, info);
                 } else {
                     final SecuredError e = ((SecuredResult.Err) result).getError();

@@ -140,6 +140,13 @@ final class ChatRowMapper {
                 r.message = String.format(labels.senderFormat, c.getLastMessageSender(), text);
             }
         }
+        // AR9: an unsent draft replaces the preview (grey: Telegram's red "Draft:" needs an upstream hook).
+        final SecuredUi.Draft draft = r.invited || c.getForeignRelay() || (!c.getReady() && !r.saved) ? null : SecuredUi.draft(r.chatId);
+        if (draft != null) {
+            r.message = SecuredUi.draftLabel() + draft.text.replace('\n', ' ');
+            r.outgoing = false;
+            r.tick = Tick.NONE;
+        }
         return r;
     }
 

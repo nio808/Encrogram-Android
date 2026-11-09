@@ -153,6 +153,65 @@ public final class SecuredUi {
         return openChatListener != null;
     }
 
+    // ---- drafts (AR9) ----------------------------------------------------------------------------------------
+
+    /** An unsent message. Memory only: never written to disk or a log (the wall forbids Secured text in preferences). */
+    static final class Draft {
+        final String text;
+        final Long replyId;
+
+        Draft(String text, Long replyId) {
+            this.text = text;
+            this.replyId = replyId;
+        }
+    }
+
+    private static final java.util.HashMap<Long, Draft> drafts = new java.util.HashMap<>();
+    private static String draftLabel = "Draft: ";
+    private static Runnable draftListener;
+
+    /** Keeps (or, for blank text, drops) the draft of one chat. {@code label} is the localized "Draft: " for the list row. */
+    static synchronized void setDraft(long chatId, String text, Long replyId, String label) {
+        if (label != null) draftLabel = label;
+        final Draft old = drafts.get(chatId);
+        final boolean blank = text == null || text.trim().isEmpty();
+        if (blank) {
+            if (drafts.remove(chatId) == null) return;
+        } else {
+            if (old != null && old.text.equals(text) && java.util.Objects.equals(old.replyId, replyId)) return;
+            drafts.put(chatId, new Draft(text, replyId));
+        }
+        final Runnable l = draftListener;
+        if (l != null) new Handler(Looper.getMainLooper()).post(l);   // the list refreshes its row
+    }
+
+    /** Reset or restore: drafts belong to the old profile (Saved Messages keeps the same id across profiles). */
+    static synchronized void clearDrafts() {
+        drafts.clear();
+    }
+
+    /** Drops drafts of chats that no longer exist (deleted; ids can be reused by the core). */
+    static synchronized void pruneDrafts(java.util.Set<Long> liveChatIds) {
+        drafts.keySet().retainAll(liveChatIds);
+    }
+
+    static synchronized Draft draft(long chatId) {
+        return drafts.get(chatId);
+    }
+
+    static synchronized String draftLabel() {
+        return draftLabel;
+    }
+
+    /** The chat list registers a refresh here (one owner at a time). */
+    static synchronized void setDraftListener(Runnable listener) {
+        draftListener = listener;
+    }
+
+    static synchronized void clearDraftListener(Runnable listener) {
+        if (draftListener == listener) draftListener = null;
+    }
+
     // ---- logged-out doors ------------------------------------------------------------------------------------
 
     /** Secured's own preferences file (never Telegram's). */

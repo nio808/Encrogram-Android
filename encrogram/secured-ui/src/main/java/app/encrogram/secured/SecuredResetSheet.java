@@ -36,6 +36,7 @@ final class SecuredResetSheet {
                     // The UI's own per-profile traces go with the data: backup offer flags, recent emoji.
                     SecuredBackupUi.forget(activity);
                     SecuredEmojiPanel.forgetRecents(activity);
+                    SecuredUi.clearDrafts();
                     done.accept(null);
                 }));
             } catch (Throwable t) {

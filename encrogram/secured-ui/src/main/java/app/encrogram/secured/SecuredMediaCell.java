@@ -70,6 +70,9 @@ abstract class SecuredMediaCell extends View {
         /** The chat screen's one voice player (null until a voice cell needs it). */
         SecuredAudioPlayer audio();
 
+        /** Who sent this message, for TalkBack: "You", the contact or the group member. */
+        String senderName(SecuredMessage m);
+
         /** The name shown over a reply quote: "You", the contact, or a group member. */
         String quoteAuthor(SecuredMessage m);
     }
@@ -348,6 +351,8 @@ abstract class SecuredMediaCell extends View {
             highlightPaint.setColor(color(Theme.key_chat_selectedBackground));
             canvas.drawRect(0, 0, getWidth(), getHeight(), highlightPaint);
         }
+        canvas.save();
+        canvas.translate(slidingOffset, 0);   // swipe to reply (AR11)
         drawBubble(canvas);
         drawHeader(canvas);
         drawContent(canvas);
@@ -364,6 +369,21 @@ abstract class SecuredMediaCell extends View {
             checkBox.setBounds(dp(10), (int) (body.bottom - size - dp(4)), size, size);
             checkBox.draw(canvas);
         }
+        canvas.restore();
+    }
+
+    private float slidingOffset;
+
+    /** Swipe to reply: slides the bubble left (a negative offset), like ChatMessageCell.setSlidingOffset. */
+    final void setSlidingOffset(float x) {
+        if (slidingOffset != x) {
+            slidingOffset = x;
+            invalidate();
+        }
+    }
+
+    final float getSlidingOffsetX() {
+        return slidingOffset;
     }
 
     /** Draws the media content inside {@link #content}. */
@@ -593,12 +613,16 @@ abstract class SecuredMediaCell extends View {
 
     /** One spoken line: kind, state and time; never the file name or caption (those are in the caption bubble). */
     protected String accessibilityText() {
-        final StringBuilder sb = new StringBuilder(MediaText.kind(getContext(), kind()));
+        final StringBuilder sb = new StringBuilder();
+        final String who = host != null ? host.senderName(message) : null;
+        if (who != null && !who.isEmpty()) sb.append(who).append(", ");
+        sb.append(MediaText.kind(getContext(), kind()));
         if (media.getState() == MediaState.FAILED) {
             sb.append(", ").append(MediaText.failureShort(getContext(), media.getFailure()));
         } else if (moving()) {
             sb.append(", ").append(MediaText.progress(getContext(), progressDone, progressTotal));
         }
+        if (message.getOutgoing() && !notes) sb.append(", ").append(getContext().getString(SecuredMessageCell.wordFor(message.getStatus())));   // only what the engine reported
         sb.append(", ").append(timeText);
         return sb.toString();
     }

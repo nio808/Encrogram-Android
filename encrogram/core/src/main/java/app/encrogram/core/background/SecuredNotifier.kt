@@ -74,7 +74,7 @@ internal object SecuredNotifier {
     fun bareServiceNotification(context: Context): Notification {
         ensureChannels(context)
         return NotificationCompat.Builder(context, SERVICE_CHANNEL)
-            .setSmallIcon(context.applicationInfo.icon)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)   // monochrome: an adaptive launcher icon can crash SystemUI on 8.0
             .setContentTitle(NotificationText.SERVICE_TITLE)
             .setSilent(true)
             .build()
@@ -108,6 +108,19 @@ internal object SecuredNotifier {
     private val unread = UnreadTracker()
     private val burst = NotifyBurst()
     private val main = Handler(Looper.getMainLooper())
+    private var pendingFlush: Runnable? = null
+    /** Android lists a new notification a moment after notify(): "not shown" just after a post is not a swipe. */
+    private var lastPostMs = 0L
+    private const val SHOW_GRACE_MS = 2_000L
+
+    private fun swipedAway(context: Context) =
+        android.os.SystemClock.elapsedRealtime() - lastPostMs > SHOW_GRACE_MS && !isShown(context)
+
+    private fun cancelBurst() {
+        burst.cancel()
+        pendingFlush?.let { main.removeCallbacks(it) }
+        pendingFlush = null
+    }
 
     /**
      * One more unseen incoming message in [chatId]. Counts at once; the one combined notification is posted on the main
@@ -117,11 +130,13 @@ internal object SecuredNotifier {
         try {
             // Swiped away (or cancelled by the system): start counting again instead of resurrecting old counts.
             // Not while a burst is waiting: its own count has not been posted yet.
-            if (!burst.isPending() && !isShown(context)) unread.clearAll()
+            if (!burst.isPending() && swipedAway(context)) unread.clearAll()
             unread.add(chatId)
             if (burst.onMessage()) {
                 val app = context.applicationContext
-                main.postDelayed({ flushBurst(app, config) }, NotifyBurst.WINDOW_MS)
+                val r = Runnable { pendingFlush = null; flushBurst(app, config) }
+                pendingFlush = r
+                main.postDelayed(r, NotifyBurst.WINDOW_MS)
             }
         } catch (t: Throwable) {
             SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)
@@ -156,6 +171,7 @@ internal object SecuredNotifier {
             .setContentIntent(tap(context, config, unread.singleChat(), NotificationText.MESSAGES_ID))
             .build()
         NotificationManagerCompat.from(context).notify(TAG, NotificationText.MESSAGES_ID, message)
+        lastPostMs = android.os.SystemClock.elapsedRealtime()
     }
 
     /** The user has seen [chatId]: drop its share; cancels the notification when nothing unseen is left. */
@@ -165,9 +181,9 @@ internal object SecuredNotifier {
             if (burst.isPending()) {
                 // Not posted yet, so "not shown" says nothing about a swipe: the pending burst posts the other chats.
                 if (unread.total() > 0) return
-                burst.cancel()
+                cancelBurst()
             }
-            if (!isShown(context)) unread.clearAll()  // swiped away: never bring it back
+            if (swipedAway(context)) unread.clearAll()  // swiped away: never bring it back
             if (unread.total() == 0 || config == null) cancel(context)
             else post(context, config, alert = false)
         } catch (t: Throwable) {
@@ -179,7 +195,7 @@ internal object SecuredNotifier {
     fun clearAll(context: Context) {
         try {
             unread.clearAll()
-            burst.cancel()
+            cancelBurst()
             cancel(context)
         } catch (t: Throwable) {
             SecuredLog.crash(SecuredLog.Ev.BG_NOTIFY_FAILED, t)

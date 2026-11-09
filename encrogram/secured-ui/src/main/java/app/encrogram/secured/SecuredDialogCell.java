@@ -178,12 +178,20 @@ final class SecuredDialogCell extends DialogCell {
             Theme.dialogs_halfCheckDrawable = outlineHalf;
             Theme.dialogs_checkReadDrawable = outlineFull;
         }
+        // List ticks and clock in Encro Indigo; Telegram's own drawables are re-tinted from the global theme afterwards.
+        final Drawable check = Theme.dialogs_checkDrawable;
+        final Drawable clock = Theme.dialogs_clockDrawable;
+        final int tickColor = Kit.color(Theme.key_chats_sentCheck);
+        if (check != null) Theme.setDrawableColor(check, tickColor);
+        if (clock != null) Theme.setDrawableColor(clock, tickColor);
         // DialogCell paints unread badges with Telegram's global paint; Secured badges use Encro Indigo (design rule).
         final int oldCount = Theme.dialogs_countPaint != null ? Theme.dialogs_countPaint.getColor() : 0;
         if (Theme.dialogs_countPaint != null) Theme.dialogs_countPaint.setColor(SecuredResourcesProvider.accentFill());
         try {
             super.onDraw(canvas);
         } finally {
+            if (check != null) Theme.setDrawableColorByKey(check, Theme.key_chats_sentCheck);
+            if (clock != null) Theme.setDrawableColorByKey(clock, Theme.key_chats_sentClock);
             if (swap) {
                 Theme.dialogs_halfCheckDrawable = oldHalf;
                 Theme.dialogs_checkReadDrawable = oldFull;
