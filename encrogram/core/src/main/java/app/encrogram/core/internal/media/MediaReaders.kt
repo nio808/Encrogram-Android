@@ -8,6 +8,7 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.Arrays
+import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /*
@@ -170,15 +171,29 @@ internal class PlaybackRegistry {
 
     private val open = HashMap<Key, MutableList<MediaPlayback>>()
 
-    /** Opens a [VaultPlayback] over [reader] and registers it; closing it unregisters it. */
-    fun open(chatId: Long, messageId: Long, kind: MediaKind, mimeType: String?, durationSeconds: Int?, reader: MediaReader): VaultPlayback {
+    /** The bare name of the encrypted file each playback was opened from (guarded by [open]); retention keeps those. */
+    private val sourceOf = IdentityHashMap<MediaPlayback, String>()
+
+    /** Opens a [VaultPlayback] over [reader] and registers it; closing it unregisters it. [source]: the file it reads. */
+    fun open(
+        chatId: Long,
+        messageId: Long,
+        kind: MediaKind,
+        mimeType: String?,
+        durationSeconds: Int?,
+        reader: MediaReader,
+        source: String? = null,
+    ): VaultPlayback {
         val p = VaultPlayback(kind, mimeType, durationSeconds, reader) { unregister(it) }
-        register(chatId, messageId, p)
+        register(chatId, messageId, p, source)
         return p
     }
 
-    fun register(chatId: Long, messageId: Long, playback: MediaPlayback) {
-        synchronized(open) { open.getOrPut(Key(chatId, messageId)) { ArrayList(1) }.add(playback) }
+    fun register(chatId: Long, messageId: Long, playback: MediaPlayback, source: String? = null) {
+        synchronized(open) {
+            open.getOrPut(Key(chatId, messageId)) { ArrayList(1) }.add(playback)
+            if (source != null) sourceOf[playback] = source
+        }
     }
 
     fun unregister(playback: MediaPlayback) {
@@ -188,6 +203,7 @@ internal class PlaybackRegistry {
                 val e = iter.next()
                 if (e.value.removeAll { p -> p === playback } && e.value.isEmpty()) iter.remove()
             }
+            sourceOf.remove(playback)
         }
     }
 
@@ -196,6 +212,7 @@ internal class PlaybackRegistry {
         val victims = ArrayList<MediaPlayback>()
         synchronized(open) {
             for (id in messageIds) open.remove(Key(chatId, id))?.let { victims.addAll(it) }
+            for (p in victims) sourceOf.remove(p)
         }
         return closeQuietly(victims)
     }
@@ -212,6 +229,7 @@ internal class PlaybackRegistry {
                     iter.remove()
                 }
             }
+            for (p in victims) sourceOf.remove(p)
         }
         return closeQuietly(victims)
     }
@@ -222,11 +240,15 @@ internal class PlaybackRegistry {
         synchronized(open) {
             for (list in open.values) victims.addAll(list)
             open.clear()
+            sourceOf.clear()
         }
         return closeQuietly(victims)
     }
 
     fun count(): Int = synchronized(open) { open.values.sumOf { it.size } }
+
+    /** The files open playbacks were read from (bare names): never removed while open. */
+    fun sources(): Set<String> = synchronized(open) { HashSet(sourceOf.values) }
 
     private fun closeQuietly(victims: List<MediaPlayback>): Int {
         for (p in victims) {

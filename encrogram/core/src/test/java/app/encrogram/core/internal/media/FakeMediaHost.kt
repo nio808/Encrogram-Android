@@ -35,6 +35,11 @@ internal class FakeMediaHost(var now: Long) : MediaHost {
     override fun currentItem(chatId: Long, itemId: Long): CoreItem? =
         lookup?.invoke(chatId, itemId) ?: store[chatId to itemId]
 
+    /** What [savedFiles] answers: the names Saved Messages holds, or null for "couldn't list them". */
+    var saved: Set<String>? = emptySet()
+
+    override fun savedFiles(): Set<String>? = saved
+
     override fun messageChanged(items: List<CoreItem>) {
         for (i in items) changed += toMessage(i)
     }

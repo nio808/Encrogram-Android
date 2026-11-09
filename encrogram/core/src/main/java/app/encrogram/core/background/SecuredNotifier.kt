@@ -193,6 +193,12 @@ internal object SecuredNotifier {
 
     /** The user opened the Secured list: everything counts as seen. */
     fun clearAll(context: Context) {
+        // Reset calls this on the engine thread; the burst state lives on main.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            val app = context.applicationContext
+            main.post { clearAll(app) }
+            return
+        }
         try {
             unread.clearAll()
             cancelBurst()

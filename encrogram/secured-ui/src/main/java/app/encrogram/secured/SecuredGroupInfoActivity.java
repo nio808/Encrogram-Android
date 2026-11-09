@@ -179,7 +179,7 @@ final class SecuredGroupInfoActivity extends SecuredGroupScreen {
     private void rebuild() {
         rows.clear();
         rows.add(new Row(T_PROFILE, 0));
-        if (admin()) {
+        if (owner()) {   // the core accepts group profile changes only from owners
             rows.add(new Row(T_ACTION, A_PHOTO));
             if (summary != null && summary.getAvatar() != null) rows.add(new Row(T_ACTION, A_PHOTO_REMOVE));
         }

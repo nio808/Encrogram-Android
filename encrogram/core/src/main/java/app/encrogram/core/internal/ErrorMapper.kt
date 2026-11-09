@@ -57,6 +57,7 @@ internal object ErrorMapper {
     const val ALREADY_IN_GROUP = "You're already in this group."
     const val ALREADY_JOINING = "You're already joining this group. It appears in your chats once it connects."
     const val UNSUPPORTED_GROUP_LINK = "This link is for a kind of channel Encrogram doesn't support."
+    const val ONLY_OWNERS_PHOTO = "Only the group's owner can change its photo."
 
     // ---- the database key lost, and "Reset Secured" (b3) ----
     const val KEY_LOST = "Secured's key on this phone can't be read, so its data can't be opened. If restarting the phone doesn't help, " +
@@ -74,6 +75,7 @@ internal object ErrorMapper {
     const val FOREIGN_RELAY_GROUP = "Someone in this group uses a server Encrogram doesn't use, so sending here is paused until an admin removes them."
     const val FOREIGN_RELAY_ADD = "This contact uses a server Encrogram doesn't use, so they can't be added to a group."
     const val FOREIGN_RELAY_JOIN = "The person who invited you uses a server Encrogram doesn't use, so you can't join this group."
+    const val FOREIGN_RELAY_PROFILE = "A contact of yours uses a server Encrogram doesn't use, so profile changes are paused until they're back on Encrogram's server or you delete them."
 
     /** A send to a contact or group with a queue on a relay we don't run ([ForeignRelays]). [message] is one of the sentences above. */
     fun foreignRelay(message: String): SecuredError = SecuredError(Kind.UNAPPROVED_RELAY, message)
@@ -298,6 +300,10 @@ internal object ErrorMapper {
     const val MEDIA_PREPARED_GONE = "This attachment is no longer available. Pick it again."
     const val MEDIA_NOT_IN_SAVED = "Photos and files can't be added to Saved Messages in this version."
     const val MEDIA_NONE = "This message has no file."
+    /** A forward of a message whose file retention or "clear media" removed (the core would refuse the whole forward). */
+    const val MEDIA_GONE_FORWARD = "This file is no longer on this phone."
+    /** "Clear media" when Saved Messages' files couldn't be listed: nothing was removed. */
+    const val MEDIA_CLEAR_FAILED = "Media couldn't be cleared right now. Try again."
     /** An incoming file offered outside our file server (smp, inline), or a core refusal of such a transfer. */
     const val MEDIA_TRANSFER_REFUSED = "Encrogram moves files only through its own file server, so this transfer was refused."
     const val MEDIA_CANCELLED = "This file transfer was cancelled."

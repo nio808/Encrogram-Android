@@ -226,11 +226,15 @@ interface SecuredEngine {
 
     /**
      * Keep media for [days] (null = forever). Older files leave this phone now and once a day; their messages stay and
-     * show NOT_ON_DEVICE (the relay keeps files only about 2 days, so they can't come back). Your own sent files count too.
+     * show NOT_ON_DEVICE (the relay keeps files only about 2 days, so they can't come back). Your own sent files count too;
+     * Saved Messages files are always kept (they are the only copy). Files in use (sending, downloading, playing) stay.
      */
     fun setMediaRetention(days: Int?, callback: SecuredCallback<Unit>) = notYet(callback)
 
-    /** Removes every media file from this phone now; the messages stay (NOT_ON_DEVICE). */
+    /**
+     * Removes media files from this phone now; the messages stay (NOT_ON_DEVICE). Saved Messages and files in use stay.
+     * Needs the engine RUNNING; STORAGE when the file list can't be read (then nothing is removed).
+     */
     fun clearMedia(callback: SecuredCallback<Unit>) = notYet(callback)
 
     // ---- photos and details (audit round 2) ----------------------------------------------------------------------
@@ -241,7 +245,7 @@ interface SecuredEngine {
      */
     fun setProfilePhoto(jpeg: ByteArray?, callback: SecuredCallback<SecuredProfile>) = notYet(callback)
 
-    /** Groups, owner or admin: sets or removes the group photo, same rules as [setProfilePhoto]. Else NOT_ALLOWED. */
+    /** Groups, owner only (the core accepts group profile changes only from owners): sets or removes the group photo, same rules as [setProfilePhoto]. Else NOT_ALLOWED. */
     fun setGroupPhoto(chatId: Long, jpeg: ByteArray?, callback: SecuredCallback<Unit>) = notYet(callback)
 
     /** When a message was sent and received, per-member delivery of your group messages, and earlier versions after edits. */
@@ -266,7 +270,8 @@ data class MediaStorage(val bytes: Long, val files: Int)
 
 /**
  * [sentAtMs]: the sender's time; [receivedAtMs]: when it reached or was made on this phone. [deliveries]: groups, your own
- * messages only (empty when the group has no delivery receipts). [versions]: earlier texts after edits, newest first.
+ * messages only: the core's row per member (SENT_TO_SERVER until that member's receipt arrives, if the group sends
+ * receipts). [versions]: earlier texts after edits, newest first.
  */
 data class MessageInfo @JvmOverloads constructor(
     val sentAtMs: Long,

@@ -27,6 +27,13 @@ internal interface MediaHost {
     /** Engine thread: [chatId]'s message [itemId] as the store holds it now (localView), or null when it is gone. */
     fun currentItem(chatId: Long, itemId: Long): CoreItem?
 
+    /**
+     * Engine thread: the bare names (fileSource.filePath) of every file Saved Messages holds, or null when they can't
+     * all be listed (not running, a core error, too many notes). Retention and "clear media" never touch these files:
+     * they are the user's own copies and can't be downloaded again. Null means nothing is removed.
+     */
+    fun savedFiles(): Set<String>?
+
     /** onMessageChanged only (never onMessageReceived, never markChanged). Engine thread; delivered on main. */
     fun messageChanged(items: List<CoreItem>)
 

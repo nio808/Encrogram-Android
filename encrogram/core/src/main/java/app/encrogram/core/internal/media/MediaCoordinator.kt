@@ -6,6 +6,7 @@ import app.encrogram.core.api.MediaKind
 import app.encrogram.core.api.MediaPlayback
 import app.encrogram.core.api.MediaReader
 import app.encrogram.core.api.MediaState
+import app.encrogram.core.api.MediaStorage
 import app.encrogram.core.api.PreparedMedia
 import app.encrogram.core.api.SecuredCallback
 import app.encrogram.core.api.SecuredError
@@ -22,6 +23,7 @@ import app.encrogram.core.internal.SecuredLog.Ev
 import app.encrogram.core.internal.ServerAddress
 import app.encrogram.core.internal.media.prep.PrepException
 import app.encrogram.core.internal.media.prep.Preparer
+import java.io.File
 import java.util.Arrays
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -45,7 +47,8 @@ import org.json.JSONObject
  * Threads:
  * - [prepare] and [discard]: any thread; the work runs on [prepExecutor], the result on main ([MediaHost.deliver]).
  * - [readBytes] and [openPlayback]: engine thread; the reading runs on [readExecutor].
- * - Everything else: the engine thread. The ledger and the progress state are touched only there.
+ * - [storage] and [retentionDays]: any thread.
+ * - Everything else: the engine thread. The ledger, the upload pins and the progress state are touched only there.
  * - A generation counter, bumped by [onStop], makes queued prep and read work give up; a result that finishes after a
  *   stop is deleted or closed, never registered. [lock] guards the counter and the prepared registry.
  */
@@ -62,17 +65,33 @@ internal class MediaCoordinator(
     /** Reads and decrypts for the UI: one background thread. */
     private val readExecutor: Executor,
     private val config: MediaPolicyConfig = MediaPolicy.DEFAULT,
+    /** "Keep media for N days": a small file in the engine's no-backup folder, next to the ledger. */
+    private val retention: RetentionSetting = RetentionSetting(File(ledger.folder, RETENTION_FILE)),
+    /** Our uploads that haven't ended: their files are never removed. Next to the ledger. */
+    private val pins: UploadPins = UploadPins(File(ledger.folder, PINS_FILE)),
 ) {
     private val lock = Any()
     private var generation = 0L
     private val prepared = HashMap<Long, Prepared>()
     private val tokens = AtomicLong(0)
 
+    /** Guarded by [lock]: files handed to the read thread right now (readBytes, openPlayback until registered), by name. */
+    private val reading = HashMap<String, Int>()
+
     // ---- engine thread only ----
     private var throttle = ProgressThrottle(host::nowMs)
 
     /** Plaintext sizes of files moving now, by (chatId, itemId): progress events carry only the core's padded units. */
     private val movingSizes = HashMap<Pair<Long, Long>, Long>()
+
+    /**
+     * Files the UI was last shown as here, by bare name -> (chatId, itemId), most recent [SHOWN_MAX]: after a
+     * retention pass or "clear media" those messages are sent again (onMessageChanged) so their bubbles show
+     * NOT_ON_DEVICE without a reopen. Anything older is mapped afresh the next time it is loaded. Memory only.
+     */
+    private val shown = object : LinkedHashMap<String, Pair<Long, Long>>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, Long>>?) = size > SHOWN_MAX
+    }
 
     // =============================================================================================================
     // Sending
@@ -163,8 +182,13 @@ internal class MediaCoordinator(
         }
         when (reply) {
             is TransportReply.Item -> {
-                // Sent, but no item of this chat came back: the file stays (the core references it).
-                val item = reply.item?.takeIf { it.chatId == chatId } ?: return fail(callback, ErrorMapper.engine("noItem"), Ev.MEDIA_FAILED, "send")
+                // Sent, but no item of this chat came back: the file stays (the core references it), pinned for good.
+                val item = reply.item?.takeIf { it.chatId == chatId } ?: run {
+                    pins.add(chatId, UploadPins.UNKNOWN_ITEM, name)
+                    return fail(callback, ErrorMapper.engine("noItem"), Ev.MEDIA_FAILED, "send")
+                }
+                // Until its upload ends, retention and "clear media" leave this file alone.
+                pins.add(chatId, item.itemId, name)
                 SecuredLog.i(Ev.MEDIA_SENT, p.kind.name)
                 host.deliver(callback, SecuredResult.Ok(host.toMessage(item)))
                 host.itemsAdded(listOf(item))
@@ -175,8 +199,8 @@ internal class MediaCoordinator(
             }
             is TransportReply.Failed -> {
                 // An error reply means the core refused it: the file goes. With no readable reply the core may already
-                // reference it, so it stays (the core's own delete removes it with the message).
-                if (reply.error !in KEEP_COMMITTED) vault.uncommit(name)
+                // reference it, so it stays (the core's own delete removes it with the message), pinned for good.
+                if (reply.error !in KEEP_COMMITTED) vault.uncommit(name) else pins.add(chatId, UploadPins.UNKNOWN_ITEM, name)
                 fail(callback, reply.error, Ev.MEDIA_FAILED, "send")
             }
         }
@@ -341,6 +365,7 @@ internal class MediaCoordinator(
             return when (val r = transport.cancel(file.fileId)) {
                 is TransportReply.Item -> {
                     SecuredLog.i(Ev.MEDIA_CANCELLED, "upload")
+                    pins.remove(item.chatId, item.itemId)
                     forget(item.chatId, item.itemId)
                     ok(callback, Unit)
                     r.item?.let { host.messageChanged(listOf(it)) } ?: Unit
@@ -427,11 +452,13 @@ internal class MediaCoordinator(
         when (ev.tag) {
             "rcvFileComplete", "sndFileCompleteXFTP" -> {
                 if (ev.tag == "rcvFileComplete" && file != null) ledger.remove(file.fileId)
+                if (ev.tag == "sndFileCompleteXFTP") pins.remove(item.chatId, item.itemId)
                 forget(item.chatId, item.itemId)
                 SecuredLog.i(Ev.MEDIA_DONE, file?.kind?.name)
             }
             "rcvFileError", "rcvFileSndCancelled", "sndFileError", "sndFileCancelled" -> {
                 if (ev.tag.startsWith("rcv") && file != null) ledger.remove(file.fileId)
+                if (ev.tag.startsWith("snd")) pins.remove(item.chatId, item.itemId)
                 forget(item.chatId, item.itemId)
                 // Failure plus the core's error type (auth, blocked, noFile, relay, other): fixed tokens, never its text.
                 SecuredLog.w(Ev.MEDIA_FAILED, file?.let { f ->
@@ -469,8 +496,12 @@ internal class MediaCoordinator(
         val receiving = f.statusTag.startsWith("rcv")
         val needsStat = f.path != null && (!receiving || f.statusTag == RCV_COMPLETE || f.protocol == LOCAL)
         val present = needsStat && vault.present(f.path)
+        if (present) f.path?.let { shown[it] = item.chatId to item.itemId }
         if (f.statusTag in UPLOADING || f.statusTag in DOWNLOADING) movingSizes[item.chatId to item.itemId] = f.sizeBytes
-        if (!receiving) return LocalFacts(present = present)
+        if (!receiving) {
+            trackUpload(item, f)
+            return LocalFacts(present = present)
+        }
         val e = ledger.get(f.fileId, item.sharedMsgId)
         val verdict = e?.verdict
         return LocalFacts(
@@ -484,6 +515,20 @@ internal class MediaCoordinator(
         )
     }
 
+    /**
+     * Keeps [UploadPins] true to what the core shows: an upload still running is pinned (one sent before pins existed,
+     * or whose pin was lost), one that has ended is released (its end event came while the engine wasn't running).
+     * Writes only when that changes something.
+     */
+    private fun trackUpload(item: CoreItem, f: CoreFile) {
+        if (f.protocol == LOCAL || item.deleted) return
+        val path = f.path
+        when (f.statusTag) {
+            in UPLOADING -> if (path != null && !pins.has(item.chatId, item.itemId)) pins.add(item.chatId, item.itemId, path)
+            in UPLOAD_ENDED -> if (!pins.isEmpty() && pins.has(item.chatId, item.itemId)) pins.remove(item.chatId, item.itemId)
+        }
+    }
+
     // =============================================================================================================
     // Reading
     // =============================================================================================================
@@ -495,18 +540,24 @@ internal class MediaCoordinator(
             return fail(callback, SecuredError(Kind.TOO_LARGE, ErrorMapper.MEDIA_TOO_LARGE_TO_OPEN), Ev.MEDIA_READ_FAILED, "cap")
         }
         val gen = currentGeneration()
-        launch(readExecutor, callback, Ev.MEDIA_READ_FAILED) {
-            if (!isCurrent(gen)) return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
-            val bytes = try {
-                vault.readBytes(src.path, src.key, config.readBytesLimit)
-            } catch (t: Throwable) {
-                return@launch fail(callback, readError(t), Ev.MEDIA_READ_FAILED, tagOf(t))
+        // Held from here (engine thread, so no retention pass can slip in between) until the read is over.
+        hold(src.path)
+        launch(readExecutor, callback, Ev.MEDIA_READ_FAILED, onRejected = { unhold(src.path) }) {
+            try {
+                if (!isCurrent(gen)) return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
+                val bytes = try {
+                    vault.readBytes(src.path, src.key, config.readBytesLimit)
+                } catch (t: Throwable) {
+                    return@launch fail(callback, readError(t), Ev.MEDIA_READ_FAILED, tagOf(t))
+                }
+                if (!isCurrent(gen)) {
+                    Arrays.fill(bytes, 0.toByte())
+                    return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
+                }
+                host.deliver(callback, SecuredResult.Ok(bytes))
+            } finally {
+                unhold(src.path)
             }
-            if (!isCurrent(gen)) {
-                Arrays.fill(bytes, 0.toByte())
-                return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
-            }
-            host.deliver(callback, SecuredResult.Ok(bytes))
         }
     }
 
@@ -522,23 +573,31 @@ internal class MediaCoordinator(
             return fail(callback, storageFull(), Ev.MEDIA_READ_FAILED, "space")
         }
         val gen = currentGeneration()
-        launch(readExecutor, callback, Ev.MEDIA_READ_FAILED) {
-            if (!isCurrent(gen)) return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
-            val reader: MediaReader = try {
-                if (inMemory) ByteArrayMediaReader(vault.readBytes(src.path, src.key, config.readBytesLimit))
-                else FileMediaReader(vault.decryptToView(src.path, src.key))
-            } catch (t: Throwable) {
-                return@launch fail(callback, readError(t), Ev.MEDIA_READ_FAILED, tagOf(t))
+        // Held until the playback is registered with its source (which then keeps the file until it closes).
+        hold(src.path)
+        launch(readExecutor, callback, Ev.MEDIA_READ_FAILED, onRejected = { unhold(src.path) }) {
+            try {
+                if (!isCurrent(gen)) return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
+                val reader: MediaReader = try {
+                    if (inMemory) ByteArrayMediaReader(vault.readBytes(src.path, src.key, config.readBytesLimit))
+                    else FileMediaReader(vault.decryptToView(src.path, src.key))
+                } catch (t: Throwable) {
+                    return@launch fail(callback, readError(t), Ev.MEDIA_READ_FAILED, tagOf(t))
+                }
+                val playback = synchronized(lock) {
+                    if (gen == generation) {
+                        vault.playbacks.open(src.chatId, src.itemId, src.kind, src.mimeType, src.durationSeconds, reader, src.path)
+                    } else null
+                }
+                if (playback == null) {
+                    // Finished after a stop: never handed out, and its view/ copy is deleted now.
+                    reader.close()
+                    return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
+                }
+                host.deliver(callback, SecuredResult.Ok(playback))
+            } finally {
+                unhold(src.path)
             }
-            val playback = synchronized(lock) {
-                if (gen == generation) vault.playbacks.open(src.chatId, src.itemId, src.kind, src.mimeType, src.durationSeconds, reader) else null
-            }
-            if (playback == null) {
-                // Finished after a stop: never handed out, and its view/ copy is deleted now.
-                reader.close()
-                return@launch fail(callback, stopped(), Ev.MEDIA_READ_FAILED, "stopped")
-            }
-            host.deliver(callback, SecuredResult.Ok(playback))
         }
     }
 
@@ -586,11 +645,17 @@ internal class MediaCoordinator(
         vault.wipeTransient()
     }
 
-    /** Engine thread: the store was replaced (restore). File ids start again, so every verdict goes too. */
+    /**
+     * Engine thread: the store was replaced (restore, reset). File ids start again, so every verdict and upload pin goes
+     * too; the retention setting is read again (a reset deletes its file with the folder).
+     */
     fun onStoreReplaced() {
         vault.wipeTransient()
         ledger.clear()
+        pins.clear()
+        retention.forget()
         movingSizes.clear()
+        shown.clear()
         throttle = ProgressThrottle(host::nowMs)
     }
 
@@ -606,6 +671,7 @@ internal class MediaCoordinator(
         for (p in dropped) deleteSealed(p)
         vault.playbacks.closeAll()
         movingSizes.clear()
+        shown.clear()
         throttle = ProgressThrottle(host::nowMs)
     }
 
@@ -619,6 +685,7 @@ internal class MediaCoordinator(
         if (itemIds.isEmpty()) return
         vault.playbacks.closeFor(chatId, itemIds)
         ledger.removeForChat(chatId, itemIds)
+        pins.removeItems(chatId, itemIds)
         for (id in itemIds) forget(chatId, id)
     }
 
@@ -626,7 +693,127 @@ internal class MediaCoordinator(
     fun onChatRemoved(chatId: Long) {
         vault.playbacks.closeChat(chatId)
         ledger.removeForChat(chatId, ledger.entries().filter { it.chatId == chatId }.map { it.itemId })
+        pins.removeChat(chatId)
         movingSizes.keys.removeAll { it.first == chatId }
+    }
+
+    // =============================================================================================================
+    // Storage and retention ("keep media", A7)
+    // =============================================================================================================
+
+    /** Any thread (no core call; lists and stats the files folder): the encrypted media on this phone. */
+    fun storage(): MediaStorage = vault.storage()
+
+    /** Any thread: days media is kept, or null for forever (the default). The first call reads one small file. */
+    fun retentionDays(): Int? = retention.days()
+
+    /**
+     * Engine thread. Saves "keep media for [days]" (null: forever), then, while the engine runs, removes what is
+     * already older at once. Null when done; otherwise why not (nothing changed).
+     */
+    fun setRetentionDays(days: Int?): SecuredError? {
+        if (!MediaRetention.valid(days)) return ErrorMapper.invalid(RETENTION_INVALID)
+        if (!retention.set(days)) return SecuredError(Kind.STORAGE, ErrorMapper.STORAGE)
+        SecuredLog.i(Ev.MEDIA_WIPED, if (days == null) "keep_forever" else "keep_days", days)
+        if (days != null && host.running()) applyRetention()
+        return null
+    }
+
+    /**
+     * Engine thread: removes the media files older than the retention setting (nothing when it is forever). Safe to call
+     * at every start and once a day; it only lists the files folder and empties what is due. Returns how many files
+     * were removed, or null when Saved Messages couldn't be listed (then nothing was). Their messages stay and show
+     * NOT_ON_DEVICE; nothing downloads them again (the core's record says complete, and /freceive refuses anything but
+     * a new offer).
+     */
+    fun applyRetention(nowMs: Long = host.nowMs()): Int? {
+        val days = retention.days() ?: return 0
+        return removeFiles(nowMs, days, "retention")
+    }
+
+    /**
+     * Engine thread: removes every media file now, except those in use and Saved Messages' (see [removeFiles]). Returns
+     * how many, or null when Saved Messages couldn't be listed (then nothing was removed).
+     */
+    fun clearAll(nowMs: Long = host.nowMs()): Int? = removeFiles(nowMs, null, "clear")
+
+    /**
+     * True when [item]'s file was here and is gone (NOT_ON_DEVICE). Engine thread. For the engine's forward: the core
+     * would find the emptied file, fail to copy it and refuse the whole forward, so such items are better refused first.
+     */
+    fun fileGone(item: CoreItem): Boolean {
+        if (item.deleted || item.file == null) return false
+        val f = annotate(listOf(item)).first().file ?: return false
+        val m = FileStatusMapper.map(f, !f.statusTag.startsWith("rcv"))
+        return m.state == MediaState.FAILED && m.failure == MediaFailure.NOT_ON_DEVICE
+    }
+
+    /**
+     * Empties every listed file that [MediaRetention.select] picks for [days] (null: all), except, whatever its age:
+     * - our own upload that hasn't ended ([UploadPins]; first refreshed from the core while it runs);
+     * - a file handed to the read thread right now (readMediaBytes, an opening playback) or open for playback;
+     * - an empty file (a download's placeholder: the core fills it in one go at the end) and anything written in the
+     *   last [MediaRetention.FRESH_MS] (a download's final write, a commit, a forward copy);
+     * - a prepared attachment: it lives in `prep/`, never in the files folder;
+     * - a file Saved Messages holds ([MediaHost.savedFiles]): the user's own copy, which can't be downloaded again
+     *   (lead decision, 9 November 2026). When those can't be listed, nothing at all is removed (null).
+     * Plaintext copies need no extra step: a `view/` copy exists only for an open playback or a read in flight, whose
+     * source is kept, and leftovers of a crash are wiped at every store open.
+     *
+     * Then the messages whose files went and that the UI was shown ([shown]) are sent again, so open chats update.
+     */
+    private fun removeFiles(nowMs: Long, days: Int?, tag: String): Int? {
+        val saved = host.savedFiles() ?: run {
+            SecuredLog.w(Ev.MEDIA_IO_FAILED, "saved_unlisted")
+            return null
+        }
+        refreshPins()
+        val pinned = pins.hashes()
+        val inUse = vault.playbacks.sources() + synchronized(lock) { HashSet(reading.keys) }
+        val keep: (String) -> Boolean = { name ->
+            name in saved || name in inUse || (pinned.isNotEmpty() && MediaRetention.nameHash(name) in pinned)
+        }
+        val due = MediaRetention.select(vault.storedFiles(), nowMs, days, keep)
+        val gone = due.filter { vault.expire(it) }
+        if (gone.size < due.size) SecuredLog.w(Ev.MEDIA_IO_FAILED, "expire", due.size - gone.size)
+        SecuredLog.i(Ev.MEDIA_WIPED, tag, gone.size)
+        tellRemoved(gone)
+        return gone.size
+    }
+
+    /** Sends again the shown messages whose files [gone] held, as the store holds them now (NOT_ON_DEVICE). */
+    private fun tellRemoved(gone: List<StoredFile>) {
+        if (gone.isEmpty() || shown.isEmpty()) return
+        val ids = gone.mapNotNullTo(LinkedHashSet()) { shown.remove(it.name) }
+        if (ids.isEmpty()) return
+        val items = ids.mapNotNull { (chatId, itemId) ->
+            try {
+                host.currentItem(chatId, itemId)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.MEDIA_IO_FAILED, t)
+                null
+            }
+        }
+        if (items.isNotEmpty()) host.messageChanged(items)
+    }
+
+    /**
+     * Releases pins whose upload has ended, on the core's word (engine running). A message the core can't find, or
+     * any doubt, keeps its pin: deleting the message removes its pin (or its file) anyway.
+     */
+    private fun refreshPins() {
+        if (pins.isEmpty() || !host.running()) return
+        for (pin in pins.entries()) {
+            if (pin.itemId == UploadPins.UNKNOWN_ITEM) continue
+            val item = try {
+                host.currentItem(pin.chatId, pin.itemId)
+            } catch (t: Throwable) {
+                SecuredLog.crash(Ev.MEDIA_IO_FAILED, t)
+                null
+            } ?: continue
+            val f = item.file
+            if (item.deleted || f == null || f.statusTag in UPLOAD_ENDED) pins.remove(pin.chatId, pin.itemId)
+        }
     }
 
     // =============================================================================================================
@@ -636,6 +823,19 @@ internal class MediaCoordinator(
     private fun currentGeneration(): Long = synchronized(lock) { generation }
 
     private fun isCurrent(gen: Long): Boolean = synchronized(lock) { gen == generation }
+
+    private fun hold(name: String?) {
+        if (name == null) return
+        synchronized(lock) { reading[name] = (reading[name] ?: 0) + 1 }
+    }
+
+    private fun unhold(name: String?) {
+        if (name == null) return
+        synchronized(lock) {
+            val n = (reading[name] ?: 0) - 1
+            if (n <= 0) reading.remove(name) else reading[name] = n
+        }
+    }
 
     private fun forget(chatId: Long, itemId: Long) {
         movingSizes.remove(chatId to itemId)
@@ -769,7 +969,18 @@ internal class MediaCoordinator(
         private const val RCV_INVITATION = "rcvInvitation"
         private const val RCV_COMPLETE = "rcvComplete"
         private val UPLOADING = setOf("sndStored", "sndTransfer", "sndWarning")
+        /** An upload that can't move again: its pin goes. (An unknown tag keeps it.) */
+        private val UPLOAD_ENDED = setOf("sndComplete", "sndCancelled", "sndError")
         private val DOWNLOADING = setOf("rcvAccepted", "rcvTransfer", "rcvWarning")
+
+        /** Next to the ledger in the engine's no-backup folder (never in `files/`, so never in a backup). */
+        const val RETENTION_FILE = "media_retention"
+        const val PINS_FILE = "media_upload_pins"
+
+        private const val RETENTION_INVALID = "Choose how many days to keep media."
+
+        /** At most this many shown files are remembered for [tellRemoved] (one core lookup each after a removal). */
+        private const val SHOWN_MAX = 128
 
         /**
          * SimplexMediaTransport's errors for a send without a readable reply (CoreReply.Invalid, an unexpected result,

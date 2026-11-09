@@ -46,6 +46,14 @@ internal object ForeignRelays {
     }
 
     /**
+     * Our profile (name and photo) goes to every contact at once (APIUpdateProfile, updateProfile_ sendUpdateToContacts,
+     * Commands.hs:3949-3966), so a change is paused while any contact is marked. Group members get it only with our next
+     * message in that group (sendGroupProfileUpdate, Library/Internal.hs:2461-2485), which [refusal] already pauses.
+     */
+    fun profileRefusal(marks: Set<Long>): String? =
+        if (marks.any { !isMemberMark(it) }) ErrorMapper.FOREIGN_RELAY_PROFILE else null
+
+    /**
      * What an `/_info @id` / `/_info #g <memberId>` reply says: true some queue is on a relay we don't run; false none
      * is (every queue ours, no active connection, or the connection is gone for good, [gone]); null when the reply
      * can't tell (another error, a garbled reply): the mark stays as it was.

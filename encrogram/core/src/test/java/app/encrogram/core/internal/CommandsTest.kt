@@ -25,9 +25,21 @@ class CommandsTest {
     }
 
     @Test
-    fun itemInfoForGroupItemsOnly() {
+    fun itemInfoForAnyChat() {
         assertEquals("/_get item info #3 7", Commands.itemInfo(ChatRef.group(3), 7))
-        assertTrue(runCatching { Commands.itemInfo(ChatRef.contact(5), 7) }.isFailure)
+        assertEquals("/_get item info @5 7", Commands.itemInfo(ChatRef.contact(5), 7))
+        assertEquals("/_get item info *2 7", Commands.itemInfo(ChatRef.notes(2), 7))
+    }
+
+    @Test
+    fun updateGroupProfileIsAsciiAndRoundTrips() {
+        val profile = JSONObject().put("displayName", "Équipe 🌸").put("fullName", "").put("image", "data:image/jpg;base64,QUJD")
+        val cmd = Commands.updateGroupProfile(3, profile)
+        assertTrue(cmd.startsWith("/_group_profile #3 {"))
+        assertTrue(ascii(cmd))
+        val sent = JSONObject(cmd.removePrefix("/_group_profile #3 "))
+        assertEquals("Équipe 🌸", sent.getString("displayName"))
+        assertEquals("data:image/jpg;base64,QUJD", sent.getString("image"))
     }
 
     @Test

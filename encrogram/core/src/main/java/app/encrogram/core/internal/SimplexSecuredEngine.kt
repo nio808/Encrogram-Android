@@ -15,8 +15,11 @@ import app.encrogram.core.api.ItemAction
 import app.encrogram.core.api.LinkCheck
 import app.encrogram.core.api.MediaInput
 import app.encrogram.core.api.MediaPlayback
+import app.encrogram.core.api.MediaStorage
+import app.encrogram.core.api.MemberDelivery
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MemberStatus
+import app.encrogram.core.api.MessageInfo
 import app.encrogram.core.api.MessagePage
 import app.encrogram.core.api.MessageStatus
 import app.encrogram.core.api.PreparedMedia
@@ -49,6 +52,7 @@ import app.encrogram.core.internal.media.CtrlGate
 import app.encrogram.core.internal.media.MediaCoordinator
 import app.encrogram.core.internal.media.MediaHost
 import app.encrogram.core.internal.media.MediaLedger
+import app.encrogram.core.internal.media.MediaRetention
 import app.encrogram.core.internal.media.MediaVault
 import app.encrogram.core.internal.media.SimplexMediaTransport
 import app.encrogram.core.internal.media.SimplexNativeFiles
@@ -163,6 +167,11 @@ internal class SimplexSecuredEngine(
     /** Bumped for each network change, so only the last one of a burst reconnects ([applyNetwork]). */
     private var reconnectGen = 0L
     @Volatile private var online = true
+
+    /** "Keep media" checks ([startRetentionChecks]): bumped at each start and stop, so only the current chain runs. */
+    private var retentionGen = 0L
+    /** Wall clock of the last retention pass (engine thread). */
+    private var lastRetentionMs = 0L
 
     /** Our own group messages sent with nobody to send them to ([NoRecipientCheck]): engine thread. */
     private val noRecipients = NoRecipientCheck(
@@ -280,6 +289,7 @@ internal class SimplexSecuredEngine(
         }
         // The row's tick follows (a finished upload lifts the clock); never applyNewItems, which would make an older
         // item the row's last message.
+        override fun savedFiles(): Set<String>? = savedFileNames()
         override fun messageChanged(items: List<CoreItem>) {
             emitChanged(items)
             applyStatuses(items)
@@ -333,12 +343,42 @@ internal class SimplexSecuredEngine(
         val name = validName(displayName) ?: return@post err(callback, nameError())
         val local = activeProfileJson() ?: return@post err(callback, ErrorMapper.engine("active_user"))
         // Read-modify-write: the core replaces the whole profile (G4). Our preferences ride along.
-        val update = CoreJson.profileUpdate(local, name) ?: return@post ok(callback, SecuredProfile(name))
+        val update = CoreJson.profileUpdate(local, name) ?: return@post ok(callback, profileOf(local))
+        sendProfile(update, callback)
+    }
+
+    /**
+     * `/_profile` with the photo set or removed, every other field kept ([CoreJson.profileUpdate]). The UI re-encoded it;
+     * [Avatars.outgoingRefusal] checks it is a small clean JPEG all the same (TOO_LARGE, UNSUPPORTED).
+     */
+    override fun setProfilePhoto(jpeg: ByteArray?, callback: SecuredCallback<SecuredProfile>) {
+        // Copied now: the caller may reuse its array while the engine thread works.
+        val bytes = jpeg?.copyOf()
+        post(callback) {
+            if (!ensureRunning(callback)) return@post
+            bytes?.let { Avatars.outgoingRefusal(it) }?.let { return@post err(callback, it) }
+            val local = activeProfileJson() ?: return@post err(callback, ErrorMapper.engine("active_user"))
+            val change = CoreJson.ImageChange(bytes?.let { Avatars.dataUrl(it) })
+            val update = CoreJson.profileUpdate(local, image = change) ?: return@post ok(callback, profileOf(local))
+            sendProfile(update, callback)
+        }
+    }
+
+    /** Our profile as a LocalProfile or Profile JSON holds it. */
+    private fun profileOf(p: JSONObject) = SecuredProfile(p.str("displayName").orEmpty(), Avatars.of(p.str("image")))
+
+    /**
+     * Sends [update] (a whole Profile, [CoreJson.profileUpdate]) to the core, which sends it to every contact at once:
+     * refused while any of them is on a relay we don't run (b1, [ForeignRelays.profileRefusal]). The result is the
+     * profile as sent.
+     */
+    private fun sendProfile(update: JSONObject, callback: SecuredCallback<SecuredProfile>) {
+        ForeignRelays.profileRefusal(foreignMarks())?.let { return refuseForeign(callback, it) }
         when (val r = send(Commands.updateProfile(userId, update))) {
             is CoreReply.Result -> when (r.type) {
                 "userProfileUpdated", "userProfileNoChange" -> {
                     SecuredLog.i(Ev.PROFILE_UPDATED, r.type)
-                    val profile = SecuredProfile(name)
+                    val profile = profileOf(update)
                     currentProfile = profile
                     ok(callback, profile)
                     markChanged()
@@ -683,6 +723,84 @@ internal class SimplexSecuredEngine(
     override fun openMediaForPlayback(chatId: Long, messageId: Long, callback: SecuredCallback<MediaPlayback>) =
         withItem(chatId, messageId, callback) { media.openPlayback(it, callback) }
 
+    // ---- storage and "keep media" (A7) ----
+
+    /** Any thread: lists and stats the files folder, no core call. */
+    override fun mediaStorage(callback: SecuredCallback<MediaStorage>) {
+        val storage = try {
+            media.storage()
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.MEDIA_IO_FAILED, t)
+            return err(callback, SecuredError(SecuredError.Kind.STORAGE, ErrorMapper.STORAGE))
+        }
+        ok(callback, storage)
+    }
+
+    override fun mediaRetentionDays(): Int? = media.retentionDays()
+
+    /** Saved at once; while running, what is already older goes now (and its shown messages are sent again). */
+    override fun setMediaRetention(days: Int?, callback: SecuredCallback<Unit>) = post(callback) {
+        media.setRetentionDays(days)?.let { return@post err(callback, it) }
+        ok(callback, Unit)
+    }
+
+    /** Needs the core: Saved Messages' files are listed first and always kept. */
+    override fun clearMedia(callback: SecuredCallback<Unit>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        if (media.clearAll() == null) return@post err(callback, SecuredError(SecuredError.Kind.STORAGE, ErrorMapper.MEDIA_CLEAR_FAILED))
+        ok(callback, Unit)
+    }
+
+    /** Engine thread: a retention pass now (nothing when the setting is forever). Never throws. */
+    private fun runRetention() {
+        lastRetentionMs = System.currentTimeMillis()
+        try {
+            media.applyRetention()
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.MEDIA_IO_FAILED, t)
+        }
+    }
+
+    /**
+     * Engine thread, at each start: a fresh chain of hourly checks that runs a pass once a day of wall-clock time (an
+     * uptime timer alone would stretch "a day" while the phone sleeps). A stop, or the next start, ends the old chain.
+     */
+    private fun startRetentionChecks() {
+        val gen = ++retentionGen
+        main.postDelayed({ post { retentionCheck(gen) } }, RETENTION_CHECK_MS)
+    }
+
+    private fun retentionCheck(gen: Long) {
+        if (gen != retentionGen || state != EngineState.RUNNING) return
+        if (System.currentTimeMillis() - lastRetentionMs >= MediaRetention.DAY_MS) runRetention()
+        main.postDelayed({ post { retentionCheck(gen) } }, RETENTION_CHECK_MS)
+    }
+
+    /**
+     * Engine thread: the bare names of every file in Saved Messages, read page by page from the newest; null when not
+     * running, on any core error, or past [SAVED_MAX_PAGES] pages (then retention removes nothing).
+     */
+    private fun savedFileNames(): Set<String>? {
+        if (state != EngineState.RUNNING || ctrl == 0L) return null
+        val ref = ChatRef.notes(noteFolderId ?: return null)
+        val names = HashSet<String>()
+        var before: Long? = null
+        repeat(SAVED_MAX_PAGES) {
+            val r = send(Commands.getChat(ref, SAVED_PAGE, beforeId = before)) as? CoreReply.Result ?: return null
+            if (r.type != "apiChat") return null
+            val page = CoreJson.filePage(r.body) ?: return null
+            names += page.paths
+            if (page.rows < SAVED_PAGE) return names
+            // A full page without an older readable id can't move the cursor: the rest can't be listed.
+            val next = page.oldestId ?: return null
+            val prev = before
+            if (prev != null && next >= prev) return null
+            before = next
+        }
+        SecuredLog.w(Ev.MEDIA_IO_FAILED, "saved_too_many")
+        return null
+    }
+
     /** Engine thread, RUNNING: [chatId]'s message [messageId] as the chat shows it, or the reason goes to [callback]. */
     private fun <T> withItem(chatId: Long, messageId: Long, callback: SecuredCallback<T>, block: (CoreItem) -> Unit) = post(callback) {
         if (!ensureRunning(callback)) return@post
@@ -794,7 +912,7 @@ internal class SimplexSecuredEngine(
                     val contactChat = m.memberContactId?.takeIf { id -> chatCache[id]?.kind == ChatKind.DIRECT && !isGroupChatId(id) }
                     val status = if (g.deleted) MemberStatus.REMOVED else m.status
                     val foreign = !m.isMe && ForeignRelays.memberMarked(marks, groupId, m.groupMemberId)
-                    GroupMember(m.groupMemberId, m.displayName, m.role, status, m.isMe, contactChat, foreign)
+                    GroupMember(m.groupMemberId, m.displayName, m.role, status, m.isMe, contactChat, foreign, m.avatar)
                 }
                 ok(callback, list)
             }
@@ -949,6 +1067,56 @@ internal class SimplexSecuredEngine(
             is CoreReply.Error -> err(callback, ErrorMapper.fromCore(r.error, Op.CONNECT))
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
+    }
+
+    /**
+     * The owner sets or removes the group's photo: `/_group_profile #g` with the group's profile as stored now and only its
+     * image changed ([CoreJson.groupProfileUpdate]: preferences and every other field kept). Members see "group updated".
+     */
+    override fun setGroupPhoto(chatId: Long, jpeg: ByteArray?, callback: SecuredCallback<Unit>) {
+        // Copied now: the caller may reuse its array while the engine thread works.
+        val bytes = jpeg?.copyOf()
+        post(callback) {
+            if (!ensureRunning(callback)) return@post
+            val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+            GroupRules.photoRefusal(g)?.let { return@post refuse(callback, "group_photo", it) }
+            bytes?.let { Avatars.outgoingRefusal(it) }?.let { return@post err(callback, it) }
+            // Every member gets the new profile (b1).
+            foreignRefusal(chatId)?.let { return@post refuseForeign(callback, it) }
+            val info = groupInfoOrErr(chatId, callback) ?: return@post
+            val current = info.optJSONObject("groupProfile")?.takeIf { !it.str("displayName").isNullOrEmpty() }
+                ?: return@post err(callback, ErrorMapper.engine("group_profile"))
+            val update = CoreJson.groupProfileUpdate(current, bytes?.let { Avatars.dataUrl(it) }) ?: return@post ok(callback, Unit)
+            chatCommand(if (bytes == null) "group_photo_remove" else "group_photo_set", Commands.updateGroupProfile(g.groupId, update), "groupUpdated", callback)
+        }
+    }
+
+    /**
+     * `/_get item info` (any chat): times and status as the chat shows the message, earlier versions after edits, and
+     * for our own group messages each member's delivery, named from a fresh `/_members` (rows of members the core no
+     * longer lists are left out, as the official app does). Version texts are user content: never logged.
+     */
+    override fun messageInfo(chatId: Long, messageId: Long, callback: SecuredCallback<MessageInfo>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val ref = refOf(chatId) ?: return@post err(callback, ErrorMapper.chatGone())
+        val info = when (val r = send(Commands.itemInfo(ref, messageId))) {
+            is CoreReply.Result ->
+                if (r.type == "chatItemInfo") CoreJson.parseMessageInfo(r.body) ?: return@post err(callback, ErrorMapper.engine("item_info"))
+                else return@post err(callback, unexpected(r))
+            is CoreReply.Error -> return@post err(callback, ErrorMapper.fromCore(r.error, Op.LOAD))
+            CoreReply.Invalid -> return@post err(callback, ErrorMapper.engine("invalid_reply"))
+        }
+        // As the chat shows it: our own earlier messages in a rejoin's history, a group message that had no recipients.
+        val item = localView(listOf(info.item)).single()
+        if (item.chatId != chatId || item.itemId != messageId || !item.shown) return@post err(callback, ErrorMapper.messageGone())
+        val rows = info.deliveries?.takeIf { item.group && item.outgoing && !item.earlierOwn && it.isNotEmpty() }
+        val deliveries = if (rows == null) emptyList() else {
+            val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
+            val names = (membersOrErr(g, callback) ?: return@post).filter { !it.isMe }.associate { it.groupMemberId to it.displayName }
+            rows.mapNotNull { (memberId, status) -> names[memberId]?.let { MemberDelivery(memberId, it, status) } }
+        }
+        SecuredLog.i(Ev.ITEM_ACTION, "info", info.versions.size)
+        ok(callback, MessageInfo(item.timeMs, info.createdAtMs.takeIf { it > 0 } ?: item.timeMs, item.status, deliveries, info.versions))
     }
 
     /** `/_members #g` parsed (us first), or null after reporting an error to [callback]. */
@@ -2473,6 +2641,10 @@ internal class SimplexSecuredEngine(
         foreignRefusal(toChatId)?.let { return refuseForeign(callback, it) }
         val from = refOf(chatId) ?: return err(callback, ErrorMapper.chatGone())
         val to = refOf(toChatId) ?: return err(callback, ErrorMapper.chatGone())
+        // A file that retention or "clear media" removed: the core would fail to copy it and refuse the whole forward.
+        if (ids.any { id -> mediaHost.currentItem(chatId, id)?.let { media.fileGone(it) } == true }) {
+            return refuse(callback, "forward_gone", ErrorMapper.MEDIA_GONE_FORWARD)
+        }
         when (val r = send(Commands.forward(to, from, ids))) {
             is CoreReply.Result -> {
                 if (r.type != "newChatItems") return err(callback, unexpected(r))
@@ -2999,7 +3171,7 @@ internal class SimplexSecuredEngine(
         }
         try {
             configureAndRun(user)
-            ok(callback, SecuredProfile(user.displayName))
+            ok(callback, SecuredProfile(user.displayName, user.avatar))
         } catch (f: StartFailure) {
             failClosed(f)
             err(callback, f.error)
@@ -3071,9 +3243,16 @@ internal class SimplexSecuredEngine(
         val prefix = File(dir, DB_PREFIX).absolutePath
         val chatDb = File(prefix + "_chat.db")
         val agentDb = File(prefix + "_agent.db")
+        val busyStreak = DbKeyStore.BusyStreak(File(dir, KEYSTORE_BUSY_FILE))
         val key = try {
-            DbKeyStore(appContext).obtain(databaseExists = chatDb.exists() || agentDb.exists())
-        } catch (f: DbKeyStore.KeyFailure) {
+            DbKeyStore(appContext).obtain(databaseExists = chatDb.exists() || agentDb.exists()).also { busyStreak.clear() }
+        } catch (failure: DbKeyStore.KeyFailure) {
+            // A Keystore that stays "busy" across a reboot never passes: the key is lost after all (review of 4bce1db8, #2).
+            val f = if (failure.reason == DbKeyStore.KEYSTORE_BUSY && busyStreak.record(DbKeyStore.bootId(appContext))) {
+                DbKeyStore.KeyFailure("key_unreadable")
+            } else {
+                failure
+            }
             SecuredLog.e(Ev.DB_KEY_FAILED, f.reason)
             // The databases are there but their key is gone or unreadable: only a reset helps (b3, KEY_LOST).
             val error = when (f.reason) {
@@ -3168,7 +3347,7 @@ internal class SimplexSecuredEngine(
      */
     private fun configureAndRun(user: CoreUser) {
         userId = user.userId
-        currentProfile = SecuredProfile(user.displayName)
+        currentProfile = SecuredProfile(user.displayName, user.avatar)
         // First run (or a first run that never finished): the stored servers may still be the core's random
         // presets until step 4 replaces them, so every SMP/XFTP connection goes to a SOCKS proxy that can't be
         // reached (127.0.0.1:9, a privileged port no app can listen on) until step 6.
@@ -3257,6 +3436,9 @@ internal class SimplexSecuredEngine(
         } catch (t: Throwable) {
             SecuredLog.crash(Ev.MEDIA_CATCHUP, t)
         }
+        // "Keep media for N days": a pass now, then once a day while running.
+        runRetention()
+        startRetentionChecks()
     }
 
     /** After a failed start: put the unreachable proxy back if it was lifted, then stop the chat. Never throws. */
@@ -3332,6 +3514,7 @@ internal class SimplexSecuredEngine(
         }
         stopReceiver()
         stopChatQuietly()
+        retentionGen++
         media.onStop()
         ctrlGate.close {
             try {
@@ -3839,7 +4022,8 @@ internal class SimplexSecuredEngine(
         var changed = false
         var unknownChat = false
         // Items a list load already counted (their events waited behind it) change nothing.
-        for (item in counted.fresh(items)) {
+        val fresh = counted.fresh(items)
+        for (item in fresh) {
             val row = chatCache[item.chatId]
             if (row == null) {
                 unknownChat = true
@@ -3857,10 +4041,32 @@ internal class SimplexSecuredEngine(
         }
         if (unknownChat) {
             refreshChats(notify = true)
-        } else if (changed) {
+            return
+        }
+        // Groups: the unread count from the core, never added to (CountedItems: their row item proves nothing).
+        for (chatId in counted.recountGroups(fresh)) {
+            val n = groupUnreadInCore(chatId) ?: continue
+            val row = chatCache[chatId] ?: continue
+            if (row.unreadCount != n) {
+                chatCache[chatId] = row.copy(unreadCount = n)
+                changed = true
+            }
+        }
+        if (changed) {
             publishChats()
             notifyChatsChanged()
         }
+    }
+
+    /**
+     * The core's unread count of a group row now ([Commands.groupUnread]), or null when it can't say (the row then keeps
+     * the `+1` it got). Our own earlier messages and a join's history were marked read in the core before this runs.
+     */
+    private fun groupUnreadInCore(chatId: Long): Int? {
+        val groupId = CoreJson.groupIdFromChatId(chatId) ?: return null
+        val r = send(Commands.groupUnread(groupId))
+        if (r !is CoreReply.Result || r.type != "apiChat") return null
+        return CoreJson.unreadCountOf(r.body)
     }
 
     /** Delivery ticks of a row's last message. */
@@ -3881,22 +4087,43 @@ internal class SimplexSecuredEngine(
         }
     }
 
-    /** An edited (or otherwise updated) message or service row: tell the UI; reload the list when it is a row's last message. */
+    /**
+     * An edited (or otherwise updated) message or service row: tell the UI. When it is a row's last message, that row is
+     * patched in place (A8 phase 1, [patchLastItem]); the list is reloaded only when the patch doesn't cover it.
+     */
     private fun applyItemUpdated(item: CoreItem) {
         if (!item.shown) return
         emitChanged(listOf(item))
         if (lastItemIds[item.chatId] == item.itemId) {
             previewCache.remove(item.chatId)
-            refreshChats(notify = true)
+            if (patchLastItem(item)) rowsPatched() else refreshChats(notify = true)
         }
+    }
+
+    /**
+     * A8 phase 1: the cached row whose last message [item] is (same id), changed in place without `/_get chats`
+     * ([MessageMapper.withLastItemChanged], as the chat shows it: [localView]). False when that isn't covered (a service
+     * row, the row would move, no row): the caller reloads. Engine thread; the caller publishes.
+     */
+    private fun patchLastItem(item: CoreItem): Boolean {
+        if (lastItemIds[item.chatId] != item.itemId) return false
+        val row = chatCache[item.chatId] ?: return false
+        val patched = MessageMapper.withLastItemChanged(row, localView(listOf(item)).single()) ?: return false
+        chatCache[item.chatId] = patched
+        return true
+    }
+
+    /** After [patchLastItem]: the list goes out as after a reload (onChatsChanged, due for the backup). */
+    private fun rowsPatched() {
+        publishChats()
+        notifyChatsChanged()
+        markChanged()
     }
 
     /** Fully deleted -> onMessagesRemoved; only marked deleted -> onMessageChanged (deleted=true, text ""). */
     private fun applyDeletions(deletions: List<CoreDeletion>) {
         if (deletions.isEmpty()) return
         markChanged()
-        // Only a row that is gone frees its id; one marked deleted keeps it.
-        for (d in deletions) if (d.replacement == null) counted.deleted(d.chatId, d.itemId)
         val removed = LinkedHashMap<Long, MutableList<Long>>()
         val marked = ArrayList<CoreItem>()
         for (d in deletions) {
@@ -3918,7 +4145,14 @@ internal class SimplexSecuredEngine(
         val lastGone = deletions.filter { lastItemIds[it.chatId] == it.itemId }
         if (lastGone.isNotEmpty()) {
             for (d in lastGone) previewCache.remove(d.chatId)
-            refreshChats(notify = true)
+            // A8 phase 1: a last message only marked deleted keeps its place, so its row is patched. One gone for good
+            // (the row's last message is now an earlier one) or replaced by a service row: the list is reloaded.
+            var reload = false
+            for (d in lastGone) {
+                val now = d.replacement
+                if (now == null || !now.shown || !patchLastItem(now)) reload = true
+            }
+            if (reload) refreshChats(notify = true) else rowsPatched()
         }
     }
 
@@ -3980,8 +4214,32 @@ internal class SimplexSecuredEngine(
         return reply
     }
 
-    /** [send] for a command that reaches a relay before it answers: a timeout or network error is retried ([NetRetry]). */
-    private fun sendNet(cmd: String): CoreReply = NetRetry.run({ online }) { n -> send(cmd, retryNum = n) }
+    /** [send] for a command that reaches a relay before it answers: a timeout or network error is retried once ([NetRetry]). */
+    private fun sendNet(cmd: String): CoreReply = NetRetry.run({ prepareRetry() }) { n -> send(cmd, retryNum = n) }
+
+    /**
+     * Before [NetRetry]'s one retry (review of 4bce1db8, #1). This task holds the engine thread, so a network change the
+     * watch reported meanwhile is still queued behind it, and [online] is what it was. So read the network now: with
+     * none usable there is no retry (the core waits for the network anyway). Else take it as the current one here (the
+     * queued report then changes nothing) and reconnect at once, so the retry goes out on a fresh connection instead of
+     * the one that just timed out. A reconnect a network switch queued is this one (its generation moves on).
+     */
+    private fun prepareRetry(): Boolean {
+        val now = if (watchingNetwork) network.now() else null
+        if (now == null) {
+            if (!online) return false
+        } else {
+            if (!now.usable) return false
+            if (now != netInfo) {
+                netInfo = now
+                sendNetworkInfo()
+                setOnline(true)
+            }
+        }
+        reconnectGen++
+        reconnectAll()
+        return true
+    }
 
     private fun expectResult(reply: CoreReply, step: String, vararg types: String): CoreReply.Result {
         if (reply is CoreReply.Result && reply.type in types) return reply
@@ -4099,10 +4357,17 @@ internal class SimplexSecuredEngine(
         const val LINK_JOINS_FILE = "link_joins"
         /** [ForeignRelays] marks, next to the databases. */
         const val FOREIGN_RELAYS_FILE = "foreign_relays"
+        /** [DbKeyStore.BusyStreak], next to the databases. */
+        const val KEYSTORE_BUSY_FILE = "keystore_busy"
         /** [DbKeyStore.KeyFailure] reasons that mean the existing databases can never be opened again on this phone. */
         val KEY_LOST_REASONS = setOf("key_unreadable", "key_missing")
         /** [applyNetwork]: reconnect once the default network has stayed the same this long. */
         const val RECONNECT_SETTLE_MS = 2_000L
+        /** How often a running engine checks whether a day of wall-clock time has passed since the last retention pass. */
+        const val RETENTION_CHECK_MS = 60L * 60L * 1000L
+        /** Saved Messages is read for its files in pages of this many rows, at most [SAVED_MAX_PAGES] of them. */
+        const val SAVED_PAGE = 200
+        const val SAVED_MAX_PAGES = 100
         /**
          * Tell the core "offline" when the phone has no network at all (held back 3 s), so it retries at the moment the
          * network is back (RetryInterval.hs:78-85, Client.hs:961-965). False: never tell it; its own back-off runs as

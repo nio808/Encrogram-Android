@@ -48,7 +48,7 @@ internal object MessageMapper {
             forwarded = i.forwarded,
             reactions = if (deleted || service) emptyList() else i.reactions,
             expiresAtMs = i.expiresAtMs,
-            sender = sender?.let { MessageSender(it.memberId, it.displayName, it.role) },
+            sender = sender?.let { MessageSender(it.memberId, it.displayName, it.role, it.avatar) },
             event = event,
             media = if (deleted || service) null else MediaMapper.map(i),
             history = i.history,
@@ -99,6 +99,7 @@ internal object MessageMapper {
             lastEvent = lastEventOf(chat.lastItem),
             lastMessageMedia = mediaOf(last),
             foreignRelay = foreignRelay,
+            avatar = c.avatar,
         )
     }
 
@@ -138,6 +139,7 @@ internal object MessageMapper {
             gone = g.gone,
             lastMessageMedia = if (g.invited) null else mediaOf(last),
             foreignRelay = foreignRelay,
+            avatar = g.avatar,
         )
     }
 
@@ -181,6 +183,26 @@ internal object MessageMapper {
         )
     }
 
+    /**
+     * A8 phase 1: the row after its last message changed in place (edited, or only marked deleted), with no list reload:
+     * the preview fields worked out from [item] as [summaryOf], [groupSummary] and [notesSummary] do, everything else
+     * (unread count, pin, mute, name, photo...) kept. Null when this isn't covered and the list must be reloaded: [item]
+     * is a service row (a moderated message becomes "deleted by admin", whose time the row can't work out alone), or the
+     * row's time, and so its place in the list, would change.
+     */
+    fun withLastItemChanged(row: ChatSummary, item: CoreItem): ChatSummary? {
+        if (!item.isMessage || item.chatId != row.chatId) return null
+        if (item.timeMs <= 0 || item.timeMs != row.lastMessageTimeMs) return null
+        return row.copy(
+            lastMessageText = if (row.invited) null else previewText(item),
+            lastMessageOutgoing = item.outgoing,
+            lastMessageStatus = item.takeIf { it.outgoing }?.status,
+            lastMessageSender = item.takeIf { it.group && !it.outgoing && !it.deleted }?.sender?.displayName,
+            lastEvent = null,
+            lastMessageMedia = if (row.invited) null else mediaOf(item),
+        )
+    }
+
     /** The contract's order: pinned first, then newest activity first (ties by id, so the order is stable). */
     fun sortChats(rows: Collection<ChatSummary>): List<ChatSummary> = rows.sortedWith(
         compareByDescending<ChatSummary> { it.pinned }
@@ -192,8 +214,15 @@ internal object MessageMapper {
 /**
  * Per chat, the newest item id the cached row already counts (A4). A list load takes the core's unread count, which
  * includes items whose `newChatItems` events still wait in the engine queue; [fresh] keeps those from counting twice.
- * Item ids only grow (SQLite rowids), except that a deleted top row's id can be given out again: [deleted].
- * Engine thread only.
+ * Item ids only grow and are never given out again (chat_items.chat_item_id is INTEGER PRIMARY KEY AUTOINCREMENT,
+ * Store/SQLite/Migrations/chat_schema.sql:465).
+ *
+ * That proof holds for contacts and notes, whose row item is their newest by creation (`ORDER BY ci.created_at DESC`,
+ * Store/Messages.hs:808, :1024). A group's row item is its newest by item_ts (:910), the sender's or relay's time, so a
+ * stored item with a higher id and an older time may already be in the count while its id is above the mark (review
+ * of 4bce1db8, #4). So a group's unread count is never added to: [recountGroups] names the groups whose fresh items
+ * include an unread one, and the engine takes their count from the core again ([CoreJson.unreadCountOf]). Setting it
+ * can't count anything twice, however the events and loads interleave. Engine thread only.
  */
 internal class CountedItems {
     private val upTo = HashMap<Long, Long>()
@@ -215,9 +244,6 @@ internal class CountedItems {
         return out
     }
 
-    /** An item at or below the mark was deleted: its id may come back for a new item, which must count. */
-    fun deleted(chatId: Long, itemId: Long) {
-        val mark = upTo[chatId] ?: return
-        if (itemId <= mark) upTo[chatId] = itemId - 1
-    }
+    /** Group chats among [fresh] items with an unread one: their count comes from the core, never `+1` (see the class). */
+    fun recountGroups(fresh: List<CoreItem>): Set<Long> = fresh.filter { it.group && it.unread }.mapTo(LinkedHashSet()) { it.chatId }
 }

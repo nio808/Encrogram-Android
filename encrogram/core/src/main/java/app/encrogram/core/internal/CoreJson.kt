@@ -2,9 +2,11 @@ package app.encrogram.core.internal
 
 import app.encrogram.core.api.GROUP_CHAT_ID_BASE
 import app.encrogram.core.api.GroupEvent
+import app.encrogram.core.api.MediaPreview
 import app.encrogram.core.api.MemberRole
 import app.encrogram.core.api.MemberStatus
 import app.encrogram.core.api.MessageStatus
+import app.encrogram.core.api.MessageVersion
 import app.encrogram.core.api.ReactionCount
 import app.encrogram.core.api.SAVED_MESSAGES_CHAT_ID
 import app.encrogram.core.api.SECURED_REACTIONS
@@ -41,14 +43,16 @@ internal sealed class CoreReply {
 
 /**
  * A ChatError reduced to its type tags, e.g. type="errorAgent", detail="SMP", subDetail="AUTH".
- * Only tags are kept: never the engine's free-text fields.
+ * Only tags are kept: never the engine's free-text fields. [networkError]: for a BROKER NETWORK error, the NetworkError's
+ * tag (connectError, tLSError, unknownCAError, failedError, timeoutError, subscribeError: simplexmq Protocol.hs:1691-1697).
  */
-internal data class CoreError(val type: String, val detail: String?, val subDetail: String?) {
+internal data class CoreError(val type: String, val detail: String?, val subDetail: String?, val networkError: String? = null) {
     /** "errorAgent.SMP.AUTH", safe for logs and error messages. */
     val tag: String get() = listOfNotNull(type, detail, subDetail).joinToString(".")
 }
 
-internal data class CoreUser(val userId: Long, val displayName: String)
+/** [avatar]: our own photo (profile.image, [Avatars]). */
+internal data class CoreUser(val userId: Long, val displayName: String, val avatar: MediaPreview? = null)
 
 internal data class CoreContact(
     val contactId: Long,
@@ -67,6 +71,8 @@ internal data class CoreContact(
     val timedEnabled: Boolean = false,
     /** Our own disappearing-message timer for this contact, when [timedEnabled]; else null. */
     val timedTtlSeconds: Int? = null,
+    /** profile.image ([Avatars]): untrusted, never logged. */
+    val avatar: MediaPreview? = null,
 )
 
 internal data class CoreItem(
@@ -167,7 +173,14 @@ internal data class CoreItem(
  * [groupWideId]: the member's group-wide memberId (GroupMember.memberId, Types.hs:1118), the same in every member's
  * copy of the group; for a history item it is the author's id as the sender of the history forwarded it.
  */
-internal data class CoreSender(val memberId: Long, val displayName: String, val role: MemberRole, val groupWideId: String? = null)
+internal data class CoreSender(
+    val memberId: Long,
+    val displayName: String,
+    val role: MemberRole,
+    val groupWideId: String? = null,
+    /** memberProfile.image ([Avatars]): untrusted, never logged. */
+    val avatar: MediaPreview? = null,
+)
 
 /**
  * A group as the chat list needs it (GroupInfo, Types.hs:477-503). [myStatus] is membership.memberStatus as the core
@@ -201,6 +214,8 @@ internal data class CoreGroup(
     val joinedAtMs: Long = 0,
     /** membership.invitedBy `{"type":"contact","byContactId":N}` (Types.hs:1268): the contact whose invitation this is, else null. */
     val invitedByContactId: Long? = null,
+    /** groupProfile.image ([Avatars]): untrusted, never logged. */
+    val avatar: MediaPreview? = null,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
@@ -234,6 +249,8 @@ internal data class CoreMember(
     val active: Boolean = false,
     /** memberStatus pending_approval or pending_review (knocking): the core refuses role changes for them (Commands.hs:2886). */
     val pending: Boolean = false,
+    /** memberProfile.image ([Avatars]): untrusted, never logged. */
+    val avatar: MediaPreview? = null,
 )
 
 /**
@@ -270,6 +287,22 @@ internal data class CoreChat(val contact: CoreContact, val lastItem: CoreItem?, 
 
 internal data class CreatedLink(val fullLink: String?, val shortLink: String?, val pendingConnId: Long?)
 
+/**
+ * What `/_get item info` says about one item ([Commands.itemInfo]; CRChatItemInfo {chatItem, chatItemInfo}, Controller.hs:778;
+ * ChatItemInfo {itemVersions, memberDeliveryStatuses?, forwardedFromChatItem?, fileXftpServers}, Messages.hs:1345-1350).
+ */
+internal class CoreItemInfo(
+    val item: CoreItem,
+    /** meta.createdAt: when the item was made on this phone (received here, or sent from here); 0 if absent. */
+    val createdAtMs: Long,
+    /** memberDeliveryStatuses (our own group items only): groupMemberId -> status, in the core's order; null when absent. */
+    val deliveries: List<Pair<Long, MessageStatus>>?,
+    /** Earlier texts after edits, newest first, the current one left out. User content: never logged. */
+    val versions: List<MessageVersion>,
+) {
+    override fun toString() = "CoreItemInfo($item, ${versions.size} versions)"
+}
+
 internal object CoreJson {
 
     fun parseReply(raw: String?): CoreReply {
@@ -303,7 +336,7 @@ internal object CoreJson {
             }
             "errorAgent" -> {
                 val agentError = e.optJSONObject("agentError")
-                CoreError(type, tagOf(agentError), agentSubTag(agentError))
+                CoreError(type, tagOf(agentError), agentSubTag(agentError), brokerNetworkTag(agentError))
             }
             "errorStore" -> CoreError(type, tagOf(e.opt("storeError")), null)
             "errorDatabase" -> CoreError(type, tagOf(e.opt("databaseError")), null)
@@ -328,6 +361,13 @@ internal object CoreJson {
     private val AGENT_SUB_KEYS = listOf(
         "smpErr", "brokerErr", "proxyErr", "connErr", "cmdErr", "agentErr", "xftpErr", "ntfErr", "fileErr", "rcpErr",
     )
+
+    /** BROKER {brokerErr: {type: NETWORK, networkError: {type}}} -> that type tag, else null. */
+    private fun brokerNetworkTag(agentError: JSONObject?): String? {
+        if (tagOf(agentError) != "BROKER") return null
+        val brokerErr = agentError?.optJSONObject("brokerErr")?.takeIf { tagOf(it) == "NETWORK" } ?: return null
+        return tagOf(brokerErr.opt("networkError"))
+    }
 
     private fun agentSubTag(agentError: JSONObject?): String? {
         if (agentError == null) return null
@@ -357,9 +397,10 @@ internal object CoreJson {
 
     fun parseUser(user: JSONObject?): CoreUser? {
         if (user == null || !user.has("userId")) return null
-        val name = user.optJSONObject("profile")?.str("displayName")?.ifEmpty { null }
+        val profile = user.optJSONObject("profile")
+        val name = profile?.str("displayName")?.ifEmpty { null }
             ?: user.str("localDisplayName").orEmpty()
-        return CoreUser(user.optLong("userId"), name)
+        return CoreUser(user.optLong("userId"), name, Avatars.of(profile?.str("image")))
     }
 
     fun parseContact(c: JSONObject?): CoreContact? {
@@ -404,6 +445,7 @@ internal object CoreJson {
             muted = ntfs != null && ntfs != "all",
             timedEnabled = timedEnabled,
             timedTtlSeconds = ttl,
+            avatar = Avatars.of(profile?.str("image")),
         )
     }
 
@@ -448,12 +490,17 @@ internal object CoreJson {
     /** LocalProfile fields that are not part of Profile (Types.hs): never sent back in `/_profile`. */
     private val LOCAL_ONLY_PROFILE_KEYS = listOf("profileId", "localAlias", "localBadge", "contactDomainVerified")
 
+    /** A new photo for a profile: a data URL ([Avatars.dataUrl]), or null to remove it. */
+    class ImageChange(val dataUrl: String?) {
+        override fun toString() = "ImageChange(${if (dataUrl == null) "remove" else "set"})"
+    }
+
     /**
      * The Profile to send with `/_profile`, from the user's current LocalProfile (`/u` -> user.profile), with
-     * [displayName] (when given) and [SECURED_PROFILE_PREFS] applied. The core replaces the whole profile
+     * [displayName] and [image] (when given) and [SECURED_PROFILE_PREFS] applied. The core replaces the whole profile
      * (gotcha G4), so every other field is kept as it is. Null when nothing would change.
      */
-    fun profileUpdate(localProfile: JSONObject, displayName: String? = null): JSONObject? {
+    fun profileUpdate(localProfile: JSONObject, displayName: String? = null, image: ImageChange? = null): JSONObject? {
         val p = localProfile.deepCopy()
         for (k in LOCAL_ONLY_PROFILE_KEYS) p.remove(k)
         var changed = false
@@ -461,6 +508,7 @@ internal object CoreJson {
             p.put("displayName", displayName)
             changed = true
         }
+        if (image != null && setImage(p, image.dataUrl)) changed = true
         if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
         val prefs = p.optJSONObject("preferences") ?: JSONObject()
         for ((feature, allow) in SECURED_PROFILE_PREFS) {
@@ -472,6 +520,33 @@ internal object CoreJson {
         }
         p.put("preferences", prefs)
         return if (changed) p else null
+    }
+
+    /**
+     * The GroupProfile to send with `/_group_profile` (APIUpdateGroupProfile, Commands.hs:5625, :3219-3221): the group's
+     * current one ([groupProfile], GroupInfo.groupProfile as stored now) with only its image set to [image] (null
+     * removes it). The core replaces the whole profile (runUpdateGroupProfile, :4019-4057; omitted Maybe fields become
+     * Nothing), so every other field (groupPreferences with history, fullDelete, reactions and our channel marker,
+     * memberAdmission, description...) is copied as it is. Null when the image is already that.
+     */
+    fun groupProfileUpdate(groupProfile: JSONObject, image: String?): JSONObject? {
+        val p = groupProfile.deepCopy()
+        if (!setImage(p, image)) return null
+        if (!p.has("fullName") || p.isNull("fullName")) p.put("fullName", "")
+        return p
+    }
+
+    /** Sets (or removes, null) a profile's `image`; true when that changed it. */
+    private fun setImage(profile: JSONObject, dataUrl: String?): Boolean {
+        val current = profile.str("image")
+        if (dataUrl == null) {
+            val had = profile.has("image")
+            profile.remove("image")
+            return had && current != null
+        }
+        if (current == dataUrl) return false
+        profile.put("image", dataUrl)
+        return true
     }
 
     /** The contact of a direct ChatInfo, or null for groups, notes, requests and pending connections. */
@@ -545,6 +620,43 @@ internal object CoreJson {
         val info = body.optJSONObject("chatItemInfo") ?: return null
         val key = "memberDeliveryStatuses"
         return item to (info.isNull(key) || info.optJSONArray(key)?.length() == 0)
+    }
+
+    /**
+     * A `chatItemInfo` reply as [SecuredEngine.messageInfo] needs it; null when the reply holds no item or info. Versions
+     * (ChatItemVersion {chatItemVersionId, msgContent, itemVersionTs, ...}, Messages.hs:1353-1360) come newest first
+     * (Store/Messages.hs:3338-3349, ORDER BY chat_item_version_id DESC), and the newest is the current text: an edit
+     * stores the new version too (addInitialAndNewCIVersions, :2589-2594), and an item never edited gets one made from
+     * its current content (mkItemVersion, Commands.hs:690). So the first is dropped, as the official app shows it as
+     * "current" (ChatItemInfoView.kt). A deleted item or a service row has none: its old text never leaves the engine.
+     */
+    fun parseMessageInfo(body: JSONObject): CoreItemInfo? {
+        val aci = body.optJSONObject("chatItem") ?: return null
+        val item = parseAChatItem(aci) ?: return null
+        val info = body.optJSONObject("chatItemInfo") ?: return null
+        val created = timeMs(aci.optJSONObject("chatItem")?.optJSONObject("meta")?.str("createdAt"))
+        val deliveries = info.optJSONArray("memberDeliveryStatuses")?.let { arr ->
+            val out = ArrayList<Pair<Long, MessageStatus>>(arr.length())
+            arr.forEachObject { d ->
+                val memberId = d.optLong("groupMemberId", 0L).takeIf { it > 0 } ?: return@forEachObject
+                out.add(memberId to StatusMapper.memberDelivery(tagOf(d.opt("memberDeliveryStatus"))))
+            }
+            out
+        }
+        val versions = if (item.deleted || !item.isMessage) emptyList() else earlierVersions(info)
+        return CoreItemInfo(item, created, deliveries, versions)
+    }
+
+    /** At most this many earlier versions are returned (a peer can edit a message many times). */
+    const val MAX_VERSIONS = 100
+
+    private fun earlierVersions(info: JSONObject): List<MessageVersion> {
+        val all = ArrayList<Triple<Long, String, Long>>()
+        info.optJSONArray("itemVersions").forEachObject { v ->
+            val text = v.optJSONObject("msgContent")?.str("text").orEmpty()
+            all.add(Triple(v.optLong("chatItemVersionId", 0L), text, timeMs(v.str("itemVersionTs"))))
+        }
+        return all.sortedByDescending { it.first }.drop(1).take(MAX_VERSIONS).map { MessageVersion(it.second, it.third) }
     }
 
     /** membership.createdAt of a GroupInfo (when our membership began on this phone), 0 when absent. */
@@ -876,6 +988,7 @@ internal object CoreJson {
             joinedAtMs = timeMs(membership?.str("createdAt")),
             invitedByContactId = membership?.optJSONObject("invitedBy")?.takeIf { tagOf(it) == "contact" }
                 ?.optLong("byContactId", 0L)?.takeIf { it > 0 },
+            avatar = Avatars.of(profile?.str("image")),
         )
     }
 
@@ -895,8 +1008,11 @@ internal object CoreJson {
     /** chatDir groupRcv's GroupMember -> the sender we show (with its group-wide memberId). */
     fun parseSender(m: JSONObject?): CoreSender? {
         if (m == null || !present(m, "groupMemberId")) return null
-        return CoreSender(m.optLong("groupMemberId"), memberName(m), memberRole(m.str("memberRole")), m.str("memberId")?.ifEmpty { null })
+        return CoreSender(m.optLong("groupMemberId"), memberName(m), memberRole(m.str("memberRole")), m.str("memberId")?.ifEmpty { null }, memberAvatar(m))
     }
+
+    /** A member's photo: memberProfile.image (LocalProfile, Types.hs:779-792), [Avatars] rules. */
+    private fun memberAvatar(m: JSONObject): MediaPreview? = Avatars.of(m.optJSONObject("memberProfile")?.str("image"))
 
     /** A member's name as we show it: our local alias, else their profile name, else the core's local name. */
     private fun memberName(m: JSONObject): String {
@@ -922,6 +1038,7 @@ internal object CoreJson {
             memberContactId = contactId,
             active = statusWord == "connected" || statusWord == "complete",
             pending = statusWord == "pending_approval" || statusWord == "pending_review",
+            avatar = memberAvatar(m),
         )
     }
 
@@ -1185,6 +1302,42 @@ internal object CoreJson {
 
     /** The groupId of a [linkJoinKey]. */
     fun linkJoinGroupId(key: Long): Long = key ushr 32
+
+    /**
+     * An `apiChat` body's chatStats.unreadCount (ChatStats, Messages.hs), or null when absent. Only the `initial=`
+     * pagination fills it for a group (getGroupChatInitial_, Store/Messages.hs:1694-1708); the others send zeros.
+     */
+    fun unreadCountOf(body: JSONObject): Int? {
+        val stats = body.optJSONObject("chat")?.optJSONObject("chatStats") ?: return null
+        if (!present(stats, "unreadCount")) return null
+        return stats.optInt("unreadCount", -1).takeIf { it >= 0 }
+    }
+
+    /**
+     * One `apiChat` page read raw for its files: how many rows came, the oldest row's id (the next page's cursor), and
+     * every row's `file.fileSource.filePath` whatever its content or state, plus its last path segment. Used to keep
+     * Saved Messages' files out of retention, so it errs towards more names, never fewer. Null without a chatItems array.
+     */
+    class FilePage(val rows: Int, val oldestId: Long?, val paths: Set<String>) {
+        override fun toString() = "FilePage($rows rows, ${paths.size} paths)"
+    }
+
+    fun filePage(body: JSONObject): FilePage? {
+        val items = body.optJSONObject("chat")?.optJSONArray("chatItems") ?: return null
+        var oldest: Long? = null
+        val paths = HashSet<String>()
+        for (j in 0 until items.length()) {
+            val item = items.optJSONObject(j) ?: continue
+            val id = item.optJSONObject("meta")?.optLong("itemId", 0L) ?: 0L
+            if (id > 0 && (oldest == null || id < oldest)) oldest = id
+            val path = item.optJSONObject("file")?.optJSONObject("fileSource")?.str("filePath")
+            if (!path.isNullOrEmpty()) {
+                paths += path
+                paths += path.substringAfterLast('/')
+            }
+        }
+        return FilePage(items.length(), oldest, paths)
+    }
 
     /** `contactCode` body {contact, connectionCode}: the code to compare in person (digits in groups of five). */
     fun contactCode(body: JSONObject): String? = body.str("connectionCode")?.ifEmpty { null }

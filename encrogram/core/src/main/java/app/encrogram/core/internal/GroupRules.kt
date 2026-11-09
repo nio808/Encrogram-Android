@@ -57,6 +57,14 @@ internal object GroupRules {
         ?: if (g.myRole < MemberRole.ADMIN) ErrorMapper.ONLY_ADMINS_LINK else null
 
     /**
+     * The group's photo (APIUpdateGroupProfile, runUpdateGroupProfile :4020 `assertUserGroupRole gInfo GROwner`): the
+     * owner, a current connected member. Members also drop a profile change from anyone below owner (Subscriber.hs:3733),
+     * so an admin's change would reach nobody.
+     */
+    fun photoRefusal(g: CoreGroup): String? = statusRefusal(CoreJson.memberStatus(g.myStatus))
+        ?: if (g.myRole < MemberRole.OWNER) ErrorMapper.ONLY_OWNERS_PHOTO else null
+
+    /**
      * Rejoins. SimpleX groups have no shared id, so joining again after leaving or being removed makes a new group row
      * (the link plan ignores groups we left or were removed from, Store/Groups.hs:2888-2903, so the join goes ahead).
      * Telegram shows one chat; so an old row whose membership ended (left, removed or rejected, not deleted: a deleted

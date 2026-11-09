@@ -30,6 +30,9 @@ internal data class LedgerEntry(
  */
 internal class MediaLedger(private val file: File) {
 
+    /** The engine's no-backup folder the ledger lives in; the retention setting and upload pins sit next to it. */
+    val folder: File get() = file.absoluteFile.parentFile ?: file.absoluteFile
+
     private var map: LinkedHashMap<Long, LedgerEntry>? = null
 
     private fun loaded(): LinkedHashMap<Long, LedgerEntry> {

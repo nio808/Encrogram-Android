@@ -161,6 +161,13 @@ internal object Commands {
         return "$cmd search=$search"
     }
 
+    /**
+     * APIGetChat with `initial=1` (CPInitial, Commands.hs:5802) for a group: its chatStats carry the core's unread count
+     * now (getGroupChatInitial_, Store/Messages.hs:1694-1708), with at most one item each side of the first unread one.
+     * Reads only; marks nothing read. Parse with [CoreJson.unreadCountOf].
+     */
+    fun groupUnread(groupId: Long): String = "/_get chat ${ChatRef.group(groupId)} initial=1"
+
     /** APIAddContact: one-time invitation -> `invitation` {connLinkInvitation {connFullLink, connShortLink}}. */
     fun addContact(userId: Long): String = "/_connect $userId"
 
@@ -320,12 +327,19 @@ internal object Commands {
 
     /**
      * APIGetChatItemInfo (`/_get item info <chatRef> <itemId>`, Commands.hs:5452; handler :687-696) -> `chatItemInfo`
-     * {chatItem, chatItemInfo}. Reads this phone's store only. Used for our own group items ([NoRecipientCheck]).
+     * {chatItem, chatItemInfo}. Reads this phone's store only; any chat (getAChatItem: direct, group, local, Store/
+     * Messages.hs:3319-3333). Used for our own group items ([NoRecipientCheck]) and for message details ([CoreJson.parseMessageInfo]).
      */
-    fun itemInfo(chat: ChatRef, itemId: Long): String {
-        require(chat.isGroup) { "group items only" }
-        return "/_get item info $chat $itemId"
-    }
+    fun itemInfo(chat: ChatRef, itemId: Long): String = "/_get item info $chat $itemId"
+
+    /**
+     * APIUpdateGroupProfile (`/_group_profile #<groupId> <GroupProfile json>`, Commands.hs:5625; handler :3219-3221,
+     * runUpdateGroupProfile :4018-4057) -> `groupUpdated {fromGroup, toGroup, member_?}` (Controller.hs:883). Owner only
+     * (`assertUserGroupRole gInfo GROwner`, :4020; members drop x.grp.info from anyone else, Subscriber.hs:3733). The
+     * core replaces the whole profile: build [profile] with [CoreJson.groupProfileUpdate].
+     */
+    fun updateGroupProfile(groupId: Long, profile: JSONObject): String =
+        "/_group_profile ${ChatRef.group(groupId)} " + asciiJson(profile.toString())
 
     /** APIDeleteChat for a contact, without notifying anyone. Used only for preset contact cards. */
     fun deleteContactQuietly(contactId: Long): String = "/_delete @$contactId full notify=off"

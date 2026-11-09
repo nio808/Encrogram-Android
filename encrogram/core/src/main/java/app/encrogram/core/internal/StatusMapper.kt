@@ -33,6 +33,20 @@ internal object StatusMapper {
 
     private fun deliveredToAll(sndProgress: String?, group: Boolean): Boolean =
         if (group) sndProgress == "complete" else sndProgress != "partial"
+
+    /**
+     * One member's delivery of our own group message: a GroupSndStatus tag (Messages.hs:1118-1126, JSON tags without
+     * "GSS", :1433). `rcvd` is that member's delivery receipt (with either msgRcptStatus: they got it), never "read".
+     * `sent`: on their relay queue; `forwarded`: passed to a member who relays it to them, so it left this phone too.
+     * `new` (not sent yet), `inactive` (they aren't connected yet: it goes when they are) and `warning` (a temporary
+     * problem, retried) stay at the clock; `error` and `invalid` failed. Anything newer than this reader: the clock.
+     */
+    fun memberDelivery(tag: String?): MessageStatus = when (tag) {
+        "rcvd" -> MessageStatus.DELIVERED
+        "sent", "forwarded" -> MessageStatus.SENT_TO_SERVER
+        "error", "invalid" -> MessageStatus.FAILED
+        else -> MessageStatus.SENDING
+    }
 }
 
 /**

@@ -1,16 +1,20 @@
 package app.encrogram.core.internal.media
 
 import app.encrogram.core.api.MediaFailure
+import app.encrogram.core.api.MediaStorage
 import app.encrogram.core.internal.SecuredLog
 import java.io.File
 import java.io.IOException
 import java.nio.Buffer
 import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.SecureRandom
 import java.util.Arrays
 
@@ -27,13 +31,15 @@ import java.util.Arrays
  * Nothing is written outside these two roots. Paths, names and keys are never logged (fixed tags and counts only),
  * and no exception thrown from here carries a path.
  *
- * Threads: [wipeTransient], [commit], [uncommit], [resolve] and [present] on the engine thread; [sealBytes] and
- * [sealFile] on the prep thread; [readBytes] and [decryptToView] on the read thread; the rest anywhere.
+ * Threads: [wipeTransient], [commit], [uncommit], [resolve], [present] and [expire] on the engine thread; [sealBytes]
+ * and [sealFile] on the prep thread; [readBytes] and [decryptToView] on the read thread; the rest anywhere.
  */
 internal class MediaVault(
     filesDir: File,
     mediaDir: File,
     private val native: NativeFiles,
+    /** Wall clock: a committed file is dated when it enters the files folder (retention counts from there). */
+    private val clock: () -> Long = System::currentTimeMillis,
     /** Makes a hard link [link] → [existing]. Tests replace it to force the copy fallback. */
     private val hardLink: (link: Path, existing: Path) -> Unit = { link, existing -> Files.createLink(link, existing) },
 ) {
@@ -174,7 +180,14 @@ internal class MediaVault(
             if (!bareName(candidate)) throw VaultIoException("commit")
             try {
                 // No REPLACE_EXISTING: fails rather than overwrite a file the core wrote in the meantime.
-                Files.move(src, File(dir, candidate).toPath())
+                val target = File(dir, candidate)
+                Files.move(src, target.toPath())
+                // A move keeps the sealing time; an attachment that waited in the composer counts from its send.
+                try {
+                    target.setLastModified(clock())
+                } catch (e: SecurityException) {
+                    SecuredLog.w(SecuredLog.Ev.MEDIA_IO_FAILED, "touch")
+                }
                 return candidate
             } catch (e: FileAlreadyExistsException) {
                 // Taken between the check and the move: try the next suffix.
@@ -221,16 +234,92 @@ internal class MediaVault(
      * the core's tail tag. (The core creates an empty placeholder when a download is accepted, so a file merely
      * existing says nothing; readability still comes from the core's file status.)
      */
-    fun present(path: String?): Boolean = resolve(path)?.let { it.isFile && it.length() >= AUTH_TAG_BYTES } == true
+    fun present(path: String?): Boolean = complete(resolve(path))
+
+    private fun complete(f: File?): Boolean = f != null && f.isFile && f.length() >= AUTH_TAG_BYTES
+
+    // ---- retention (engine thread; [storedFiles] and [storage] anywhere) -----------------------------------------
+
+    /**
+     * Every regular file directly in the files folder (no links, no folders), with its size and last write. Entries
+     * that can't be read are skipped (counted in the log). Nothing is opened or changed.
+     */
+    fun storedFiles(): List<StoredFile> {
+        val dir = files.toPath()
+        if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) return emptyList()
+        val out = ArrayList<StoredFile>()
+        var failed = 0
+        try {
+            Files.newDirectoryStream(dir).use { entries ->
+                for (p in entries) {
+                    try {
+                        val a = Files.readAttributes(p, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                        val name = p.fileName?.toString() ?: continue
+                        if (a.isRegularFile && bareName(name)) out += StoredFile(name, a.size(), a.lastModifiedTime().toMillis())
+                    } catch (e: IOException) {
+                        failed++
+                    } catch (e: SecurityException) {
+                        failed++
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            failed++
+        } catch (e: SecurityException) {
+            failed++
+        }
+        if (failed > 0) SecuredLog.w(SecuredLog.Ev.MEDIA_IO_FAILED, "list", failed)
+        return out
+    }
+
+    /** The encrypted media on this phone: bytes and count of the non-empty files (an emptied file is gone media). */
+    fun storage(): MediaStorage {
+        var bytes = 0L
+        var count = 0
+        for (f in storedFiles()) {
+            if (f.bytes <= 0) continue
+            bytes += f.bytes
+            count++
+        }
+        return MediaStorage(bytes, count)
+    }
+
+    /**
+     * Removes the media in [f] from this phone: the file is emptied in place (truncated to 0 bytes; it is ciphertext,
+     * so nothing needs scrubbing) and keeps its name, so the core never hands that name to a newer file that deleting
+     * the old message would then delete (the core frees names by existence, Files.hs uniqueCombine). An empty file is
+     * not [present], so its message shows NOT_ON_DEVICE and every read refuses it.
+     *
+     * Only when it is still the very file that was listed: a regular file, not a link, same size and same last write.
+     * False when it changed, vanished or couldn't be emptied.
+     */
+    fun expire(f: StoredFile): Boolean {
+        if (f.bytes <= 0) return false
+        val file = resolve(f.name) ?: return false
+        val p = file.toPath()
+        return try {
+            val a = Files.readAttributes(p, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            if (!a.isRegularFile || a.size() != f.bytes || a.lastModifiedTime().toMillis() != f.modifiedMs) return false
+            FileChannel.open(p, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { it.truncate(0) }
+            true
+        } catch (e: IOException) {
+            false
+        } catch (e: SecurityException) {
+            false
+        } catch (e: UnsupportedOperationException) {
+            false
+        }
+    }
 
     // ---- reading (read thread) ---------------------------------------------------------------------------------
 
     /**
-     * The whole plaintext of [path] in memory. Refused before reading when it's not here ([MediaFailure.NOT_ON_DEVICE])
-     * or its plaintext is over [cap] bytes ([MediaFailure.TOO_LARGE]). Native failures throw [NativeFileException].
+     * The whole plaintext of [path] in memory. Refused before reading when it's not here or was removed
+     * ([MediaFailure.NOT_ON_DEVICE]) or its plaintext is over [cap] bytes ([MediaFailure.TOO_LARGE]). Native failures
+     * throw [NativeFileException].
      */
     fun readBytes(path: String?, key: FileKey, cap: Long): ByteArray {
-        val f = resolve(path)?.takeIf { it.isFile } ?: throw VaultException(MediaFailure.NOT_ON_DEVICE)
+        val f = resolve(path)?.takeIf { complete(it) } ?: throw VaultException(MediaFailure.NOT_ON_DEVICE)
         if (f.length() - AUTH_TAG_BYTES > cap) throw VaultException(MediaFailure.TOO_LARGE)
         val bytes = withNativePath(f) { native.readDecrypted(it, key) }
         if (bytes.size > cap) {
@@ -246,7 +335,7 @@ internal class MediaVault(
      * failed chatDecryptFile leaves unauthenticated plaintext behind.
      */
     fun decryptToView(path: String?, key: FileKey): File {
-        val f = resolve(path)?.takeIf { it.isFile } ?: throw VaultException(MediaFailure.NOT_ON_DEVICE)
+        val f = resolve(path)?.takeIf { complete(it) } ?: throw VaultException(MediaFailure.NOT_ON_DEVICE)
         val out = newFile(ensureDir(viewDir))
         var ok = false
         try {

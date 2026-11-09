@@ -173,6 +173,15 @@ internal class NetworkWatch(
         }
     }
 
+    /**
+     * Any thread: the default network as Android sees it right now, not debounced; null while the watch isn't
+     * registered. For a caller that can't wait for the next report on [handler]'s thread (NetRetry's one retry).
+     */
+    fun now(): NetInfo? {
+        val cm = synchronized(this) { manager } ?: return null
+        return currentInfo(cm)
+    }
+
     /** Starts over on [handler]'s thread with [info] as the state now. */
     private fun restart(info: NetInfo) {
         handler.post {

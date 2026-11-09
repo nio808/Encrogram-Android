@@ -1,10 +1,14 @@
 package app.encrogram.core.internal
 
 import android.content.Context
+import android.os.Build
+import android.provider.Settings
+import android.os.SystemClock
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
+import java.io.File
 import java.security.SecureRandom
 import java.util.Base64
 import javax.crypto.AEADBadTagException
@@ -149,11 +153,59 @@ internal class DbKeyStore(private val context: Context) {
         return generator.generateKey()
     }
 
-    /** The Keystore has no key under our alias (getKey returned null). */
+    /**
+     * The Keystore has no key under our alias (getKey returned null). On Android 8-11 that is also what a failed binder
+     * call to a restarting Keystore daemon looks like, so it is retried like other passing errors ([readWithRetry]).
+     */
     internal class KeyGone : Exception()
 
     /** The stored passphrase or IV isn't valid base64 any more. */
     internal class StoredValueBroken : Exception()
+
+    /**
+     * Starts in a row that ended [KEYSTORE_BUSY] (review of 4bce1db8, #2): a failure that never passes would otherwise
+     * read "try again" forever, while only a reset (KEY_LOST) helps. From the [LOST_AFTER]th such start, when they span
+     * a reboot (the first was in another boot than this one: a reboot restarts the Keystore daemon, so a passing
+     * failure would have passed), [record] says the key is lost. Any start that reads the key clears it ([clear]).
+     * Kept in [file], next to the databases (no backup); a write that fails only means counting starts again.
+     */
+    internal class BusyStreak(private val file: File) {
+
+        /** One more busy start in boot [bootId]; true when the streak now means the key is lost. */
+        fun record(bootId: String): Boolean {
+            val (count, firstBoot) = read() ?: (0 to bootId)
+            val now = count + 1
+            write(now, firstBoot)
+            return now >= LOST_AFTER && firstBoot != bootId
+        }
+
+        fun clear() {
+            if (file.exists() && !file.delete()) SecuredLog.w(SecuredLog.Ev.DB_KEY_FAILED, "streak_clear")
+        }
+
+        private fun read(): Pair<Int, String>? = try {
+            val lines = if (file.exists()) file.readText().lines() else emptyList()
+            val count = lines.getOrNull(0)?.trim()?.toIntOrNull()
+            val boot = lines.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+            if (count != null && count > 0 && boot != null) count to boot else null
+        } catch (e: Exception) {
+            null
+        }
+
+        private fun write(count: Int, firstBoot: String) {
+            try {
+                val tmp = File(file.path + ".tmp")
+                tmp.writeText("$count\n$firstBoot\n")
+                if (!tmp.renameTo(file)) SecuredLog.w(SecuredLog.Ev.DB_KEY_FAILED, "streak_write")
+            } catch (e: Exception) {
+                SecuredLog.w(SecuredLog.Ev.DB_KEY_FAILED, "streak_write")
+            }
+        }
+
+        companion object {
+            const val LOST_AFTER = 3
+        }
+    }
 
     companion object {
         /** [KeyFailure] reason: the Keystore kept failing for a few seconds. Not a lost key: a later start can still work. */
@@ -163,17 +215,23 @@ internal class DbKeyStore(private val context: Context) {
         internal val RETRY_PAUSES_MS = longArrayOf(300, 1_000, 2_000)
 
         /**
-         * True when the passphrase can never be read on this phone (A3): the key is gone or invalidated, the stored values
-         * are broken, or the key doesn't open them (the GCM tag fails). Any other Keystore error may pass.
+         * True when the passphrase can never be read on this phone (A3): the stored values are broken, the key is
+         * invalidated or doesn't open them (the GCM tag fails), or Android 13+ says the Keystore error is not transient
+         * ([transient] false, KeyStoreException.isTransientFailure). A missing key ([KeyGone]) and any other error may pass.
          */
-        internal fun readLost(e: Throwable): Boolean =
-            e is KeyGone || e is StoredValueBroken || e is KeyPermanentlyInvalidatedException || e is AEADBadTagException
+        internal fun readLost(e: Throwable, transient: (Throwable) -> Boolean? = ::platformTransient): Boolean =
+            e is StoredValueBroken || e is KeyPermanentlyInvalidatedException || e is AEADBadTagException || transient(e) == false
 
         /**
          * [read] with retries for errors that may pass. Throws [KeyFailure]: "key_unreadable" (only a reset helps,
-         * KEY_LOST) at once for [readLost], else [KEYSTORE_BUSY] after the last retry.
+         * KEY_LOST) at once for [readLost], and after the last retry when the key is still missing ([KeyGone]); else
+         * [KEYSTORE_BUSY] after the last retry (the engine counts those, [BusyStreak]).
          */
-        internal fun readWithRetry(read: () -> String, pause: (Long) -> Unit = Thread::sleep): String {
+        internal fun readWithRetry(
+            read: () -> String,
+            transient: (Throwable) -> Boolean? = ::platformTransient,
+            pause: (Long) -> Unit = Thread::sleep,
+        ): String {
             var retries = 0
             while (true) {
                 val failure = try {
@@ -181,17 +239,55 @@ internal class DbKeyStore(private val context: Context) {
                 } catch (e: Exception) {
                     e
                 }
-                if (readLost(failure)) {
+                if (readLost(failure, transient)) {
                     SecuredLog.e(SecuredLog.Ev.DB_KEY_FAILED, failure.javaClass.simpleName)
                     throw KeyFailure("key_unreadable")
                 }
                 if (retries == RETRY_PAUSES_MS.size) {
+                    if (failure is KeyGone) {
+                        SecuredLog.e(SecuredLog.Ev.DB_KEY_FAILED, "key_gone")
+                        throw KeyFailure("key_unreadable")
+                    }
                     SecuredLog.crash(SecuredLog.Ev.DB_KEY_FAILED, failure)
                     throw KeyFailure(KEYSTORE_BUSY)
                 }
                 SecuredLog.w(SecuredLog.Ev.DB_KEY_FAILED, "retry", retries + 1)
                 pause(RETRY_PAUSES_MS[retries++])
             }
+        }
+
+        /**
+         * Android 13+: what the Keystore says of its own error (android.security.KeyStoreException.isTransientFailure,
+         * anywhere in the cause chain); null before Android 13 or when the chain holds none.
+         */
+        internal fun platformTransient(e: Throwable): Boolean? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Api33.transient(e) else null
+
+        /** Kept apart so older Android versions never load android.security.KeyStoreException. */
+        private object Api33 {
+            fun transient(e: Throwable): Boolean? {
+                var t: Throwable? = e
+                var depth = 0
+                while (t != null && depth++ < 8) {
+                    if (t is android.security.KeyStoreException) return t.isTransientFailure
+                    t = t.cause
+                }
+                return null
+            }
+        }
+
+        /**
+         * Which boot of the phone this is: Settings.Global.BOOT_COUNT (Android 7+), else the wall-clock time of the boot
+         * in minutes. Never sent anywhere.
+         */
+        fun bootId(context: Context): String {
+            val count = try {
+                Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+            } catch (t: Throwable) {
+                -1
+            }
+            if (count >= 0) return "c$count"
+            return "t" + (System.currentTimeMillis() - SystemClock.elapsedRealtime()) / 60_000L
         }
 
         const val PREFS_NAME = "encrogram_secured_keys"
