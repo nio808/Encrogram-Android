@@ -71,6 +71,7 @@ internal object ErrorMapper {
     const val FOREIGN_RELAY_CONTACT = "This contact uses a server Encrogram doesn't use, so messages to them are paused."
     const val FOREIGN_RELAY_GROUP = "Someone in this group uses a server Encrogram doesn't use, so sending here is paused until an admin removes them."
     const val FOREIGN_RELAY_ADD = "This contact uses a server Encrogram doesn't use, so they can't be added to a group."
+    const val FOREIGN_RELAY_JOIN = "The person who invited you uses a server Encrogram doesn't use, so you can't join this group."
 
     /** A send to a contact or group with a queue on a relay we don't run ([ForeignRelays]). [message] is one of the sentences above. */
     fun foreignRelay(message: String): SecuredError = SecuredError(Kind.UNAPPROVED_RELAY, message)

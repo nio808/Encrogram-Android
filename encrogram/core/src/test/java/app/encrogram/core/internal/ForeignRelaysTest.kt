@@ -124,6 +124,19 @@ class ForeignRelaysTest {
         assertNull(ForeignRelays.departedOf("leftMemberUser", JSONObject().put("groupInfo", g).put("member", m(7))))
     }
 
+    @Test
+    fun anInvitationKnowsItsInvitingContactSoAPausedOneCanBeRefused() {
+        fun group(invitedBy: String) = CoreJson.parseGroup(JSONObject(
+            """{"groupId":7,"groupProfile":{"displayName":"G"},"membership":{"memberRole":"member","memberStatus":"invited",
+                "memberId":"bQ==","createdAt":"2026-11-09T10:00:00Z","invitedBy":$invitedBy}}""",
+        ))!!
+        assertEquals(4L, group("""{"type":"contact","byContactId":4}""").invitedByContactId)
+        assertNull(group("""{"type":"user"}""").invitedByContactId)
+        assertNull(group("""{"type":"unknown"}""").invitedByContactId)
+        // joinGroup refuses when the inviter's own chat is marked (the same check sends use).
+        assertEquals(ErrorMapper.FOREIGN_RELAY_CONTACT, ForeignRelays.refusal(setOf(4L), 4L))
+    }
+
     private companion object {
         val SecuredErrorKind = app.encrogram.core.api.SecuredError.Kind.UNAPPROVED_RELAY
     }

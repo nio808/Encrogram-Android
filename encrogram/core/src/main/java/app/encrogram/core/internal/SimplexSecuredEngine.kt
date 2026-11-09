@@ -742,6 +742,8 @@ internal class SimplexSecuredEngine(
         if (!ensureRunning(callback)) return@post
         val g = groupCache[chatId] ?: return@post err(callback, ErrorMapper.chatGone())
         if (!g.invited) return@post refuse(callback, "join_not_invited", ErrorMapper.ALREADY_JOINED)
+        // Joining answers the inviter's own queue (APIJoinGroup -> joinConnection): not when that contact is on a relay we don't run (b1).
+        if (g.invitedByContactId?.let { foreignRefusal(it) } != null) return@post refuseForeign(callback, ErrorMapper.FOREIGN_RELAY_JOIN)
         val acceptedAt = System.currentTimeMillis()
         when (val r = send(Commands.joinGroup(g.groupId))) {
             is CoreReply.Result -> {

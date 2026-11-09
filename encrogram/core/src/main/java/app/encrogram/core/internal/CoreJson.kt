@@ -199,6 +199,8 @@ internal data class CoreGroup(
     val myMemberId: String? = null,
     /** membership.createdAt: when this membership began on this phone (invitation received or link join accepted), 0 if unknown. */
     val joinedAtMs: Long = 0,
+    /** membership.invitedBy `{"type":"contact","byContactId":N}` (Types.hs:1268): the contact whose invitation this is, else null. */
+    val invitedByContactId: Long? = null,
 ) {
     val chatId: Long get() = GROUP_CHAT_ID_BASE + groupId
     val invited: Boolean get() = myStatus == "invited"
@@ -859,6 +861,8 @@ internal object CoreJson {
             linkKey = joinLinkKey(g),
             myMemberId = membership?.str("memberId")?.ifEmpty { null },
             joinedAtMs = timeMs(membership?.str("createdAt")),
+            invitedByContactId = membership?.optJSONObject("invitedBy")?.takeIf { tagOf(it) == "contact" }
+                ?.optLong("byContactId", 0L)?.takeIf { it > 0 },
         )
     }
 
