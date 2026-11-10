@@ -69,6 +69,11 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     public BaseFragment wrapChats(DialogsActivity chats) {
         telegramUsedHere = true;   // Telegram's main tabs exist only with an account: never put it back to sleep in this process
         try {
+            releasePush();
+        } catch (Throwable t) {
+            fail("releasePush", t);
+        }
+        try {
             final EncrogramChatsHost host = new EncrogramChatsHost(chats);
             host.setOnDestroy(() -> release(chats));
             hosts.put(chats, new WeakReference<>(host));
@@ -215,7 +220,8 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     // Asleep = no Telegram account is activated and no Telegram login is half done, decided once per process before
     // Telegram's network starts. That covers the welcome screen and the Secured-only list. While asleep, Telegram's
     // network layer sees "no network" (its own offline state: no socket, no DNS fallback) and its push-token request
-    // waits. Opening Telegram's intro or login screen wakes it with the call Telegram makes when the network returns.
+    // waits. Opening Telegram's intro or login screen wakes the network with the call Telegram makes when the network
+    // returns; the push-token request keeps waiting until Telegram's main tabs are built (a signed-in account).
     // With a Telegram account the state is "awake" from the first call, and every hook below returns Telegram's own
     // behaviour unchanged.
     //
@@ -310,13 +316,13 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     }
 
     private void wakeTelegram() {
-        final Runnable push;
         final boolean unpause;
         synchronized (telegramLock) {
             final boolean wasAsleep = telegramState == TG_ASLEEP;
             telegramState = TG_AWAKE;
-            push = heldPush;
-            heldPush = null;
+            // The push setup stays held: the login screens don't use the token (sendCode only checks that Play services
+            // exist), and Firebase's token request left a Google connection open after a mere peek (HT-2 follow-up).
+            // releasePush runs it once an account is in use.
             if (!wasAsleep) {
                 return;
             }
@@ -335,7 +341,21 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 cm.setAppPaused(false, true);
             }
         }
+    }
+
+    /**
+     * Runs Telegram's held push setup (initPushServices: Firebase token, then registration for activated accounts)
+     * once Telegram is really in use: its main tabs are built, which happens only with a signed-in account. Telegram
+     * calls initPushServices only at app start, so without this a sign-in in the same process would get no pushes.
+     */
+    private void releasePush() {
+        final Runnable push;
+        synchronized (telegramLock) {
+            push = heldPush;
+            heldPush = null;
+        }
         if (push != null) {
+            debugLog("push released");
             push.run();   // Telegram's initPushServices, now unheld
         }
     }

@@ -92,7 +92,7 @@ public final class EncrogramHooks {
 
         /**
          * ApplicationLoader.initPushServices, before the push-token request. Return true to postpone it; Encrogram then
-         * runs {@code initPushServices} itself when Telegram wakes. The default returns false: the request goes out now.
+         * runs {@code initPushServices} itself once a Telegram account is in use. The default returns false: the request goes out now.
          */
         default boolean holdTelegramPush(Runnable initPushServices) {
             return false;
