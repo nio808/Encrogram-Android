@@ -156,7 +156,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static final int ROW_REACTIONS = 2;
     private static final int ROW_EVENT = 3;   // group service row ("X joined")
     private static final int ROW_UNREAD = 5;  // Telegram's "Unread messages" bar above the first unread message
-    private static final int ROW_MEDIA = 4;   // the media bubble of a message; its caption is a joined ROW_MESSAGE
+    private static final int ROW_MEDIA = 4;   // the media bubble of a message, its caption drawn inside (as Telegram does)
 
     private static final int PAGE_SIZE = 50;
     private static final int GROUP_SECONDS = 5 * 60;
@@ -2365,6 +2365,14 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (media == null || engine == null) return;
         final int hit = cell.hitTest(x, y);
         if (hit == SecuredMediaCell.HIT_NONE) return;
+        if (hit == SecuredMediaCell.HIT_LINK) {
+            // Same rule as a link in a text bubble (didPressUrl): only plain web links, and only after asking.
+            final CharacterStyle url = cell.pressedLink();
+            if (!(url instanceof URLSpan) || url instanceof URLSpanNoUnderline) return;
+            final String tapped = ((URLSpan) url).getURL();
+            if (!openSecuredLink(tapped)) confirmOpenLink(tapped);
+            return;
+        }
         if (hit == SecuredMediaCell.HIT_QUOTE) {
             final Long qid = m.getReplyTo() != null ? m.getReplyTo().getMessageId() : null;
             if (qid == null) showNotLoaded();
@@ -3438,12 +3446,10 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private static final class Row {
         final int kind;
         final long stableId;
-        final SecuredMessage message;   // null for date rows; the whole message (media included) for media and caption rows
+        final SecuredMessage message;   // null for date rows; the whole message (media included) for media rows
         final int dateSec;
         boolean pinnedTop;
         boolean pinnedBottom;
-        /** ROW_MESSAGE that shows only the caption of a media message, joined under its ROW_MEDIA. */
-        boolean caption;
 
         Row(int kind, long stableId, SecuredMessage message, int dateSec) {
             this.kind = kind;
@@ -3493,13 +3499,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         if (i < 0 || adapter == null) return false;
         final Row old = rows.get(i);
         if (old.message == null || old.message.getEvent() != null) return false;
-        if (updated.getMedia() != null || old.message.getMedia() != null) {
-            // A media message has two rows (media and caption): patch both, or rebuild if the shape may change.
-            final int j = mediaRowIndexOf(messageId);
-            if (j < 0 || updated.getMedia() == null || updated.getDeleted()
-                    || old.message.getText().isEmpty() != updated.getText().isEmpty()) return false;
-            if (j != i) patchRow(j, updated);
-        }
+        // A media message is one row (its caption is drawn inside it): rebuild only if it stops being media.
+        if ((updated.getMedia() != null || old.message.getMedia() != null)
+                && (old.kind != ROW_MEDIA || updated.getMedia() == null || updated.getDeleted())) return false;
         patchRow(i, updated);
         return true;
     }
@@ -3509,17 +3511,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         final Row r = new Row(old.kind, old.stableId, updated, old.dateSec);
         r.pinnedTop = old.pinnedTop;
         r.pinnedBottom = old.pinnedBottom;
-        r.caption = old.caption;
         rows.set(i, r);
         adapter.notifyItemChanged(i);
-    }
-
-    private int mediaRowIndexOf(long messageId) {
-        for (int i = rows.size() - 1; i >= 0; i--) {
-            final Row r = rows.get(i);
-            if (r.kind == ROW_MEDIA && r.message.getMessageId() == messageId) return i;
-        }
-        return -1;
     }
 
     /** The caption of a media message as a plain text message for the one text mapper: no media, quote or label. */
@@ -3572,13 +3565,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 continue;
             }
             if (m.getMedia() != null && !m.getDeleted()) {
-                // The media bubble, then its caption as its own joined text bubble (AGENTS.md "Media v1").
+                // One bubble: the media with its caption inside, as Telegram draws it (AGENTS.md "Media v1").
                 next.add(new Row(ROW_MEDIA, m.getMessageId() * 4, m, sec));
-                if (!m.getText().isEmpty()) {
-                    final Row cap = new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec);
-                    cap.caption = true;
-                    next.add(cap);
-                }
             } else {
                 next.add(new Row(ROW_MESSAGE, m.getMessageId() * 4 + 1, m, sec));
             }
@@ -3591,10 +3579,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             if (!isBubble(r)) continue;
             final Row prev = i > 0 ? next.get(i - 1) : null;
             final Row after = i + 1 < next.size() ? next.get(i + 1) : null;
-            // A caption is always joined to its media bubble above it.
-            r.pinnedTop = r.caption || prev != null && isBubble(prev) && sameGroup(prev.message, r.message);
-            r.pinnedBottom = after != null && (after.caption && after.message == r.message
-                    || isBubble(after) && sameGroup(r.message, after.message));
+            r.pinnedTop = prev != null && isBubble(prev) && sameGroup(prev.message, r.message);
+            r.pinnedBottom = after != null && isBubble(after) && sameGroup(r.message, after.message);
         }
 
         if (!animated || adapter == null) {
@@ -3624,7 +3610,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                     final Row a = old.get(o);
                     final Row b = next.get(n);
                     if (a.kind != b.kind || a.dateSec != b.dateSec || a.pinnedTop != b.pinnedTop
-                            || a.pinnedBottom != b.pinnedBottom || a.caption != b.caption) return false;
+                            || a.pinnedBottom != b.pinnedBottom) return false;
                     if (a.message == null || b.message == null) return a.message == b.message;
                     if (a.kind == ROW_REACTIONS) return a.message.getReactions().equals(b.message.getReactions());
                     // AR8: only what the row draws (reactions have a row of their own)
@@ -3674,7 +3660,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         return messageAt(listView.getChildAdapterPosition(cell));
     }
 
-    /** The message's last bubble row: its text bubble, or a media message's caption, or its media bubble. */
+    /** The message's bubble row: its text bubble or its media bubble. */
     private int rowIndexOf(long messageId) {
         for (int i = rows.size() - 1; i >= 0; i--) {
             final Row r = rows.get(i);
@@ -3717,7 +3703,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             int below = 0;
             for (int p = last + 1; p < rows.size() && below < unreadBelow; p++) {
                 final Row r = rows.get(p);
-                if (r.message != null && !r.caption && !r.message.getOutgoing()) below++;
+                if (r.message != null && !r.message.getOutgoing()) below++;
             }
             unreadBelow = below;
         }
@@ -3942,7 +3928,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
                 if (cell instanceof SecuredMessageCell) {
                     ((SecuredMessageCell) cell).setSecuredStatus(r.message.getOutgoing() ? r.message.getStatus() : null, notes);
                 }
-                cell.setMessageObject(objectFor(r.caption ? captionOf(r.message) : r.message), null, r.pinnedBottom, r.pinnedTop, false);
+                cell.setMessageObject(objectFor(r.message), null, r.pinnedBottom, r.pinnedTop, false);
                 final boolean selecting = !selectedIds.isEmpty();
                 final boolean sel = selectedIds.contains(r.message.getMessageId());
                 cell.setCheckBoxVisible(selecting, false);
@@ -3951,8 +3937,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             } else if (view instanceof SecuredMediaCell) {
                 final SecuredMediaCell cell = (SecuredMediaCell) view;
                 cell.setSlidingOffset(0);
-                final boolean captionBelow = r.pinnedBottom && position + 1 < rows.size() && rows.get(position + 1).caption;
-                cell.bind(r.message, r.pinnedTop, r.pinnedBottom, captionBelow, groupChat, notes);
+                // The caption is the one text mapper's output (links filtered there); the cell only lays it out.
+                final CharSequence caption = r.message.getText().isEmpty() ? null : objectFor(captionOf(r.message)).messageText;
+                cell.bind(r.message, r.pinnedTop, r.pinnedBottom, caption, groupChat, notes);
                 final long[] live = liveProgress.get(r.message.getMessageId());
                 if (live != null) cell.setProgress(live[0], live[1]);
                 final boolean selecting = !selectedIds.isEmpty();

@@ -11,9 +11,12 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.text.Layout;
+import android.text.Spanned;
 import android.text.StaticLayout;
 import android.text.TextPaint;
 import android.text.TextUtils;
+import android.text.style.CharacterStyle;
+import android.text.style.ClickableSpan;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -61,6 +64,8 @@ abstract class SecuredMediaCell extends View {
     static final int HIT_QUOTE = 3;
     /** Voice waveform: seek to {@link #seekFraction()}. */
     static final int HIT_SEEK = 4;
+    /** A link in the caption: {@link #pressedLink()}. */
+    static final int HIT_LINK = 5;
 
     /** What the cell needs from its chat screen. Main thread only. */
     interface Host {
@@ -85,9 +90,9 @@ abstract class SecuredMediaCell extends View {
     protected SecuredMedia media;
     protected boolean out;
     protected boolean pinnedTop;
-    /** Joined to the bubble below (its caption, or the same sender's next message): no avatar, joined corners. */
+    /** Joined to the same sender's next bubble: no avatar, joined corners. */
     protected boolean pinnedBottom;
-    /** A caption bubble is joined under this one: no time here, square bottom corners. */
+    /** The caption is drawn under the content, inside this bubble (as Telegram does): small picture corners above it. */
     protected boolean captionBelow;
     protected boolean group;
     protected boolean notes;
@@ -132,8 +137,24 @@ abstract class SecuredMediaCell extends View {
     private String timeText = "";
     private int timeWidth;
 
+    // The caption: the text mapper's output (SecuredMessageMapper via the chat screen), laid out at the bubble width.
+    private final TextPaint captionPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+    private CharSequence caption;
+    private StaticLayout captionLayout;
+    private CharSequence captionLayoutText;
+    private int captionLayoutWidth = -1;
+    private float captionLayoutSize;
+    /** The time does not fit after the caption's last line: it gets a line of its own. */
+    private boolean captionTimeLine;
+    private final RectF captionRect = new RectF();
+    private CharacterStyle pressedLink;
+
     private final AvatarDrawable avatar;
     private boolean drawAvatar;
+    /** The member's own photo (AvatarPhotos' shared cache, never recycled), drawn instead of the letters when set. */
+    private android.graphics.Bitmap avatarPhoto;
+    private final Paint avatarPhotoPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final android.graphics.Path avatarClip = new android.graphics.Path();
 
     private final MsgClockDrawable clock = new MsgClockDrawable();
     private Drawable mediaCheck;
@@ -165,19 +186,22 @@ abstract class SecuredMediaCell extends View {
     // ---- binding ---------------------------------------------------------------------------------------------
 
     /**
-     * Binds a media message. {@code captionBelow}: its caption is shown as a joined text bubble under this one.
-     * {@code pinnedBottom}: joined to the next bubble of the same run (always true with a caption below).
+     * Binds a media message. {@code caption}: the caption as the text mapper produced it (links already filtered),
+     * drawn under the content inside this bubble; null or empty for none.
+     * {@code pinnedBottom}: joined to the next bubble of the same run.
      * {@code group}: incoming bubbles get the avatar column and the sender's name.
      */
-    final void bind(SecuredMessage m, boolean pinnedTop, boolean pinnedBottom, boolean captionBelow, boolean group, boolean notes) {
+    final void bind(SecuredMessage m, boolean pinnedTop, boolean pinnedBottom, CharSequence caption, boolean group, boolean notes) {
         final boolean sameMessage = message != null && m != null && message.getMessageId() == m.getMessageId();
         final boolean sameFile = sameMessage && media != null && m.getMedia() != null && media.getState() == m.getMedia().getState();
         message = m;
         media = m.getMedia();
         out = m.getOutgoing();
         this.pinnedTop = pinnedTop;
-        this.captionBelow = captionBelow;
-        this.pinnedBottom = pinnedBottom || captionBelow;
+        this.caption = caption != null && caption.length() > 0 ? caption : null;
+        this.captionBelow = this.caption != null;
+        this.pinnedBottom = pinnedBottom;
+        pressedLink = null;
         this.group = group;
         this.notes = notes;
         if (!sameFile && media != null) {
@@ -189,8 +213,10 @@ abstract class SecuredMediaCell extends View {
         timeWidth = (int) Math.ceil(timePaint.measureText(timeText));
         final MessageSender sender = m.getSender();
         drawAvatar = group && !out && sender != null;
+        avatarPhoto = null;
         if (drawAvatar) {
             Kit.setAvatar(avatar, sender.getMemberId(), sender.getDisplayName());
+            avatarPhoto = AvatarPhotos.bitmap(sender.getAvatar());   // as the mapper does for text bubbles; null: letters
             nameColor = color(Theme.keys_avatar_nameInMessage[AvatarDrawable.getColorIndex(Kit.colorKey(sender.getDisplayName()))]);
         }
         onBind(sameMessage);
@@ -254,9 +280,9 @@ abstract class SecuredMediaCell extends View {
     /** Photo and video: the time sits on a dark pill over the media. File and voice: in the bubble's corner. */
     protected abstract boolean timeOverContent();
 
-    /** Media-type bubble (no tail): photos always, files and voice only when a caption is joined below. */
+    /** Media-type bubble (no tail): a photo or video without a caption. With a caption it is a normal bubble, as in Telegram. */
     protected boolean mediaBubble() {
-        return timeOverContent() || captionBelow;
+        return timeOverContent() && !captionBelow;
     }
 
     /** A name, "Forwarded" or a reply quote sits above the content (photos then square their top corners). */
@@ -304,11 +330,55 @@ abstract class SecuredMediaCell extends View {
         final int top = pinnedTop ? dp(1) : dp(4);
         final int bottomGap = pinnedBottom ? dp(1) : dp(4);
         final int contentH = contentHeight(bw);
-        final int bodyH = header + insets.top + contentH + insets.bottom;
+        // Caption under the content (ChatMessageCell's numbers): it starts 6dp under a picture, 9dp in from the
+        // bubble's sides, and the time takes a line of its own when it doesn't fit after the last line.
+        int captionH = 0;
+        int captionGap = 0;
+        final int captionW = Math.max(dp(40), bw - dp(18));
+        if (captionBelow) {
+            buildCaption(captionW);
+            captionGap = insets.bottom > 0 ? dp(6) - insets.bottom : 0;
+            captionH = captionGap + captionLayout.getHeight() + dp(captionTimeLine ? 21 : 7);
+        }
+        final int bodyH = header + insets.top + contentH + insets.bottom + captionH;
         final float left = out ? width - dp(11) - bw : leftOffset() + dp(11);
         body.set(left, top, left + bw, top + bodyH);
         content.set(body.left + insets.left, body.top + header + insets.top, body.right - insets.right, body.top + header + insets.top + contentH);
+        if (captionBelow) {
+            final float ct = content.bottom + insets.bottom + captionGap;
+            captionRect.set(body.left + dp(9), ct, body.left + dp(9) + captionW, ct + captionLayout.getHeight());
+        } else {
+            captionRect.setEmpty();
+        }
         setMeasuredDimension(width, top + bodyH + bottomGap);
+    }
+
+    /** Lays the caption out at {@code width}; kept while the text, width and font size stay the same. */
+    private void buildCaption(int width) {
+        final TextPaint base = Theme.chat_msgTextPaint;
+        final float size = base != null ? base.getTextSize() : dp(16);
+        if (captionLayout == null || captionLayoutText != caption || captionLayoutWidth != width || captionLayoutSize != size) {
+            captionPaint.setTextSize(size);
+            if (base != null) captionPaint.setTypeface(base.getTypeface());
+            if (caption instanceof Spanned) {
+                // A caption is never big emoji (the mapper sizes an emoji-only text message up): normal text size, as in Telegram.
+                final Paint.FontMetricsInt fm = captionPaint.getFontMetricsInt();
+                for (Emoji.EmojiSpan e : ((Spanned) caption).getSpans(0, caption.length(), Emoji.EmojiSpan.class)) {
+                    e.replaceFontMetrics(fm);
+                }
+            }
+            captionLayout = StaticLayout.Builder.obtain(caption, 0, caption.length(), captionPaint, width)
+                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                    .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
+                    .build();
+            captionLayoutText = caption;
+            captionLayoutWidth = width;
+            captionLayoutSize = size;
+        }
+        final int last = captionLayout.getLineCount() - 1;
+        final int status = out && !notes ? dp(20) : 0;
+        // getLineRight, not the width: a right-to-left last line ends at the right edge, where the time is drawn.
+        captionTimeLine = captionLayout.getLineRight(last) > width - dp(6) - status - timeWidth;
     }
 
     private void buildHeader(int width) {
@@ -374,13 +444,25 @@ abstract class SecuredMediaCell extends View {
         drawBubble(canvas);
         drawHeader(canvas);
         drawContent(canvas);
-        if (!captionBelow) drawTime(canvas);
+        if (captionBelow) drawCaption(canvas);
+        drawTime(canvas);
         if (drawAvatar && !pinnedBottom) {
-            // Only the last bubble of a sender's run gets the avatar (a joined caption bubble draws it instead).
+            // Only the last bubble of a sender's run gets the avatar.
             final int size = dp(42);
             final int bottom = (int) body.bottom;
-            avatar.setBounds(dp(6) + (checkBoxVisible ? dp(35) : 0), bottom - size, dp(6) + (checkBoxVisible ? dp(35) : 0) + size, bottom);
-            avatar.draw(canvas);
+            final int left = dp(6) + (checkBoxVisible ? dp(35) : 0);
+            if (avatarPhoto != null) {
+                avatarClip.reset();
+                avatarClip.addCircle(left + size / 2f, bottom - size / 2f, size / 2f, android.graphics.Path.Direction.CW);
+                canvas.save();
+                canvas.clipPath(avatarClip);
+                bounds.set(left, bottom - size, left + size, bottom);
+                canvas.drawBitmap(avatarPhoto, null, bounds, avatarPhotoPaint);
+                canvas.restore();
+            } else {
+                avatar.setBounds(left, bottom - size, left + size, bottom);
+                avatar.draw(canvas);
+            }
         }
         if (checkBoxVisible) {
             final int size = dp(21);
@@ -479,10 +561,20 @@ abstract class SecuredMediaCell extends View {
         }
     }
 
+    private void drawCaption(Canvas canvas) {
+        if (captionLayout == null) return;
+        captionPaint.setColor(color(out ? Theme.key_chat_messageTextOut : Theme.key_chat_messageTextIn));
+        captionPaint.linkColor = color(out ? Theme.key_chat_messageLinkOut : Theme.key_chat_messageLinkIn);
+        canvas.save();
+        canvas.translate(captionRect.left, captionRect.top);
+        captionLayout.draw(canvas);
+        canvas.restore();
+    }
+
     private void drawTime(Canvas canvas) {
         final boolean showStatus = out && !notes;
         final int statusW = showStatus ? dp(20) : 0;
-        if (timeOverContent()) {
+        if (timeOverContent() && !captionBelow) {
             // Telegram's pill over a photo (ChatMessageCell.drawTimeInternal): dark, 60% of its theme alpha.
             final boolean big = SharedConfig.bubbleRadius >= 10;
             final float right = content.right - dp(6);
@@ -593,7 +685,13 @@ abstract class SecuredMediaCell extends View {
 
     /** What a tap at (x, y), in this cell's coordinates, hits. */
     int hitTest(float x, float y) {
+        pressedLink = null;
         if (!quoteRect.isEmpty() && quoteRect.contains(x, y)) return HIT_QUOTE;
+        if (captionBelow && body.contains(x, y) && y >= captionRect.top - dp(6)) {
+            // The caption area opens nothing (as in Telegram), except a link in it.
+            pressedLink = linkAt(x - captionRect.left, y - captionRect.top);
+            return pressedLink != null ? HIT_LINK : HIT_NONE;
+        }
         final int sub = contentHit(x, y);
         if (sub != HIT_NONE) return sub;
         return body.contains(x, y) ? HIT_CONTENT : HIT_NONE;
@@ -607,6 +705,21 @@ abstract class SecuredMediaCell extends View {
     /** After {@link #HIT_SEEK}: where on the waveform, 0..1. */
     float seekFraction() {
         return 0f;
+    }
+
+    /** After {@link #HIT_LINK}: the tapped span, as the mapper left it. The chat screen decides what it opens. */
+    CharacterStyle pressedLink() {
+        return pressedLink;
+    }
+
+    /** The clickable span under (x, y) in caption-layout coordinates, or null. */
+    private CharacterStyle linkAt(float x, float y) {
+        if (captionLayout == null || !(captionLayout.getText() instanceof Spanned) || y < 0 || y > captionLayout.getHeight()) return null;
+        final int line = captionLayout.getLineForVertical((int) y);
+        if (x < captionLayout.getLineLeft(line) || x > captionLayout.getLineRight(line)) return null;
+        final int offset = captionLayout.getOffsetForHorizontal(line, x);
+        final ClickableSpan[] spans = ((Spanned) captionLayout.getText()).getSpans(offset, offset, ClickableSpan.class);
+        return spans.length > 0 ? spans[0] : null;
     }
 
     // ---- helpers ---------------------------------------------------------------------------------------------
@@ -629,7 +742,7 @@ abstract class SecuredMediaCell extends View {
         return media != null ? media.getKind() : MediaKind.FILE;
     }
 
-    /** One spoken line: kind, state and time; never the file name or caption (those are in the caption bubble). */
+    /** One spoken line: sender, kind, state, caption, status and time (subclasses add the file name). */
     protected String accessibilityText() {
         final StringBuilder sb = new StringBuilder();
         final String who = host != null ? host.senderName(message) : null;
@@ -640,6 +753,7 @@ abstract class SecuredMediaCell extends View {
         } else if (moving()) {
             sb.append(", ").append(MediaText.progress(getContext(), progressDone, progressTotal));
         }
+        if (caption != null) sb.append(", ").append(caption.toString());
         if (message.getOutgoing() && !notes) sb.append(", ").append(getContext().getString(SecuredMessageCell.wordFor(message.getStatus())));   // only what the engine reported
         sb.append(", ").append(timeText);
         return sb.toString();
