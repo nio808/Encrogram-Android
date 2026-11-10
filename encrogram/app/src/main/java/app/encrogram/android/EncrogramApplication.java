@@ -36,6 +36,8 @@ public class EncrogramApplication extends ApplicationLoader {
         applicationContext = getApplicationContext();
 
         applyIdentity();
+        // Before Telegram reads its cached language packs: our app name must not come back as "Telegram".
+        BrandStrings.stripCachedPacks();
         SecuredUi.install(this, EngineBootstrap::create);
         SecuredBackground.install(this, SecuredUi::engine, new NotificationConfig(
                 R.drawable.notification, Color.parseColor("#4A4FD6"), this::openChatIntent));
@@ -46,6 +48,7 @@ public class EncrogramApplication extends ApplicationLoader {
         }
 
         super.onCreate();
+        BrandStrings.install();
         installDiagnostics();
 
         if (BuildConfig.DEBUG) {

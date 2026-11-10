@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Our app name for a language whose Telegram translation ships in the APK (TMessagesProj/src/main/res/values-*/).
+    Without this, that translation's AppName ("Telegram") wins over our default values/strings.xml for this language.
+    The same name in every language. Other overrides (intro pages, icon names) are not translated yet.
+-->
+<resources>
+    <string name="AppName">Encrogram</string>
+    <string name="AppNameBeta">Encrogram Beta</string>
+</resources>

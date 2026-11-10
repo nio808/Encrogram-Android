@@ -4,8 +4,10 @@
     win at merge). Only places where "Telegram" means this app's own name are changed. Where "Telegram" means the
     Telegram network or the Telegram tab, it stays. Wording rules: docs/brand/BRAND.md (honest-wording checklist).
 
-    Limit: Telegram's LocaleController prefers its cloud language pack over these resources once that pack has loaded
-    (BuildVars.USE_CLOUD_STRINGS), so these show on a fresh install and may revert to Telegram's text later.
+    Telegram's LocaleController prefers its cloud language pack over these resources once that pack has loaded
+    (BuildVars.USE_CLOUD_STRINGS). BrandStrings.java cuts every name in this file from those packs, so these keep
+    winning; BrandStringsTest fails if the two lists differ. AppName also has values-<lang> copies, because the
+    Telegram translations bundled in the APK would otherwise win for those languages.
 -->
 <resources>
     <string name="AppName">Encrogram</string>
