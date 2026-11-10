@@ -1,7 +1,9 @@
 package app.encrogram.core.internal
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import chat.simplex.common.platform.chatCloseStore
 import chat.simplex.common.platform.chatMigrateInit
 import chat.simplex.common.platform.chatRecvMsgWait
@@ -51,5 +53,43 @@ internal class HandlerMainThread(private val handler: Handler = Handler(Looper.g
 
     override fun postDelayed(task: Runnable, delayMs: Long) {
         handler.postDelayed(task, delayMs)
+    }
+}
+
+/**
+ * N-A1: keeps the CPU awake for a short while after the core hands over an event, so the engine thread, the 700 ms
+ * notification burst ([app.encrogram.core.background.NotifyBurst]) and the core's own receipts finish before a sleeping
+ * phone dozes off again. The official app holds one for 30 s after every receive (SimpleXAPI.kt:707-716); we hold
+ * 10 s, and only when an event actually arrived. Production: [PartialWakeGuard]; tests: [NONE].
+ */
+internal fun interface WakeGuard {
+    /** Holds (or extends) the wake for [PartialWakeGuard.HOLD_MS]. Never throws. */
+    fun hold()
+
+    companion object {
+        val NONE = WakeGuard { }
+    }
+}
+
+/** One timed partial wake lock, not reference counted: each [hold] restarts its timeout, nothing ever has to release it. */
+internal class PartialWakeGuard(context: Context) : WakeGuard {
+    private val lock: PowerManager.WakeLock? = try {
+        (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "encrogram:secured-receive")
+            ?.apply { setReferenceCounted(false) }
+    } catch (e: RuntimeException) {
+        null
+    }
+
+    override fun hold() {
+        try {
+            lock?.acquire(HOLD_MS)
+        } catch (e: RuntimeException) {
+            // No WAKE_LOCK permission (it comes from Telegram's manifest): receive as before, without the hold.
+        }
+    }
+
+    companion object {
+        const val HOLD_MS = 10_000L
     }
 }

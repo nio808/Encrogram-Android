@@ -31,13 +31,13 @@ import java.util.concurrent.atomic.AtomicLong
  * so a test can wait until everything queued has run ([awaitIdle]). Only the Android pieces the engine touches on its
  * start path are stood in for ([TestContext]); the Keystore is replaced by the database-key seam.
  */
-internal class EngineHarness(dir: File) : AutoCloseable {
+internal class EngineHarness(dir: File, wake: WakeGuard = WakeGuard.NONE) : AutoCloseable {
     val core = FakeCore()
     val main = TestMain()
     val engineThread = CountingThread("test-engine")
     val netThread = CountingThread("test-net")
     val listener = Recorder()
-    val engine = SimplexSecuredEngine(TestContext(dir), CONFIG, core, main, engineThread, netThread) { "test-db-key" }
+    val engine = SimplexSecuredEngine(TestContext(dir), CONFIG, core, main, engineThread, netThread, wake) { "test-db-key" }
 
     /** Waits until the engine, network and main threads are empty and every pushed event reached the engine. */
     fun awaitIdle(timeoutMs: Long = 10_000) {
@@ -316,8 +316,11 @@ internal class FakeCore : NativeApi {
 
     override fun load() = Unit
 
+    /** The migration result the next [migrateInit] reports; anything but "ok" opens no controller. */
+    @Volatile var migrateTag = "ok"
+
     override fun migrateInit(dbPath: String, dbKey: String, confirm: String): Array<Any> =
-        arrayOf("""{"type":"ok"}""", nextCtrl.incrementAndGet())
+        if (migrateTag == "ok") arrayOf("""{"type":"ok"}""", nextCtrl.incrementAndGet()) else arrayOf("""{"type":"$migrateTag"}""", 0L)
 
     override fun sendCmd(ctrl: Long, cmd: String, retryNum: Int): String {
         val call = Call(ctrl, cmd, retryNum, Thread.currentThread().name)

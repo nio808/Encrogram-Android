@@ -108,6 +108,8 @@ internal class SimplexSecuredEngine internal constructor(
     private val executor: ExecutorService,
     /** A6: the network-bound commands' native calls ([sendNetAsync]), so they never hold the engine thread. */
     private val netExecutor: ExecutorService,
+    /** N-A1: holds the CPU awake while an arrived event is handled; a no-op in tests. */
+    private val wake: WakeGuard = WakeGuard.NONE,
     /** The database passphrase ([DbKeyStore.obtain]); throws [DbKeyStore.KeyFailure]. */
     private val databaseKey: (databaseExists: Boolean) -> String,
 ) : SecuredEngine {
@@ -115,7 +117,7 @@ internal class SimplexSecuredEngine internal constructor(
     /** Production wiring ([app.encrogram.core.api.SecuredEngines]). */
     constructor(appContext: Context, config: RelayConfig) : this(
         appContext, config, JniNativeApi, HandlerMainThread(),
-        daemonThread("encrogram-secured-engine"), daemonThread("encrogram-secured-net"),
+        daemonThread("encrogram-secured-engine"), daemonThread("encrogram-secured-net"), PartialWakeGuard(appContext),
         { exists -> DbKeyStore(appContext).obtain(exists) },
     )
 
@@ -2291,7 +2293,7 @@ internal class SimplexSecuredEngine internal constructor(
         SecuredLog.w(Ev.RESTORE_WIPED)
     }
 
-    /** The `.bak` copies left by import and re-keying (old keys!) and any `.exported` leftover. */
+    /** The `.bak` copies left by import, re-keying (old keys!) and migrations, and any `.exported` leftover. */
     private fun deleteDatabaseCopies(dir: File) {
         for (db in listOf("_chat.db", "_agent.db")) {
             for (suffix in listOf(".bak", ".exported")) {
@@ -3540,6 +3542,13 @@ internal class SimplexSecuredEngine internal constructor(
 
     /** Backup timer (an upload owed after a restore starts here), queued server deletes, the repair of restored contacts, and media catch-up. Never throws. */
     private fun afterRunning() {
+        // N-A9: with `yesUp` the core copies each database to `.bak` before it migrates (simplexmq Agent/Store/SQLite.hs:95-97).
+        // A start that reached RUNNING proved the migrated store, and the copy would keep messages deleted or expired later.
+        try {
+            deleteDatabaseCopies(dataDir)
+        } catch (t: Throwable) {
+            SecuredLog.crash(Ev.DB_OPEN, t)
+        }
         try {
             if (backupState().enabled) scheduleAuto(0L)
             if (backupClient != null) {
@@ -3730,6 +3739,8 @@ internal class SimplexSecuredEngine internal constructor(
             }
             if (!r.running || ctrl != r.ctrl) break
             if (raw.isEmpty()) continue
+            // Before anything else: on a dozing phone the packet's own wake-up may end before the notification posts.
+            wake.hold()
             val reply = CoreJson.parseReply(raw)
             if (reply === CoreReply.Invalid) {
                 SecuredLog.w(Ev.EVENT_PARSE_FAILED)

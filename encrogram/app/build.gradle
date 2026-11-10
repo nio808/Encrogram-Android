@@ -212,3 +212,23 @@ if (!missingReleaseKeys.isEmpty()) {
         }
     }
 }
+
+// N-A10: every release build needs a higher version code than the last one built, so an older APK can never install
+// over a newer one (the core refuses down-migrations, which would leave the store unopenable). The last code is written
+// to the tracked encrogram/released.properties when a release build finishes; commit that file with the release.
+def releasedFile = rootProject.file('encrogram/released.properties')
+def lastReleasedCode = Integer.parseInt((loadProps(releasedFile).getProperty('LAST_RELEASED_VERSION_CODE') ?: '0').trim())
+gradle.taskGraph.whenReady { graph ->
+    def rel = graph.allTasks.find { it.project == project && it.name.toLowerCase().contains('release') }
+    if (rel != null && encVersionCode <= lastReleasedCode) {
+        throw new GradleException("Release build blocked: ENC_VERSION_CODE is ${encVersionCode}, but release " +
+                "${lastReleasedCode} was already built (encrogram/released.properties). " +
+                "Raise ENC_VERSION_CODE in encrogram/encrogram.properties.")
+    }
+}
+tasks.matching { it.name in ['assembleRelease', 'bundleRelease'] }.configureEach { t ->
+    t.doLast {
+        releasedFile.text = "# The last Encrogram release built (N-A10). Written by the release build; commit it with the release.\n" +
+                "LAST_RELEASED_VERSION_CODE=${encVersionCode}\n"
+    }
+}
