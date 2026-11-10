@@ -27,6 +27,7 @@ import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.DialogsActivity;
+import org.telegram.ui.ExternalActionActivity;
 import org.telegram.ui.IntroActivity;
 import org.telegram.ui.LoginActivity;
 
@@ -233,6 +234,11 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     // (native_pauseNetwork), and every open connection is closed at once (dropSockets). "No network" alone would leave an
     // open socket alive: tgnet keeps pinging it. Once Telegram's main tabs have
     // existed in this process (an account was used), it never sleeps again. Anything throwing: awake, as Telegram.
+    //
+    // Telegram Passport (HT-8): another app's "org.telegram.passport.AUTHORIZE" opens ExternalActionActivity, which with
+    // no account shows Telegram's login outside LaunchActivity, so willPresentFragment never sees it. An activity watcher
+    // registered at app start wakes Telegram while that screen is resumed and counts it as an open login screen. When it
+    // closes: signed in there, the held push setup runs; otherwise the usual sleep check.
 
     private static final int TG_UNDECIDED = 0;
     private static final int TG_ASLEEP = 1;
@@ -244,7 +250,7 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     private volatile boolean wokenFromSleep;    // a wake from "asleep" happened here: only then may it sleep again
     private volatile boolean telegramUsedHere;  // Telegram's main tabs were built: an account is in use, stay awake
     private boolean pausedByUs;                 // guarded by telegramLock: tgnet got native_pauseNetwork from us
-    private boolean resumeWatch;                // UI thread: the activity-resumed callback below is registered
+    private WeakReference<Activity> passportScreen;   // UI thread: the last Passport login screen resumed (HT-8)
     // Telegram intro and login screens presented in this process (weak keys: closed ones disappear). UI thread only.
     private final Map<BaseFragment, Boolean> telegramScreens = new WeakHashMap<>();
 
@@ -305,6 +311,10 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
 
     /** An activated Telegram account, or a half-done login (LaunchActivity then reopens LoginActivity at start). */
     private static boolean telegramInUse() {
+        return accountActivated() || LoginActivity.loadCurrentState(false, 0).getInt("currentViewNum", 0) != 0;
+    }
+
+    private static boolean accountActivated() {
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             final UserConfig config = UserConfig.getInstance(a);
             config.loadConfig();   // idempotent; Telegram loads the same file at start
@@ -312,7 +322,7 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 return true;
             }
         }
-        return LoginActivity.loadCurrentState(false, 0).getInt("currentViewNum", 0) != 0;
+        return false;
     }
 
     private void wakeTelegram() {
@@ -385,7 +395,6 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
                 ConnectionsManager.native_pauseNetwork(a);  // Telegram's background pause
                 dropSockets(cm);                           // and close what is open now
             }
-            watchResumes();
             debugLog("asleep again");
         } catch (Throwable t) {
             fail("sleepTelegram", t);
@@ -418,18 +427,32 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     private static final int CONNECTION_GENERIC_MEDIA = 64;
 
     /**
-     * Any of Telegram's activities resuming (LaunchActivity.onResume, a bubble, the screen coming on) calls
+     * Called once from SecuredUi.install (Application.onCreate, before any activity exists). Two jobs:
+     * <ul>
+     * <li>Any of Telegram's activities resuming (LaunchActivity.onResume, a bubble, the screen coming on) calls
      * setAppPaused(false, ...), which cancels tgnet's pause before its 10 s countdown closes the sockets. While asleep
-     * by our pause, pause again right after that resume has run. tgnet ignores a pause while already paused.
-     * Registered once per process, on the first sleep; afterwards one volatile read per activity resume.
+     * by our pause, pause again right after that resume has run. tgnet ignores a pause while already paused.</li>
+     * <li>HT-8: Telegram's Passport screen resuming or closing (see the section comment).</li>
+     * </ul>
+     * Per activity resume: one instanceof and one volatile read. Posted, so each runs after the activity's own onResume.
      */
-    private void watchResumes() {
-        if (resumeWatch || !(ApplicationLoader.applicationContext instanceof android.app.Application)) return;
-        resumeWatch = true;
-        ((android.app.Application) ApplicationLoader.applicationContext).registerActivityLifecycleCallbacks(new android.app.Application.ActivityLifecycleCallbacks() {
+    void watchActivities(android.app.Application application) {
+        application.registerActivityLifecycleCallbacks(new android.app.Application.ActivityLifecycleCallbacks() {
             @Override
             public void onActivityResumed(@NonNull Activity activity) {
-                if (telegramState == TG_ASLEEP) AndroidUtilities.runOnUIThread(SecuredHooks.this::pauseAgainIfAsleep);
+                if (activity instanceof ExternalActionActivity) {
+                    AndroidUtilities.runOnUIThread(() -> externalActionResumed(activity));
+                } else if (telegramState == TG_ASLEEP) {
+                    AndroidUtilities.runOnUIThread(SecuredHooks.this::pauseAgainIfAsleep);
+                }
+            }
+
+            @Override
+            public void onActivityDestroyed(@NonNull Activity activity) {
+                // Recreated for a config change (font size, split screen): the new instance resumes next, not a close.
+                if (activity instanceof ExternalActionActivity && !activity.isChangingConfigurations()) {
+                    AndroidUtilities.runOnUIThread(SecuredHooks.this::externalActionClosed);
+                }
             }
 
             @Override public void onActivityCreated(@NonNull Activity activity, android.os.Bundle state) {}
@@ -437,9 +460,46 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
             @Override public void onActivityPaused(@NonNull Activity activity) {}
             @Override public void onActivityStopped(@NonNull Activity activity) {}
             @Override public void onActivitySaveInstanceState(@NonNull Activity activity, @NonNull android.os.Bundle out) {}
-            @Override public void onActivityDestroyed(@NonNull Activity activity) {}
         });
     }
+
+    /**
+     * HT-8. Telegram sleeps only with no account, and with no account the Passport intent always shows Telegram's login:
+     * wake Telegram and count the screen as open. Any other ExternalActionActivity (Android's "Manage space" screen) stays
+     * asleep. UI thread. Never throws.
+     */
+    private void externalActionResumed(Activity activity) {
+        try {
+            final Intent intent = activity.getIntent();
+            if (intent != null && PASSPORT_AUTHORIZE.equals(intent.getAction()) && !activity.isFinishing()) {
+                passportScreen = new WeakReference<>(activity);
+                if (telegramAsleep()) wakeTelegram();
+            } else {
+                pauseAgainIfAsleep();
+            }
+        } catch (Throwable t) {
+            fail("externalActionResumed", t);
+        }
+    }
+
+    /**
+     * HT-8: an ExternalActionActivity has closed. Signed in there: run the held push setup now, since Telegram's main tabs
+     * may not open in this process. Otherwise put Telegram back to sleep if nothing else uses it. UI thread. Never throws.
+     */
+    private void externalActionClosed() {
+        try {
+            if (accountActivated()) {
+                releasePush();
+                return;
+            }
+        } catch (Throwable t) {
+            fail("externalActionClosed", t);
+            return;
+        }
+        sleepTelegramIfUnused();
+    }
+
+    private static final String PASSPORT_AUTHORIZE = "org.telegram.passport.AUTHORIZE";
 
     /** Posted after an activity resume: our pause again, only while still asleep by our own pause. Never throws. */
     private void pauseAgainIfAsleep() {
@@ -463,7 +523,8 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
         for (BaseFragment f : telegramScreens.keySet()) {
             if (f != null && f.getParentLayout() != null && !f.isRemovingFromStack()) return true;
         }
-        return false;
+        final Activity passport = passportScreen != null ? passportScreen.get() : null;
+        return passport != null && !passport.isFinishing() && !passport.isDestroyed();
     }
 
     /** Debug builds only: one content-free state line (logcat tag EncrogramHooks) for the device test. */

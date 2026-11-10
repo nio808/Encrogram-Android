@@ -63,6 +63,7 @@ public final class SecuredUi {
         provider = engineProvider;
         hooks = new SecuredHooks();
         EncrogramHooks.install(hooks);
+        hooks.watchActivities(application);
     }
 
     /** The engine, or null when it cannot be created ({@link #engineError()} then says why). */
