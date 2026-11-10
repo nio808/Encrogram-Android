@@ -34,7 +34,8 @@ done
 
 start=$(date +%s)
 status=0
-./gradlew "$@" --max-workers=6 -Pandroid.injected.build.abi=arm64-v8a --console=plain || status=$?
+# The injected ABI makes AGP mark the APK testOnly (a phone refuses to install it from a file); testOnly=false undoes that.
+./gradlew "$@" --max-workers=6 -Pandroid.injected.build.abi=arm64-v8a -Pandroid.injected.testOnly=false --console=plain || status=$?
 end=$(date +%s)
 printf '%s\t%ss\texit=%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$((end - start))" "$status" "$*" >> "$LOG"
 exit $status
