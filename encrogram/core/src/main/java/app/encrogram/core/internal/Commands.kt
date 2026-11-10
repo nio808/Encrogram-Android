@@ -126,6 +126,12 @@ internal object Commands {
     fun getChats(userId: Long): String = "/_get chats $userId"
 
     /**
+     * APIGetChats with pending connections (`pcc=on`, Commands.hs:5442): the chats plus a `contactConnection` row per
+     * connection that has no contact yet (Store/Messages.hs getContactConnectionChatPreviews_). Local only.
+     */
+    fun getChatsWithPending(userId: Long): String = "/_get chats $userId pcc=on"
+
+    /**
      * APIGetChat -> `apiChat`. ChatPagination: `count=N` (CPLast), `before=<id> count=N`, `after=<id> count=N`,
      * `around=<id> count=N` (N before, the item, N after). `search=` must be last: it takes the rest of the line
      * as plain text (no JSON escaping), so it must come from [InputRules.searchQuery].

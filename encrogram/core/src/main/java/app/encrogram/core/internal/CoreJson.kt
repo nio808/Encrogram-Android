@@ -1386,6 +1386,33 @@ internal object CoreJson {
         return CreatedLink(full, short, connId)
     }
 
+    /**
+     * `apiChats` body of [Commands.getChatsWithPending] -> the connection ids of our one-time invites nobody has used
+     * yet. A `contactConnection` chat (JSONChatInfo, Messages.hs:209) holds a PendingContactConnection (Types.hs:1931,
+     * defaultJSON: absent Maybe fields are left out). Ours and unused: made by `/_connect` ([Commands.addContact]:
+     * createDirectConnection with ConnNew and connLinkInv), so status `new` (ConnStatus, Types.hs:1965, a tagged
+     * object) with `connLinkInv`, not via a contact address (`viaContactUri`), our own address
+     * (`viaUserContactLink`) or a group link (`groupLinkId`). A link we joined is `prepared`, `joined` or `sndReady`;
+     * one the other side used is `requested` or later (or a contact by then): never counted.
+     */
+    fun unusedInviteIds(body: JSONObject): List<Long> {
+        val arr = body.optJSONArray("chats") ?: return emptyList()
+        val out = ArrayList<Long>()
+        for (i in 0 until arr.length()) {
+            val info = arr.optJSONObject(i)?.optJSONObject("chatInfo") ?: continue
+            if (info.str("type") != "contactConnection") continue
+            val pcc = info.optJSONObject("contactConnection") ?: continue
+            if (!pcc.has("pccConnId") || pcc.isNull("pccConnId")) continue
+            val connId = pcc.optLong("pccConnId", 0L).takeIf { it > 0L } ?: continue
+            if (tagOf(pcc.opt("pccConnStatus")) != "new") continue
+            if (pcc.optJSONObject("connLinkInv") == null) continue
+            if (pcc.optBoolean("viaContactUri", false)) continue
+            if (present(pcc, "viaUserContactLink") || present(pcc, "groupLinkId")) continue
+            out.add(connId)
+        }
+        return out
+    }
+
     /** `connectionPlan` body -> e.g. "invitationLink.ownLink", "contactAddress.known". */
     fun connectionPlanTag(body: JSONObject): String {
         val plan = body.optJSONObject("connectionPlan") ?: return "unknown"

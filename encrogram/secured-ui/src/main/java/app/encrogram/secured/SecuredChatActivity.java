@@ -314,6 +314,55 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private long unreadDividerBefore = Long.MIN_VALUE;
     /** Live progress from onMediaProgress, so a cell scrolled back into view shows it too. Cleared on each change. */
     private final HashMap<Long, long[]> liveProgress = new HashMap<>();
+    /** HT-5: uptime of the last progress (or of the first sighting of a moving transfer), per message. */
+    private final HashMap<Long, Long> progressAt = new HashMap<>();
+    /**
+     * HT-5: uptime when the network last came back (0: not seen). After a cut, the core's file worker sleeps its retry
+     * back-off before the next piece, up to about 2 minutes (device test 10 November 2026: one 4 MB piece, then 110 s
+     * of nothing). It reports progress only per piece (up to 4 MB), so "8 s without progress" alone would also flag a
+     * healthy slow download: the hint is limited to the window after the network returns.
+     */
+    private long backOnlineAt;
+    private Boolean lastOnline;
+    private static final long STALL_MS = 8000;
+    private static final long RECOVERY_WINDOW_MS = 3 * 60_000;
+    private final Runnable stallCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed) return;
+            updateStalls();
+            AndroidUtilities.runOnUIThread(this, 2000);
+        }
+    };
+
+    /** Visible moving media cells: "Waiting for network…" offline; "Connecting…" while a transfer waits after the network returned. */
+    private void updateStalls() {
+        if (listView == null || engine == null) return;
+        final boolean online = engine.isOnline();
+        final long now = android.os.SystemClock.uptimeMillis();
+        if (online && Boolean.FALSE.equals(lastOnline)) backOnlineAt = now;
+        lastOnline = online;
+        for (int i = 0; i < listView.getChildCount(); i++) {
+            final View child = listView.getChildAt(i);
+            if (!(child instanceof SecuredMediaCell)) continue;
+            final SecuredMediaCell cell = (SecuredMediaCell) child;
+            final SecuredMessage m = cell.message();
+            final SecuredMedia media = m != null ? m.getMedia() : null;
+            final boolean moving = media != null && (media.getState() == MediaState.DOWNLOADING || media.getState() == MediaState.UPLOADING);
+            if (!moving) {
+                cell.setStall(SecuredMediaCell.STALL_NONE);
+                continue;
+            }
+            Long since = progressAt.get(m.getMessageId());
+            if (since == null) {
+                since = now;
+                progressAt.put(m.getMessageId(), since);
+            }
+            final boolean recovering = backOnlineAt > 0 && now - backOnlineAt < RECOVERY_WINDOW_MS;
+            final boolean stalled = backOnlineAt > since || (recovering && now - since >= STALL_MS);
+            cell.setStall(!online ? SecuredMediaCell.STALL_WAITING : stalled ? SecuredMediaCell.STALL_CONNECTING : SecuredMediaCell.STALL_NONE);
+        }
+    }
 
     private final Runnable hideFloatingDate = () -> showFloatingDate(false);
 
@@ -349,6 +398,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         @Override
         public void onConnectionChanged(boolean online) {
             updateHeader();
+            updateStalls();
         }
 
         @Override
@@ -382,6 +432,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             // A new media state carries its own byte count: forget the live one.
             final long id = message.getMessageId();
             liveProgress.remove(id);
+            progressAt.remove(id);
             final int idx = indexOf(id);
             if (idx >= 0 && messages.get(idx).getMedia() != null && (message.getDeleted() || message.getMedia() == null)) {
                 // Deleted for everyone (or its file withdrawn): close what still shows or plays it.
@@ -404,6 +455,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             if (cid != chatId || destroyed) return;
             // Redraws the one visible cell; the list is not rebuilt per step (contract: onMediaProgress).
             liveProgress.put(messageId, new long[]{transferredBytes, totalBytes});
+            progressAt.put(messageId, android.os.SystemClock.uptimeMillis());
             final SecuredMediaCell cell = mediaCellFor(messageId);
             if (cell != null) cell.setProgress(transferredBytes, totalBytes);
         }
@@ -468,6 +520,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         // Media: stop the player and the viewer (both release their decrypted playback), drop prepared attachments
         // and the in-memory bitmaps.
         SecuredMediaViewer.closeAll();
+        AndroidUtilities.cancelRunOnUIThread(stallCheck);
         if (audio != null) audio.release();
         if (attach != null) attach.destroy();
         if (bitmaps != null) bitmaps.clear();
@@ -1916,7 +1969,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         final Context context = getContext();
         if (context == null) return;
         final String reason = e != null ? e.getMessage() : context.getString(R.string.sec_engine_failed_unknown);
-        Toast.makeText(context, context.getString(R.string.sec_send_failed, reason), Toast.LENGTH_LONG).show();
+        final String text = context.getString(R.string.sec_send_failed, reason);
+        if (destroyed || getParentActivity() == null) {
+            Toast.makeText(context, text, Toast.LENGTH_LONG).show();   // screen gone: the system toast still says it
+            return;
+        }
+        // H13: Telegram's error bulletin, not a system toast (which carries the app icon, a link symbol).
+        BulletinFactory.of(this).createErrorBulletin(text, chatResources).show();
     }
 
     // ---- engine actions --------------------------------------------------------------------------------------
@@ -2366,11 +2425,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         final int hit = cell.hitTest(x, y);
         if (hit == SecuredMediaCell.HIT_NONE) return;
         if (hit == SecuredMediaCell.HIT_LINK) {
-            // Same rule as a link in a text bubble (didPressUrl): only plain web links, and only after asking.
-            final CharacterStyle url = cell.pressedLink();
-            if (!(url instanceof URLSpan) || url instanceof URLSpanNoUnderline) return;
-            final String tapped = ((URLSpan) url).getURL();
-            if (!openSecuredLink(tapped)) confirmOpenLink(tapped);
+            openCaptionLink(cell.pressedLink());
             return;
         }
         if (hit == SecuredMediaCell.HIT_QUOTE) {
@@ -2405,6 +2460,13 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         }
     }
 
+    /** Same rule as a link in a text bubble (didPressUrl): only plain web links, and only after asking. Also used by the viewer's caption. */
+    private void openCaptionLink(CharacterStyle url) {
+        if (destroyed || !(url instanceof URLSpan) || url instanceof URLSpanNoUnderline) return;
+        final String tapped = ((URLSpan) url).getURL();
+        if (!openSecuredLink(tapped)) confirmOpenLink(tapped);
+    }
+
     private void openMedia(SecuredMediaCell cell, SecuredMessage m, int hit) {
         final SecuredMedia media = m.getMedia();
         if (media == null || !media.getReadable()) return;
@@ -2412,7 +2474,9 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
             case IMAGE:
             case GIF:
             case VIDEO:
-                SecuredMediaViewer.open(this, engine, bitmaps, m, authorOf(m), chatResources);
+                SecuredMediaViewer.open(this, engine, bitmaps, m, authorOf(m), chatResources,
+                        m.getText().isEmpty() ? null : objectFor(captionOf(m)).messageText,   // same strict-mapper text as the bubble
+                        url -> openCaptionLink(url));
                 break;
             case VOICE: {
                 final SecuredAudioPlayer player = mediaHost.audio();
@@ -2451,7 +2515,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
     private void showMediaNote(String text) {
         final Context c = getContext();
         if (c == null || destroyed || text == null) return;
-        BulletinFactory.of(this).createSimpleBulletin(org.telegram.messenger.R.raw.chats_infotip, text).show();
+        BulletinFactory.of(this).createErrorBulletin(text, chatResources).show();   // Telegram's error icon, not the link-like info tip
     }
 
     // ---- message cell delegate: every click is ours ----------------------------------------------------------
@@ -3795,6 +3859,8 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         SecuredBackground.setOpenChat(chatId);
         SecuredBackground.clearChat(chatId);
         updateHeader();
+        AndroidUtilities.cancelRunOnUIThread(stallCheck);
+        AndroidUtilities.runOnUIThread(stallCheck, 2000);
     }
 
     @Override
@@ -3804,6 +3870,7 @@ public class SecuredChatActivity extends BaseFragment implements SecuredScreen {
         saveDraft();
         if (audio != null) audio.pause();
         SecuredMediaViewer.pauseAll();
+        AndroidUtilities.cancelRunOnUIThread(stallCheck);
         if (emojiPanel != null) emojiPanel.dismissPopups();
         if (voice != null) voice.onPause();
         AndroidUtilities.removeAdjustResize(getParentActivity(), classGuid);

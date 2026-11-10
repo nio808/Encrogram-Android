@@ -83,6 +83,11 @@ final class ChatRowMapper {
         boolean muted;
         int unread;
         int dateSeconds;
+        /**
+         * H10: {@link #message} is a real message or group event, so the time means "sent or received at". False for status
+         * lines (no messages yet, connecting, paused, invitation) and drafts: TalkBack then reads no time.
+         */
+        boolean timed;
         boolean archived;
         /** Saved Messages: Telegram's saved-messages avatar, no lock badge, no unread count, no "You:" and no tick. */
         boolean saved;
@@ -96,7 +101,7 @@ final class ChatRowMapper {
         /** Same everything: the chat list's DiffUtil leaves such a row alone (H2/P1). */
         boolean sameAs(Row o) {
             return o != null && chatId == o.chatId && outgoing == o.outgoing && tick == o.tick && pinned == o.pinned
-                    && muted == o.muted && unread == o.unread && dateSeconds == o.dateSeconds && archived == o.archived
+                    && muted == o.muted && unread == o.unread && dateSeconds == o.dateSeconds && timed == o.timed && archived == o.archived
                     && saved == o.saved && group == o.group && invited == o.invited && channel == o.channel
                     && (avatar == o.avatar || (avatar != null && avatar.equals(o.avatar)))
                     && java.util.Objects.equals(name, o.name) && java.util.Objects.equals(message, o.message);
@@ -132,10 +137,12 @@ final class ChatRowMapper {
             r.message = labels.connecting;
         } else if (text == null && c.getLastEvent() != null && labels.events != null) {
             r.message = labels.events.text(c.getLastEvent(), c.getKind());
+            r.timed = c.getLastMessageTimeMs() > 0;
         } else if (text == null) {
             r.message = labels.noMessages;
         } else {
             r.message = text;
+            r.timed = c.getLastMessageTimeMs() > 0;
             r.outgoing = c.getLastMessageOutgoing() && !r.saved;
             if (r.outgoing) {
                 r.tick = tickFor(c.getLastMessageStatus());
@@ -150,6 +157,7 @@ final class ChatRowMapper {
             r.message = SecuredUi.draftLabel() + draft.text.replace('\n', ' ');
             r.outgoing = false;
             r.tick = Tick.NONE;
+            r.timed = false;
         }
         return r;
     }
@@ -229,15 +237,16 @@ final class ChatRowMapper {
         check(bad, "failed: error tick", r.tick == Tick.FAILED);
 
         r = map(new ChatSummary(1, "Ann", "hi", 1000, 1, false, true, false, MessageStatus.DELIVERED, false, false, false, null), labels, now);
-        check(bad, "incoming: no tick, no You:", !r.outgoing && r.tick == Tick.NONE);
+        check(bad, "incoming: no tick, no You:", !r.outgoing && r.tick == Tick.NONE && r.timed);
         r = map(new ChatSummary(1, "Ann", "hi", 1000, 1, false, true, true, MessageStatus.RECEIVED, false, false, false, null), labels, now);
         check(bad, "RECEIVED never ticks", r.tick == Tick.NONE);
 
         r = map(new ChatSummary(2, "Bob", "secret", 0, 0, true, false, true, MessageStatus.SENDING, false, false, false, null), labels, now);
-        check(bad, "not ready: Connecting…, no preview text, no tick", "Connecting…".equals(r.message) && !r.outgoing && r.tick == Tick.NONE);
+        check(bad, "not ready: Connecting…, no preview text, no tick", "Connecting…".equals(r.message) && !r.outgoing && r.tick == Tick.NONE && !r.timed);
         check(bad, "no time: uses now", r.dateSeconds == (int) (now / 1000L));
         r = map(new ChatSummary(3, "Cy", null, 0, 0, false, true, false, null, false, false, true, null), labels, now);
         check(bad, "empty chat text", "No messages yet".equals(r.message) && r.archived);
+        check(bad, "empty chat: no spoken time (H10)", !r.timed);
 
         for (Tick t : Tick.values()) {
             final Row x = new Row();

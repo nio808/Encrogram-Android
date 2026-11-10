@@ -161,7 +161,8 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
             @Override
             public void selectNetwork(int network) {
                 if (network == ChatsSwitcherView.NETWORK_TELEGRAM) {
-                    SecuredUi.openTelegramLogin(SecuredDialogsActivity.this);   // this list stays below: Back returns
+                    // HT-2: ask first; only "Sign in" opens the login (this list stays below: Back returns).
+                    SecuredUi.askTelegramLogin(SecuredDialogsActivity.this);
                 }
             }
 
@@ -402,6 +403,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
     public void onBecomeFullyVisible() {
         super.onBecomeFullyVisible();
         Kit.reassertSecure(getParentActivity());
+        if (host == null) SecuredUi.telegramMaybeSleep();   // HT-2: back from Telegram's login, nothing uses Telegram
     }
 
     // FLAG_SECURE stays through onPause (Home, Recents snapshot); dropped when covered, on the Telegram tab, or gone.
@@ -607,6 +609,7 @@ public class SecuredDialogsActivity extends BaseFragment implements MainTabsActi
         nameInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         nameInput.setSingleLine(true);
         nameInput.setMaxLines(1);
+        nameInput.setFilters(new android.text.InputFilter[]{Kit.nameLengthFilter()});   // H8: 50 characters, capped while typing
         nameInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         nameInput.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING); // keyboard doesn't learn Secured names
         nameInput.setPadding(dp(16), dp(12), dp(16), dp(12));

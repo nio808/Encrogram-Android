@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import app.encrogram.core.background.BackgroundState
 import app.encrogram.core.background.SecuredNotifier
 import app.encrogram.core.api.BackupInfo
 import app.encrogram.core.api.BackupState
@@ -360,7 +361,7 @@ internal class SimplexSecuredEngine internal constructor(
 
     override fun updateProfile(displayName: String, callback: SecuredCallback<SecuredProfile>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        val name = validName(displayName) ?: return@post err(callback, nameError())
+        val name = validName(displayName) ?: return@post err(callback, nameError(displayName))
         val local = activeProfileJson() ?: return@post err(callback, ErrorMapper.engine("active_user"))
         // Read-modify-write: the core replaces the whole profile (G4). Our preferences ride along.
         val update = CoreJson.profileUpdate(local, name) ?: return@post ok(callback, profileOf(local))
@@ -462,7 +463,7 @@ internal class SimplexSecuredEngine internal constructor(
                 when (LinkChecker.check(link, config.allowedHosts, config.smpServers)) {
                     // On our relay the short link drops the relay's port and key hash (?p=..&c=..): checkLink and
                     // connect put them back for our relays. Kept full unless the short form checks the same way.
-                    LinkCheck.Approved -> ok(callback, SecuredInvite(compactInvite(link)))
+                    LinkCheck.Approved -> ok(callback, SecuredInvite(compactInvite(link), created.pendingConnId ?: 0L))
                     else -> {
                         // Never hand out an invite that would bring a contact to a server we don't run.
                         SecuredLog.e(Ev.INVITE_REFUSED)
@@ -475,6 +476,51 @@ internal class SimplexSecuredEngine internal constructor(
             CoreReply.Invalid -> err(callback, ErrorMapper.engine("invalid_reply"))
         }
     }
+
+    /** Local only: the core's own list of pending connections ([CoreJson.unusedInviteIds]). */
+    override fun unusedInviteCount(except: SecuredInvite?, callback: SecuredCallback<Int>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val ids = unusedInvites(except, callback) ?: return@post
+        ok(callback, ids.size)
+    }
+
+    /**
+     * `/_delete :<id>` for each unused invite: the core deletes the row now and the queue on our relay in the background
+     * (APIDeleteChat, Commands.hs:1332, deleteAgentConnectionAsync), so the link stops working. One that became a
+     * contact since the list was read is no longer a pending connection and is refused by the core (not counted).
+     */
+    override fun revokeUnusedInvites(except: SecuredInvite?, callback: SecuredCallback<Int>) = post(callback) {
+        if (!ensureRunning(callback)) return@post
+        val ids = unusedInvites(except, callback) ?: return@post
+        var revoked = 0
+        for (id in ids) {
+            val r = send(Commands.deletePendingConnection(id), expected = setOf("pendingConnectionNotFound"))
+            if (r is CoreReply.Result && r.type == "contactConnectionDeleted") revoked++
+        }
+        SecuredLog.i(Ev.CHAT_ACTION, "invites_revoked", revoked)
+        if (revoked < ids.size) SecuredLog.w(Ev.CHAT_ACTION, "invites_not_revoked", ids.size - revoked)
+        ok(callback, revoked)
+    }
+
+    /** Engine thread, RUNNING: the connection ids of our unused one-time invites but [except]'s, or null (error sent). */
+    private fun <T> unusedInvites(except: SecuredInvite?, callback: SecuredCallback<T>): List<Long>? =
+        when (val r = send(Commands.getChatsWithPending(userId))) {
+            is CoreReply.Result ->
+                if (r.type == "apiChats") {
+                    CoreJson.unusedInviteIds(r.body).filter { except == null || except.id <= 0L || it != except.id }
+                } else {
+                    err(callback, unexpected(r))
+                    null
+                }
+            is CoreReply.Error -> {
+                err(callback, ErrorMapper.fromCore(r.error, Op.INVITE))
+                null
+            }
+            CoreReply.Invalid -> {
+                err(callback, ErrorMapper.engine("invalid_reply"))
+                null
+            }
+        }
 
     override fun checkLink(link: String): LinkCheck =
         LinkChecker.check(LinkChecker.expand(link, config.smpServers), config.allowedHosts, config.smpServers)
@@ -502,6 +548,11 @@ internal class SimplexSecuredEngine internal constructor(
             LinkCheck.Approved -> Unit
         }
         val normalized = analysis.normalized ?: return@post err(callback, ErrorMapper.invalidLink())
+        // A cut-off key never opens the link's data, and asking for the plan of a one-time invite already uses it up (H4).
+        if (LinkChecker.hasDamagedKey(normalized)) {
+            SecuredLog.w(Ev.CONNECT_REFUSED, "damaged_key")
+            return@post err(callback, ErrorMapper.damagedLink())
+        }
         // Always ask for the plan first, and connect only on its verdict (ConnectPlan): the request a short link holds
         // must be on our relay too, our own invite would connect us to ourselves (the core proceeds on ownLink), and
         // group links are joined with exactly the checked request. No plan, no connect: a short link we couldn't
@@ -848,7 +899,7 @@ internal class SimplexSecuredEngine internal constructor(
     /** `/_group` with history and full delete on; a channel also carries our marker (CoreJson.CHANNEL_MARKER_PREF). */
     override fun createGroup(name: String, channel: Boolean, callback: SecuredCallback<Long>) = post(callback) {
         if (!ensureRunning(callback)) return@post
-        val groupName = validName(name) ?: return@post err(callback, nameError())
+        val groupName = validName(name) ?: return@post err(callback, nameError(name))
         when (val r = send(Commands.newGroup(userId, CoreJson.newGroupProfile(groupName, channel)))) {
             is CoreReply.Result -> {
                 val groupId = if (r.type == "groupCreated") CoreJson.createdGroupId(r.body) else null
@@ -3087,6 +3138,8 @@ internal class SimplexSecuredEngine internal constructor(
             lastAutoSync.clear()
             syncRechecks.clear()
             val files = SecuredReset.deleteTree(dataDir)
+            // The background flag lived in that folder: its in-memory copy goes too (H11).
+            BackgroundState.forget()
             backupStore.forget()
             val key = DbKeyStore(appContext).wipe()
             SecuredNotifier.clearAll(appContext)
@@ -3283,7 +3336,7 @@ internal class SimplexSecuredEngine internal constructor(
             EngineState.RUNNING -> return err(callback, SecuredError(SecuredError.Kind.ENGINE, "A Secured profile already exists."))
             else -> return err(callback, ErrorMapper.notRunning(state))
         }
-        val displayName = validName(name) ?: return err(callback, nameError())
+        val displayName = validName(name) ?: return err(callback, nameError(name))
         // A restore marker that couldn't be cleared would wipe this new profile at the next start.
         if (!clearRestoreMarker()) {
             SecuredLog.e(Ev.RESTORE_FAILED, "marker_clear")
@@ -3315,14 +3368,15 @@ internal class SimplexSecuredEngine internal constructor(
         }
     }
 
-    /** The trimmed name, or null. The core counts characters (code points): mkValidName keeps at most 50. */
-    private fun validName(name: String): String? {
-        val displayName = name.trim()
-        val nameLength = displayName.codePointCount(0, displayName.length)
-        return if (nameLength == 0 || nameLength > MAX_NAME_CHARS) null else displayName
-    }
+    /**
+     * [name] as it is sent ([InputRules.cleanName]: trimmed, spaces one each), or null when the core would refuse it:
+     * profile and group names alike go through its checkValidName (mkValidName, at most 50 code points). [nameError]
+     * says why, in a fixed sentence.
+     */
+    private fun validName(name: String): String? = InputRules.cleanName(name).takeIf { ErrorMapper.nameRefusal(it) == null }
 
-    private fun nameError() = ErrorMapper.invalid("Enter a name of 1 to $MAX_NAME_CHARS characters.")
+    private fun nameError(name: String): SecuredError =
+        ErrorMapper.nameRefusal(InputRules.cleanName(name)) ?: ErrorMapper.invalid(ErrorMapper.NAME_LENGTH)
 
     /** The active user's LocalProfile JSON as stored now (`/u`), or null. */
     private fun activeProfileJson(): JSONObject? {
@@ -4619,8 +4673,6 @@ internal class SimplexSecuredEngine internal constructor(
          * runs either way.
          */
         const val TELL_CORE_OFFLINE = true
-        /** Commands.hs mkValidName keeps at most 50 characters (code points) of a display name. */
-        const val MAX_NAME_CHARS = 50
         /** Local-only archive flags ([ArchiveStore]), next to the databases. */
         const val ARCHIVE_FILE = "archived_chats"
 

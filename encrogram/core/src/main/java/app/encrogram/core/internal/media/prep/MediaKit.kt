@@ -67,7 +67,10 @@ internal fun interface Preparer {
     fun prepare(input: MediaInput): Prepared
 }
 
-/** Why preparing failed: maps to SecuredError kinds TOO_LARGE, UNSUPPORTED or STORAGE, or a generic failure. */
+/**
+ * Why preparing failed: maps to SecuredError kinds TOO_LARGE, UNSUPPORTED or STORAGE, or a generic failure. EMPTY: the
+ * picked item has no bytes at all (picking it again can't help, unlike UNREADABLE).
+ */
 internal class PrepException(val reason: Reason) : Exception(reason.name) {
-    enum class Reason { TOO_LARGE, UNSUPPORTED, STORAGE, UNREADABLE, CANCELLED }
+    enum class Reason { TOO_LARGE, UNSUPPORTED, STORAGE, UNREADABLE, CANCELLED, EMPTY }
 }

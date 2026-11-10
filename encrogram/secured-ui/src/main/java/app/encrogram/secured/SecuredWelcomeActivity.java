@@ -25,6 +25,13 @@ final class SecuredWelcomeActivity extends BaseFragment implements SecuredScreen
         return SecuredResourcesProvider.get();
     }
 
+    /** HT-2: back from Telegram's login without signing in: Telegram goes back to sleep. */
+    @Override
+    public void onBecomeFullyVisible() {
+        super.onBecomeFullyVisible();
+        SecuredUi.telegramMaybeSleep();
+    }
+
     @Override
     public View createView(Context context) {
         hasOwnBackground = true;

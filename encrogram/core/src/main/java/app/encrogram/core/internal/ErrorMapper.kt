@@ -15,6 +15,8 @@ internal object ErrorMapper {
     const val NETWORK = "Can't reach the Secured server. Check your internet connection and try again."
     const val LINK_USED = "This invite link was already used or has expired. Ask for a new one."
     const val LINK_INVALID = "This isn't a valid Secured invite link."
+    /** A short link whose key is cut off ([LinkChecker.hasDamagedKey]), or link data its key can't open (H4). */
+    const val LINK_DAMAGED = "This link is damaged or incomplete. Ask for a new one."
     const val CHAT_GONE = "This chat is no longer available."
     const val MESSAGE_GONE = "This message is no longer available."
     const val TOO_LONG = "The message is too long."
@@ -93,6 +95,30 @@ internal object ErrorMapper {
     /** Malformed input from the UI (empty, too long, bad page). */
     fun invalid(message: String): SecuredError = SecuredError(Kind.UNKNOWN, message)
 
+    // ---- display names: profile and group names (H8, InputRules.mkValidName) ----
+    const val NAME_LENGTH = "Enter a name of 1 to ${InputRules.MAX_NAME_CHARS} characters."
+    const val NAME_PROHIBITED = "Names can't contain these characters: . , ; / \\ # @ ' \" ` ~"
+    const val NAME_START = "Names must start with a letter, number or emoji."
+    const val NAME_PUNCTUATION = "Names can't have two punctuation marks in a row."
+    const val NAME_EMOJI = "Names can't use emoji with skin tones or combined emoji."
+    const val NAME_OTHER = "Names can't contain brackets, quotation marks or some other symbols."
+
+    /**
+     * Null when the core takes [name] (already [InputRules.cleanName]d) as it is; else why not, as a fixed sentence.
+     * The core refuses any name its mkValidName would change (checkValidName). Never echoes the name.
+     */
+    fun nameRefusal(name: String): SecuredError? {
+        val length = name.codePointCount(0, name.length)
+        if (length == 0 || length > InputRules.MAX_NAME_CHARS) return invalid(NAME_LENGTH)
+        return when (InputRules.nameProblem(name) ?: return null) {
+            InputRules.NameProblem.PROHIBITED -> invalid(NAME_PROHIBITED)
+            InputRules.NameProblem.START -> invalid(NAME_START)
+            InputRules.NameProblem.PUNCTUATION -> invalid(NAME_PUNCTUATION)
+            InputRules.NameProblem.EMOJI -> invalid(NAME_EMOJI)
+            InputRules.NameProblem.OTHER -> invalid(NAME_OTHER)
+        }
+    }
+
     fun chatGone(): SecuredError = SecuredError(Kind.ENGINE, CHAT_GONE)
 
     fun messageGone(): SecuredError = SecuredError(Kind.ENGINE, MESSAGE_GONE)
@@ -105,6 +131,8 @@ internal object ErrorMapper {
         SecuredError(Kind.UNAPPROVED_RELAY, "This link points to a server outside Encrogram ($host). Ask your contact for a new Encrogram invite.")
 
     fun invalidLink(): SecuredError = SecuredError(Kind.INVALID_LINK, LINK_INVALID)
+
+    fun damagedLink(): SecuredError = SecuredError(Kind.INVALID_LINK, LINK_DAMAGED)
 
     fun ownLink(): SecuredError = SecuredError(Kind.OWN_LINK, OWN_LINK)
 
@@ -183,6 +211,13 @@ internal object ErrorMapper {
                 else -> engine(e.tag)
             }
             "CONN" -> if (op == Op.CONNECT) SecuredError(Kind.INVALID_LINK, LINK_USED) else engine(e.tag)
+            // On a link: the link's data can't be decrypted with its key (A_CRYPTO), or its hash, signature or address
+            // don't match the link (A_LINK) (simplexmq Crypto/ShortLink.hs decryptLinkData, Agent.hs getConnShortLink').
+            // Only a cut-off or altered link does that.
+            "AGENT" -> when (e.subDetail) {
+                "A_CRYPTO", "A_LINK" -> if (op == Op.CONNECT) damagedLink() else engine(e.tag)
+                else -> engine(e.tag)
+            }
             else -> engine(e.tag)
         }
     }
@@ -313,6 +348,8 @@ internal object ErrorMapper {
     const val MEDIA_DAMAGED = "This file arrived damaged. Ask the sender to send it again."
     const val MEDIA_OPEN_FAILED = "This file couldn't be opened."
     const val MEDIA_UNREADABLE = "This file couldn't be read. Pick it again."
+    /** The picked photo or file has no bytes at all (H7). */
+    const val MEDIA_EMPTY = "This file is empty."
     const val MEDIA_TOO_LARGE_TO_PREPARE = "This file is too large for this phone to prepare. Try sending it as a file."
     const val MEDIA_REPLY_TOO_LONG = "This caption is too long for a reply. Shorten it, or send it without the quote."
 

@@ -120,7 +120,8 @@ final class SecuredDialogCell extends DialogCell {
     /**
      * DialogCell builds its TalkBack text from Telegram user and chat objects, which a CustomDialog does not have, so
      * it would read only the unread count. Same order and Telegram strings, from the row: kind and name, muted,
-     * unread, sent or received time, then the preview ("Name: text" for groups; "You" only through the sent string).
+     * unread, sent or received time (only for a real message), then the preview ("Name: text" for groups; "You" only
+     * through the sent string). An empty chat reads "Name. No messages yet".
      */
     @Override
     public void onPopulateAccessibilityEvent(android.view.accessibility.AccessibilityEvent event) {
@@ -150,9 +151,12 @@ final class SecuredDialogCell extends DialogCell {
             if (r.muted) sb.append(LocaleController.getString(R.string.AccDescrNotificationsMuted)).append(". ");
             if (r.unread > 0) sb.append(LocaleController.formatPluralString("NewMessages", r.unread)).append(". ");
             if (r.message != null && !r.message.isEmpty()) {
-                final String date = LocaleController.formatDateAudio(r.dateSeconds, true);
-                sb.append(LocaleController.formatString(r.outgoing ? "AccDescrSentDate" : "AccDescrReceivedDate",
-                        r.outgoing ? R.string.AccDescrSentDate : R.string.AccDescrReceivedDate, date)).append(". ");
+                // H10: a status line ("No messages yet", "Connecting…") or a draft has no message time to read.
+                if (r.timed) {
+                    final String date = LocaleController.formatDateAudio(r.dateSeconds, true);
+                    sb.append(LocaleController.formatString(r.outgoing ? "AccDescrSentDate" : "AccDescrReceivedDate",
+                            r.outgoing ? R.string.AccDescrSentDate : R.string.AccDescrReceivedDate, date)).append(". ");
+                }
                 sb.append(r.message);
             }
         }

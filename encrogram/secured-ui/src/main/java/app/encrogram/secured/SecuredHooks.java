@@ -67,6 +67,7 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
 
     @Override
     public BaseFragment wrapChats(DialogsActivity chats) {
+        telegramUsedHere = true;   // Telegram's main tabs exist only with an account: never put it back to sleep in this process
         try {
             final EncrogramChatsHost host = new EncrogramChatsHost(chats);
             host.setOnDestroy(() -> release(chats));
@@ -217,6 +218,15 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     // waits. Opening Telegram's intro or login screen wakes it with the call Telegram makes when the network returns.
     // With a Telegram account the state is "awake" from the first call, and every hook below returns Telegram's own
     // behaviour unchanged.
+    //
+    // Back to sleep (HT-2): only after a wake from "asleep" in this process. When a Secured root screen is fully visible
+    // again, or the login screen we opened has closed, and no Telegram account is activated, no login is half done and
+    // no Telegram intro or login screen is in any stack, the state goes back to "asleep". Then, per account, the network
+    // layer is told "no network" (checkConnection: no new socket, no reconnect, no request sent, no DNS-over-HTTPS task
+    // started, since onRequestNewServerIpAndPort reads isNetworkOnline too) and gets Telegram's own background pause
+    // (native_pauseNetwork), and every open connection is closed at once (dropSockets). "No network" alone would leave an
+    // open socket alive: tgnet keeps pinging it. Once Telegram's main tabs have
+    // existed in this process (an account was used), it never sleeps again. Anything throwing: awake, as Telegram.
 
     private static final int TG_UNDECIDED = 0;
     private static final int TG_ASLEEP = 1;
@@ -225,6 +235,12 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     private final Object telegramLock = new Object();
     private volatile int telegramState = TG_UNDECIDED;
     private Runnable heldPush;   // guarded by telegramLock
+    private volatile boolean wokenFromSleep;    // a wake from "asleep" happened here: only then may it sleep again
+    private volatile boolean telegramUsedHere;  // Telegram's main tabs were built: an account is in use, stay awake
+    private boolean pausedByUs;                 // guarded by telegramLock: tgnet got native_pauseNetwork from us
+    private boolean resumeWatch;                // UI thread: the activity-resumed callback below is registered
+    // Telegram intro and login screens presented in this process (weak keys: closed ones disappear). UI thread only.
+    private final Map<BaseFragment, Boolean> telegramScreens = new WeakHashMap<>();
 
     @Override
     public boolean keepTelegramOffline() {
@@ -250,8 +266,9 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
     @Override
     public void willPresentFragment(BaseFragment fragment) {
         try {
-            if (telegramState != TG_AWAKE && (fragment instanceof IntroActivity || fragment instanceof LoginActivity)) {
-                wakeTelegram();
+            if (fragment instanceof IntroActivity || fragment instanceof LoginActivity) {
+                telegramScreens.put(fragment, Boolean.TRUE);   // HT-2: never sleep while one of these is on screen
+                if (telegramState != TG_AWAKE) wakeTelegram();
             }
         } catch (Throwable t) {
             fail("willPresentFragment", t);
@@ -294,6 +311,7 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
 
     private void wakeTelegram() {
         final Runnable push;
+        final boolean unpause;
         synchronized (telegramLock) {
             final boolean wasAsleep = telegramState == TG_ASLEEP;
             telegramState = TG_AWAKE;
@@ -302,15 +320,130 @@ final class SecuredHooks implements EncrogramHooks.Hooks {
             if (!wasAsleep) {
                 return;
             }
+            wokenFromSleep = true;
+            unpause = pausedByUs;
+            pausedByUs = false;
         }
         debugLog("woken");
         // Telegram's own reaction to "network is back": each account re-reads isNetworkOnline and reconnects.
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-            ConnectionsManager.getInstance(a).checkConnection();
+            final ConnectionsManager cm = ConnectionsManager.getInstance(a);
+            cm.checkConnection();
+            if (unpause) {
+                // Undo our pause the way Telegram does when the screen comes on: resumed if the app is in the foreground
+                // for that account, paused again otherwise (Telegram's own count of resumed screens decides).
+                cm.setAppPaused(false, true);
+            }
         }
         if (push != null) {
             push.run();   // Telegram's initPushServices, now unheld
         }
+    }
+
+    /**
+     * HT-2: called when a Secured root screen is fully visible again and when the Telegram login screen we opened has
+     * closed. Puts Telegram back to sleep only when it was woken from sleep here and nothing uses it; see the section
+     * comment. UI thread. Never throws.
+     */
+    void sleepTelegramIfUnused() {
+        try {
+            if (telegramState != TG_AWAKE || !wokenFromSleep || telegramUsedHere) return;   // volatile reads: cheap
+            if (telegramScreenOpen() || telegramInUse()) return;
+        } catch (Throwable t) {
+            fail("sleepTelegram", t);   // unsure: stay awake
+            return;
+        }
+        synchronized (telegramLock) {
+            if (telegramState != TG_AWAKE || telegramUsedHere) return;
+            telegramState = TG_ASLEEP;   // isNetworkOnline answers false from here on
+            pausedByUs = true;           // set first: a failure below wakes and unpauses
+        }
+        try {
+            for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                final ConnectionsManager cm = ConnectionsManager.getInstance(a);
+                cm.checkConnection();                      // "no network": no new socket, no DNS fallback
+                ConnectionsManager.native_pauseNetwork(a);  // Telegram's background pause
+                dropSockets(cm);                           // and close what is open now
+            }
+            watchResumes();
+            debugLog("asleep again");
+        } catch (Throwable t) {
+            fail("sleepTelegram", t);
+            try {
+                wakeTelegram();   // back to exactly Telegram's behaviour
+            } catch (Throwable t2) {
+                fail("sleepTelegram.undo", t2);
+            }
+        }
+    }
+
+    /**
+     * Closes every open Telegram connection now, with Telegram's own discardConnection (tgnet suspends it; with "no
+     * network" set first, Connection::connect refuses to reopen it). The pause alone isn't enough: tgnet skips its sleep
+     * while a salt or file request is pending, and a request can't finish once the network reads as off, so the login's
+     * sockets stayed open (device test, 10 November 2026). Production DCs 1-5, every connection kind and slot.
+     */
+    private static void dropSockets(ConnectionsManager cm) {
+        final int[] single = {ConnectionsManager.ConnectionTypeGeneric, CONNECTION_GENERIC_MEDIA, CONNECTION_TEMP,
+                ConnectionsManager.ConnectionTypePush};
+        for (int dc = 1; dc <= 5; dc++) {
+            for (int type : single) cm.discardConnection(dc, type);
+            for (int n = 0; n < 8; n++) cm.discardConnection(dc, ConnectionsManager.ConnectionTypeDownload | (n << 16));
+            for (int n = 0; n < 4; n++) cm.discardConnection(dc, ConnectionsManager.ConnectionTypeUpload | (n << 16));
+        }
+    }
+
+    // tgnet Defines.h ConnectionType values with no Java constant.
+    private static final int CONNECTION_TEMP = 16;
+    private static final int CONNECTION_GENERIC_MEDIA = 64;
+
+    /**
+     * Any of Telegram's activities resuming (LaunchActivity.onResume, a bubble, the screen coming on) calls
+     * setAppPaused(false, ...), which cancels tgnet's pause before its 10 s countdown closes the sockets. While asleep
+     * by our pause, pause again right after that resume has run. tgnet ignores a pause while already paused.
+     * Registered once per process, on the first sleep; afterwards one volatile read per activity resume.
+     */
+    private void watchResumes() {
+        if (resumeWatch || !(ApplicationLoader.applicationContext instanceof android.app.Application)) return;
+        resumeWatch = true;
+        ((android.app.Application) ApplicationLoader.applicationContext).registerActivityLifecycleCallbacks(new android.app.Application.ActivityLifecycleCallbacks() {
+            @Override
+            public void onActivityResumed(@NonNull Activity activity) {
+                if (telegramState == TG_ASLEEP) AndroidUtilities.runOnUIThread(SecuredHooks.this::pauseAgainIfAsleep);
+            }
+
+            @Override public void onActivityCreated(@NonNull Activity activity, android.os.Bundle state) {}
+            @Override public void onActivityStarted(@NonNull Activity activity) {}
+            @Override public void onActivityPaused(@NonNull Activity activity) {}
+            @Override public void onActivityStopped(@NonNull Activity activity) {}
+            @Override public void onActivitySaveInstanceState(@NonNull Activity activity, @NonNull android.os.Bundle out) {}
+            @Override public void onActivityDestroyed(@NonNull Activity activity) {}
+        });
+    }
+
+    /** Posted after an activity resume: our pause again, only while still asleep by our own pause. Never throws. */
+    private void pauseAgainIfAsleep() {
+        try {
+            synchronized (telegramLock) {
+                if (telegramState != TG_ASLEEP || !pausedByUs) return;
+            }
+            for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                ConnectionsManager.native_pauseNetwork(a);
+            }
+        } catch (Throwable t) {
+            fail("pauseAgain", t);   // still "no network": no new socket either way
+        }
+    }
+
+    /**
+     * A Telegram intro or login screen that is still in a stack and not closing, in any layout (phone, tablet layer or
+     * right pane). Every destroy path clears a fragment's parent layout, so a closed one never counts. UI thread.
+     */
+    private boolean telegramScreenOpen() {
+        for (BaseFragment f : telegramScreens.keySet()) {
+            if (f != null && f.getParentLayout() != null && !f.isRemovingFromStack()) return true;
+        }
+        return false;
     }
 
     /** Debug builds only: one content-free state line (logcat tag EncrogramHooks) for the device test. */

@@ -19,24 +19,48 @@ internal object BackgroundState {
 
     private fun file(context: Context, name: String) = File(context.noBackupFilesDir, "encrogram-secured/$name")
 
-    fun isEnabled(context: Context): Boolean = try {
-        file(context, "background_on").isFile
-    } catch (t: Throwable) {
-        false
+    /**
+     * The flag as this process last read or wrote it; null until then (H11: setEnabled runs on the main thread, on
+     * every Secured screen). The file changes only through this object and "Reset Secured", which deletes the whole
+     * folder and then calls [forget].
+     */
+    @Volatile private var enabled: Boolean? = null
+
+    fun isEnabled(context: Context): Boolean {
+        enabled?.let { return it }
+        return synchronized(this) {
+            enabled ?: try {
+                file(context, "background_on").isFile.also { enabled = it }
+            } catch (t: Throwable) {
+                false
+            }
+        }
     }
 
+    /** Touches the disk only when [value] differs from what this process last knew. */
     fun setEnabled(context: Context, value: Boolean) {
-        try {
-            val f = file(context, "background_on")
-            if (value) {
-                f.parentFile?.mkdirs()
-                f.createNewFile()
-            } else {
-                f.delete()
+        if (enabled == value) return
+        synchronized(this) {
+            if (enabled == value) return
+            try {
+                val f = file(context, "background_on")
+                if (value) {
+                    f.parentFile?.mkdirs()
+                    f.createNewFile()
+                } else {
+                    f.delete()
+                }
+                enabled = value
+            } catch (t: Throwable) {
+                enabled = null
+                SecuredLog.crash(SecuredLog.Ev.BG_START_REFUSED, t)
             }
-        } catch (t: Throwable) {
-            SecuredLog.crash(SecuredLog.Ev.BG_START_REFUSED, t)
         }
+    }
+
+    /** "Reset Secured" deleted the folder with the flag in it: the next call reads or writes the disk again. */
+    fun forget() {
+        synchronized(this) { enabled = null }
     }
 
     @Volatile private var token: String? = null

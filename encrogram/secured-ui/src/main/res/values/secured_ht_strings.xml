@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Harsh-test fixes HT-2 and HT-4 (10 November 2026). Lead-owned: agents use these, never edit them. -->
+<resources>
+    <!-- HT-2: no Telegram account, the user taps the Telegram tab -->
+    <string name="sec_tg_signin_title">Sign in to Telegram?</string>
+    <string name="sec_tg_signin_text">Encrogram will connect to Telegram\'s servers to sign you in. Your Secured chats stay separate and keep working either way.</string>
+    <string name="sec_tg_signin_ok">Sign in</string>
+    <string name="sec_tg_signin_cancel">Not now</string>
+
+    <!-- HT-4: unused one-time invite links, under the new link in the invite sheet -->
+    <plurals name="sec_invite_unused">
+        <item quantity="one">You have 1 other unused invite link. Anyone who has it can still connect with you.</item>
+        <item quantity="other">You have %1$d other unused invite links. Anyone who has them can still connect with you.</item>
+    </plurals>
+    <string name="sec_invite_revoke_others">Revoke unused links</string>
+    <string name="sec_invite_revoke_title">Revoke unused links?</string>
+    <string name="sec_invite_revoke_text">Once revoked, no one can connect with you using them. The link above keeps working.</string>
+    <string name="sec_invite_revoke_ok">Revoke</string>
+    <plurals name="sec_invite_revoked">
+        <item quantity="one">1 link revoked</item>
+        <item quantity="other">%1$d links revoked</item>
+    </plurals>
+</resources>

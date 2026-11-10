@@ -393,7 +393,19 @@ class MediaPreparerTest {
         }
         opener.failure = null
         refused(FakeSource(ByteArray(100), displayName = "a.bin", failRead = true), PrepException.Reason.UNREADABLE)
-        refused(FakeSource(ByteArray(0), displayName = "empty.txt"), PrepException.Reason.UNREADABLE)
+    }
+
+    @Test
+    fun anEmptyPickIsEmptyNotUnreadable() {
+        // H7: no bytes at all, whatever the picker claims; as a file and as a photo.
+        refused(FakeSource(ByteArray(0), displayName = "empty.txt"), PrepException.Reason.EMPTY, asFile = true)
+        refused(FakeSource(ByteArray(0), displayName = "empty.txt"), PrepException.Reason.EMPTY)
+        refused(FakeSource(ByteArray(0), displayName = "a.jpg", mimeType = "image/jpeg"), PrepException.Reason.EMPTY)
+        refused(FakeSource(ByteArray(0), mimeType = "video/mp4", declared = 5000L), PrepException.Reason.EMPTY)
+        refused(FakeSource(ByteArray(0), declared = null), PrepException.Reason.EMPTY, asFile = true)
+        assertTrue(logs.any { it.contains("MEDIA_PREPARE_FAILED") && it.contains("EMPTY") })
+        // One byte is a file.
+        assertEquals(MediaKind.FILE, prepare(FakeSource(ByteArray(1), displayName = "one.bin"), asFile = true).kind)
     }
 
     @Test

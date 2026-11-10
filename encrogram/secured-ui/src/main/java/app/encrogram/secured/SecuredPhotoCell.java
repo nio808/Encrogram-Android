@@ -407,7 +407,7 @@ final class SecuredPhotoCell extends SecuredMediaCell {
         final boolean ready = s == MediaState.READY;
         final String detail;
         if (moving()) {
-            detail = MediaText.progress(c, progressDone, progressTotal);
+            detail = transferLine();
         } else if (!ready) {
             detail = MediaText.size(media.getSizeBytes());
         } else {

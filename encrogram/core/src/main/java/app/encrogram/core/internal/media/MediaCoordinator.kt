@@ -927,7 +927,8 @@ internal class MediaCoordinator(
     /** A voice recording's refusals in its own words; anything else as for any file. */
     private fun voiceError(t: Throwable): SecuredError = when ((t as? PrepException)?.reason) {
         PrepException.Reason.TOO_LARGE -> SecuredError(Kind.TOO_LARGE, ErrorMapper.VOICE_TOO_LONG)
-        PrepException.Reason.UNSUPPORTED, PrepException.Reason.UNREADABLE -> SecuredError(Kind.UNSUPPORTED, ErrorMapper.VOICE_UNREADABLE)
+        PrepException.Reason.UNSUPPORTED, PrepException.Reason.UNREADABLE, PrepException.Reason.EMPTY ->
+            SecuredError(Kind.UNSUPPORTED, ErrorMapper.VOICE_UNREADABLE)
         else -> prepError(t)
     }
 
@@ -938,6 +939,7 @@ internal class MediaCoordinator(
             PrepException.Reason.UNSUPPORTED -> SecuredError(Kind.UNSUPPORTED, ErrorMapper.MEDIA_UNSUPPORTED)
             PrepException.Reason.STORAGE -> storageFull()
             PrepException.Reason.UNREADABLE -> ErrorMapper.invalid(ErrorMapper.MEDIA_UNREADABLE)
+            PrepException.Reason.EMPTY -> ErrorMapper.invalid(ErrorMapper.MEDIA_EMPTY)
             PrepException.Reason.CANCELLED -> preparedGone()
         }
         is VaultException -> ErrorMapper.mediaFailure(t.failure)

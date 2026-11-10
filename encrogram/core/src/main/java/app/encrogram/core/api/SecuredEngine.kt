@@ -50,6 +50,18 @@ interface SecuredEngine {
     /** Creates a one-time invite link on our relay (for example https://encrogram.nytmanager.com/i#...). */
     fun createInvite(callback: SecuredCallback<SecuredInvite>)
 
+    /**
+     * How many one-time invites made on this phone nobody has used yet, not counting [except] (the one just shown;
+     * null counts all). Started joins, group links and the contact's side of a connection never count. Never contacts a server.
+     */
+    fun unusedInviteCount(except: SecuredInvite?, callback: SecuredCallback<Int>) = notYet(callback)
+
+    /**
+     * Revokes every unused one-time invite except [except]: deleted here and on our relay, so the links stop working.
+     * Only invites nobody has used yet; a connection in progress is never touched. The result is how many were revoked.
+     */
+    fun revokeUnusedInvites(except: SecuredInvite?, callback: SecuredCallback<Int>) = notYet(callback)
+
     /** Checks a pasted or tapped link before connecting. Never contacts a server. */
     fun checkLink(link: String): LinkCheck
 
@@ -540,7 +552,10 @@ val SECURED_REACTIONS: List<String> = listOf("👍", "👎", "😀", "😂", "�
  */
 const val SAVED_MESSAGES_CHAT_ID: Long = -1L
 
-data class SecuredInvite(val link: String)
+/** [id]: the engine's handle for a one-time invite (0 for group links); never shown. toString leaves the link out. */
+data class SecuredInvite @JvmOverloads constructor(val link: String, val id: Long = 0L) {
+    override fun toString() = "SecuredInvite(id=$id)"
+}
 
 sealed class LinkCheck {
     object Approved : LinkCheck()

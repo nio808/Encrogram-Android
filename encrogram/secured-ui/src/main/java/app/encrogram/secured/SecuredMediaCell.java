@@ -208,6 +208,7 @@ abstract class SecuredMediaCell extends View {
             // A new snapshot: start from the engine's own count; live updates follow through setProgress.
             progressDone = media.getTransferredBytes();
             progressTotal = media.getSizeBytes();
+            stall = STALL_NONE;
         }
         timeText = LocaleController.getInstance().getFormatterDay().format(m.getTimeMs());
         timeWidth = (int) Math.ceil(timePaint.measureText(timeText));
@@ -228,8 +229,27 @@ abstract class SecuredMediaCell extends View {
     final void setProgress(long done, long total) {
         progressDone = done;
         progressTotal = total;
+        stall = STALL_NONE;   // bytes arrived: the normal line is back at once
         onProgress();
         invalidate();
+    }
+
+    static final int STALL_NONE = 0, STALL_WAITING = 1, STALL_CONNECTING = 2;
+    private int stall = STALL_NONE;
+
+    /** HT-5: the activity's one cheap check says what to show instead of the byte count while a transfer sits still. */
+    final void setStall(int mode) {
+        if (mode == stall) return;
+        stall = mode;
+        onProgress();
+        invalidate();
+    }
+
+    /** The size/progress line of a moving transfer: Telegram's "Waiting for network…" or "Connecting…" when it is stalled. */
+    protected final String transferLine() {
+        if (stall == STALL_WAITING) return LocaleController.getString(org.telegram.messenger.R.string.WaitingForNetwork);
+        if (stall == STALL_CONNECTING) return LocaleController.getString(org.telegram.messenger.R.string.Connecting);
+        return MediaText.progress(getContext(), progressDone, progressTotal);
     }
 
     final SecuredMessage message() {
@@ -751,7 +771,7 @@ abstract class SecuredMediaCell extends View {
         if (media.getState() == MediaState.FAILED) {
             sb.append(", ").append(MediaText.failureShort(getContext(), media.getFailure()));
         } else if (moving()) {
-            sb.append(", ").append(MediaText.progress(getContext(), progressDone, progressTotal));
+            sb.append(", ").append(transferLine());
         }
         if (caption != null) sb.append(", ").append(caption.toString());
         if (message.getOutgoing() && !notes) sb.append(", ").append(getContext().getString(SecuredMessageCell.wordFor(message.getStatus())));   // only what the engine reported

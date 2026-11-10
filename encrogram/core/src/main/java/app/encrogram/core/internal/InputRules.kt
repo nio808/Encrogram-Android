@@ -130,6 +130,127 @@ internal object InputRules {
         return code
     }
 
+    // ---- display names (H8) -------------------------------------------------------------------------------------
+
+    /** mkValidName keeps at most this many characters (code points) of a name. */
+    const val MAX_NAME_CHARS = 50
+
+    /** Characters a name may never contain (Commands.hs mkValidName `prohibited`). */
+    const val PROHIBITED_NAME_CHARS = ".,;/\\#@'\"`~"
+
+    /** Why the core would change a name, from the first character it drops. */
+    enum class NameProblem { PROHIBITED, START, PUNCTUATION, EMOJI, OTHER }
+
+    /**
+     * Commands.hs:6035 mkValidName, character for character: the name the core makes of [name]. The core refuses
+     * every display name (profile, new group, group rename: checkValidName, Commands.hs:4058) that this changes.
+     * Categories are Java's ([Character.getType]) for Haskell's generalCategory; both follow Unicode, so they agree
+     * except on characters one side's Unicode version doesn't know yet.
+     */
+    fun mkValidName(name: String): String = foldName(name).first
+
+    /**
+     * Null when the core takes [name] as it is (non-empty, nothing dropped or changed); else why not. [name] is
+     * expected trimmed with its spaces already one each ([normalizeNameSpaces]); a leftover space problem is OTHER.
+     */
+    fun nameProblem(name: String): NameProblem? {
+        if (name.isEmpty()) return NameProblem.OTHER
+        val (valid, problem) = foldName(name)
+        return if (valid == name) null else problem ?: NameProblem.OTHER
+    }
+
+    /** [raw] as it is sent: trimmed, with its spaces one each ([normalizeNameSpaces]). */
+    fun cleanName(raw: String): String = normalizeNameSpaces(raw.trim())
+
+    /**
+     * Every space character (Haskell's isSpace) becomes one plain space, runs of them one space, and none at the ends:
+     * exactly what mkValidName does to spaces, so this never changes what the core keeps of a name.
+     */
+    fun normalizeNameSpaces(name: String): String {
+        val sb = StringBuilder(name.length)
+        var i = 0
+        while (i < name.length) {
+            val cp = name.codePointAt(i)
+            i += Character.charCount(cp)
+            if (hsIsSpace(cp)) {
+                if (sb.isNotEmpty() && sb[sb.length - 1] != ' ') sb.append(' ')
+            } else {
+                sb.appendCodePoint(cp)
+            }
+        }
+        if (sb.isNotEmpty() && sb[sb.length - 1] == ' ') sb.setLength(sb.length - 1)
+        return sb.toString()
+    }
+
+    /** The fold of mkValidName, plus the reason for the first character it dropped (null: none dropped). */
+    private fun foldName(name: String): Pair<String, NameProblem?> {
+        val out = StringBuilder(name.length)
+        var prev = 0 // '\NUL': nothing kept yet
+        var punct = 0
+        var problem: NameProblem? = null
+        var i = 0
+        while (i < name.length) {
+            val raw = name.codePointAt(i)
+            i += Character.charCount(raw)
+            val c = if (hsIsSpace(raw)) SPACE else raw
+            val type = Character.getType(c)
+            val isPunct = type == Character.CONNECTOR_PUNCTUATION.toInt() || type == Character.DASH_PUNCTUATION.toInt() ||
+                type == Character.OTHER_PUNCTUATION.toInt()
+            val firstName = isLetterType(type) || type == Character.DECIMAL_DIGIT_NUMBER.toInt() || type == Character.OTHER_SYMBOL.toInt()
+            val first = firstName || type == Character.CURRENCY_SYMBOL.toInt() || type == Character.MATH_SYMBOL.toInt()
+            val prohibited = c < 0x80 && PROHIBITED_NAME_CHARS.indexOf(c.toChar()) >= 0
+            val valid = when {
+                prohibited -> false
+                prev == 0 -> c > SPACE && firstName
+                prev == SPACE -> first || (punct == 0 && isPunct)
+                punct > 0 -> first || c == SPACE
+                else -> first || c == SPACE || isMarkType(type) || isPunct
+            }
+            if (valid) {
+                out.appendCodePoint(c)
+                prev = c
+                punct = when {
+                    isPunct -> punct + 1
+                    c == SPACE -> punct
+                    else -> 0
+                }
+            } else if (problem == null) {
+                problem = when {
+                    prohibited -> NameProblem.PROHIBITED
+                    prev == 0 -> NameProblem.START
+                    isPunct && punct > 0 -> NameProblem.PUNCTUATION
+                    isEmojiPart(c, prev) -> NameProblem.EMOJI
+                    else -> NameProblem.OTHER
+                }
+            }
+        }
+        // take 50, then dropWhileEnd isSpace (every space is ' ' by now).
+        var kept = out.toString()
+        if (kept.codePointCount(0, kept.length) > MAX_NAME_CHARS) kept = kept.substring(0, kept.offsetByCodePoints(0, MAX_NAME_CHARS))
+        return kept.trimEnd(' ') to problem
+    }
+
+    private const val SPACE = 0x20
+
+    /** GHC's Data.Char.isSpace: tab to carriage return, space and no-break space; above U+0377 the Zs category. */
+    private fun hsIsSpace(cp: Int): Boolean =
+        if (cp <= 0x377) cp == SPACE || cp in 0x09..0x0D || cp == 0xA0 else Character.getType(cp) == Character.SPACE_SEPARATOR.toInt()
+
+    private fun isLetterType(type: Int): Boolean =
+        type == Character.UPPERCASE_LETTER.toInt() || type == Character.LOWERCASE_LETTER.toInt() ||
+            type == Character.TITLECASE_LETTER.toInt() || type == Character.MODIFIER_LETTER.toInt() || type == Character.OTHER_LETTER.toInt()
+
+    private fun isMarkType(type: Int): Boolean =
+        type == Character.NON_SPACING_MARK.toInt() || type == Character.COMBINING_SPACING_MARK.toInt() ||
+            type == Character.ENCLOSING_MARK.toInt()
+
+    /**
+     * Parts of a composed emoji the core drops: a joiner right after an emoji (👨‍💻), a skin tone (👍🏽, modifier
+     * symbols), a tag character (subdivision flags).
+     */
+    private fun isEmojiPart(c: Int, prev: Int): Boolean =
+        (c == 0x200D && Character.getType(prev) == Character.OTHER_SYMBOL.toInt()) || c in 0x1F3FB..0x1F3FF || c in 0xE0020..0xE007F
+
     /** A short preview of a quoted message, never cutting a surrogate pair. */
     fun preview(text: String, maxChars: Int = QUOTE_PREVIEW_CHARS): String {
         if (text.length <= maxChars) return text

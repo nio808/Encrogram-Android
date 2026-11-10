@@ -66,15 +66,20 @@ final class SecuredMediaViewer {
     @Nullable
     private static SecuredMediaViewer current;
 
+    /**
+     * {@code caption}: the strict text mapper's output (or null). A tap on a link in it closes the viewer and hands the
+     * span to {@code onLink}; the span's own onClick is never called.
+     */
     static void open(BaseFragment fragment, SecuredEngine engine, MediaBitmaps bitmaps, SecuredMessage m, String title,
-                     Theme.ResourcesProvider resources) {
+                     Theme.ResourcesProvider resources, @Nullable CharSequence caption,
+                     @Nullable java.util.function.Consumer<android.text.style.CharacterStyle> onLink) {
         if (fragment == null || engine == null || bitmaps == null || m == null || m.getMedia() == null) return;
         final Context context = fragment.getParentActivity();
         if (context == null) return;
         final MediaKind kind = m.getMedia().getKind();
         if (kind != MediaKind.IMAGE && kind != MediaKind.GIF && kind != MediaKind.VIDEO) return;
         if (current != null) current.close();
-        final SecuredMediaViewer v = new SecuredMediaViewer(context, engine, bitmaps, m, title);
+        final SecuredMediaViewer v = new SecuredMediaViewer(context, engine, bitmaps, m, title, caption, onLink);
         current = v;
         if (Kit.show(fragment, v.dialog) == null) {
             // Not shown (a screen transition is running): nothing was loaded yet, so there is nothing to release.
@@ -119,6 +124,8 @@ final class SecuredMediaViewer {
     private final LinearLayout topBar;
     private final TextView errorText;
     @Nullable
+    private View captionView;
+    @Nullable
     private TextureView texture;
     @Nullable
     private LinearLayout bottomBar;
@@ -129,6 +136,7 @@ final class SecuredMediaViewer {
     @Nullable
     private TextView timeText;
 
+    private int insetBottom;
     private boolean closed;
     private boolean fullShown;
     private boolean barsVisible = true;
@@ -148,7 +156,8 @@ final class SecuredMediaViewer {
     private int videoW, videoH, durationMs;
     private final Runnable progressTick = this::tick;
 
-    private SecuredMediaViewer(Context context, SecuredEngine engine, MediaBitmaps bitmaps, SecuredMessage m, String title) {
+    private SecuredMediaViewer(Context context, SecuredEngine engine, MediaBitmaps bitmaps, SecuredMessage m, String title,
+                               @Nullable CharSequence caption, @Nullable java.util.function.Consumer<android.text.style.CharacterStyle> onLink) {
         this.context = context;
         this.engine = engine;
         this.bitmaps = bitmaps;
@@ -193,6 +202,8 @@ final class SecuredMediaViewer {
         topBar = buildTopBar(title, m.getTimeMs());
         root.addView(topBar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
+        if (caption != null && caption.length() > 0) buildCaption(caption, onLink);
+
         final int baseTop = topBar.getPaddingTop();
         final int baseBottom = bottomBar != null ? bottomBar.getPaddingBottom() : 0;
         root.setOnApplyWindowInsetsListener((v, insets) -> {
@@ -201,6 +212,8 @@ final class SecuredMediaViewer {
                 bottomBar.setPadding(bottomBar.getPaddingLeft(), bottomBar.getPaddingTop(), bottomBar.getPaddingRight(),
                         baseBottom + insets.getSystemWindowInsetBottom());
             }
+            insetBottom = insets.getSystemWindowInsetBottom();
+            placeCaption();
             return insets;
         });
 
@@ -370,8 +383,114 @@ final class SecuredMediaViewer {
         root.addView(bar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
     }
 
+    /** Telegram's PhotoViewer look: white 16sp text on a translucent black band at the bottom, scrolling after a third of the screen. */
+    private void buildCaption(CharSequence caption, @Nullable java.util.function.Consumer<android.text.style.CharacterStyle> onLink) {
+        final TextView tv = new TextView(context);
+        tv.setText(inertLinks(caption));
+        tv.setTextColor(Color.WHITE);
+        tv.setLinkTextColor(0xFF8CC8FF);
+        tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16);
+        tv.setPadding(dp(16), dp(10), dp(16), dp(10));
+        // No selection, no copy, no share of the caption; no LinkMovementMethod (it would call the span's own onClick).
+        tv.setTextIsSelectable(false);
+        tv.setLongClickable(false);
+        tv.setMovementMethod(null);
+        final android.view.GestureDetector gd = new android.view.GestureDetector(context, new android.view.GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onDown(android.view.MotionEvent e) {
+                return true;
+            }
+
+            @Override
+            public boolean onSingleTapUp(android.view.MotionEvent e) {
+                final android.text.style.CharacterStyle span = linkAt(tv, e.getX(), e.getY());
+                if (span != null && onLink != null) {
+                    close();
+                    AndroidUtilities.runOnUIThread(() -> onLink.accept(span));
+                } else {
+                    toggleBars();
+                }
+                return true;
+            }
+        });
+        tv.setOnTouchListener((v, ev) -> gd.onTouchEvent(ev));
+        final int maxH = screenH / 3;
+        final android.widget.ScrollView sv = new android.widget.ScrollView(context) {
+            @Override
+            protected void onMeasure(int w, int h) {
+                super.onMeasure(w, View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST));
+            }
+        };
+        sv.setBackgroundColor(0x99000000);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.addView(tv, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        captionView = sv;
+        root.addView(sv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        if (bottomBar != null) bottomBar.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> placeCaption());
+        placeCaption();
+    }
+
+    /** The caption sits above the video controls, or above the system bar when there are none. */
+    private void placeCaption() {
+        final View c = captionView;
+        if (c == null) return;
+        final int bottom = bottomBar != null && bottomBar.getHeight() > 0 ? bottomBar.getHeight() : insetBottom;
+        final FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) c.getLayoutParams();
+        if (lp.bottomMargin != bottom) {
+            lp.bottomMargin = bottom;
+            c.setLayoutParams(lp);
+        }
+    }
+
+    /** The link span under a touch, found by hand so no span's own onClick (Telegram's browser path) can run. */
+    @Nullable
+    private static android.text.style.CharacterStyle linkAt(TextView tv, float x, float y) {
+        final android.text.Layout layout = tv.getLayout();
+        final CharSequence text = tv.getText();
+        if (layout == null || !(text instanceof android.text.Spanned)) return null;
+        final float px = x - tv.getTotalPaddingLeft() + tv.getScrollX();
+        final float py = y - tv.getTotalPaddingTop() + tv.getScrollY();
+        if (py < 0 || py > layout.getHeight()) return null;
+        final int line = layout.getLineForVertical((int) py);
+        if (px < layout.getLineLeft(line) || px > layout.getLineRight(line)) return null;
+        final int off = layout.getOffsetForHorizontal(line, px);
+        final InertLink[] spans = ((android.text.Spanned) text).getSpans(off, off, InertLink.class);
+        return spans.length > 0 ? spans[0].original : null;
+    }
+
+    /**
+     * A copy of the caption in which every ClickableSpan is swapped for an {@link InertLink}. A real ClickableSpan in a
+     * TextView can be clicked without touch (TalkBack's links menu sends ACTION_CLICKABLE_SPAN, which calls the span's
+     * own onClick: Telegram's browser path, rule 1). The bubble draws its own layout and never exposes spans.
+     */
+    static CharSequence inertLinks(CharSequence caption) {
+        if (!(caption instanceof android.text.Spanned)) return caption;
+        final android.text.SpannableStringBuilder b = new android.text.SpannableStringBuilder(caption);
+        for (android.text.style.ClickableSpan span : b.getSpans(0, b.length(), android.text.style.ClickableSpan.class)) {
+            final int start = b.getSpanStart(span), end = b.getSpanEnd(span), flags = b.getSpanFlags(span);
+            b.removeSpan(span);
+            b.setSpan(new InertLink(span), start, end, flags);
+        }
+        return b;
+    }
+
+    /** Looks like a link and remembers the mapper's span, but is no ClickableSpan: only our tap handler acts on it. */
+    static final class InertLink extends android.text.style.CharacterStyle {
+        final android.text.style.ClickableSpan original;
+
+        InertLink(android.text.style.ClickableSpan original) {
+            this.original = original;
+        }
+
+        @Override
+        public void updateDrawState(android.text.TextPaint tp) {
+            tp.setColor(tp.linkColor);
+        }
+    }
+
     private void toggleBars() {
         barsVisible = !barsVisible;
+        if (captionView != null) animateBar(captionView, barsVisible);
         animateBar(topBar, barsVisible);
         if (bottomBar != null) animateBar(bottomBar, barsVisible);
     }

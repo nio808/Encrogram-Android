@@ -65,6 +65,8 @@ internal class MediaPreparer(
                 } catch (e: Exception) {
                     throw PrepException(PrepException.Reason.UNREADABLE)
                 }
+                // Read to the end of the stream and nothing came: an empty file, as a photo or as a file (H7).
+                if (head.isEmpty()) throw PrepException(PrepException.Reason.EMPTY)
                 val declared = s.declaredSize
                 if (declared != null && declared > config.capBytes) throw PrepException(PrepException.Reason.TOO_LARGE)
                 requireRoom(maxOf(declared ?: 0L, 0L))

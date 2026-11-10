@@ -98,22 +98,43 @@ internal object LinkChecker {
      * A short group link (`https://<host>/g#..`, `simplex:/g#..`), by its shape only. [ConnectPlan] then accepts
      * nothing but a group plan for it.
      */
-    fun isShortGroupLink(link: String?): Boolean {
-        val s = link?.trim() ?: return false
+    fun isShortGroupLink(link: String?): Boolean = shortFragment(link)?.first == Kind.SHORT_GROUP
+
+    /**
+     * A short link whose key can't be a whole link key: cut off or damaged. The key is sha3-256 of the link's fixed
+     * data (simplexmq Crypto/ShortLink.hs encodeSignFixedData), always 32 bytes, written as 43 base64url characters
+     * without padding (Agent/Protocol.hs slEncode), so no valid short link of any kind (`/i`, `/a`, `/g`, https or
+     * `simplex:`) fails this. The core would find out only after fetching the link's data from the relay, and for a
+     * one-time invite that fetch (LKEY) already uses the invite up (Agent.hs getConnShortLink'), so the whole link
+     * would no longer work either (H4). False for full links and anything else.
+     */
+    fun hasDamagedKey(link: String?): Boolean {
+        val (kind, fragment) = shortFragment(link) ?: return false
+        if (kind == null || kind !in SHORT_KINDS) return false
+        val key = fragment.substringBefore('?').substringAfterLast('/')
+        return key.trimEnd('=').length != LINK_KEY_CHARS
+    }
+
+    /** base64url characters of a 32-byte link key without padding. */
+    private const val LINK_KEY_CHARS = 43
+
+    /** The kind and the fragment (after '#') of an https or `simplex:` link, by its shape only. */
+    private fun shortFragment(link: String?): Pair<Kind?, String>? {
+        val s = link?.trim() ?: return null
         val lower = s.lowercase(Locale.ROOT)
         val tail = when {
             lower.startsWith("https://") -> {
                 val rest = s.substring("https://".length)
                 val authorityEnd = rest.indexOfFirst { it == '/' || it == '?' || it == '#' }
-                if (authorityEnd <= 0) return false
+                if (authorityEnd <= 0) return null
                 rest.substring(authorityEnd)
             }
             lower.startsWith("simplex:") -> s.substring("simplex:".length)
-            else -> return false
+            else -> return null
         }
         val hash = tail.indexOf('#')
-        if (!tail.startsWith("/") || hash < 0) return false
-        return kindOf(tail.substring(1, hash).removeSuffix("/")) == Kind.SHORT_GROUP
+        if (!tail.startsWith("/") || hash < 0) return null
+        return kindOf(tail.substring(1, hash).removeSuffix("/")) to tail.substring(hash + 1)
     }
 
     /** Fingerprints compare as unpadded base64url. */

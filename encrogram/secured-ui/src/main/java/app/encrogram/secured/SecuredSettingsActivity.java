@@ -321,6 +321,7 @@ final class SecuredSettingsActivity extends SecuredBackupScreen {
     private void editName(Context c) {
         if (engine == null) return;
         final EditText input = new EditText(c);
+        input.setFilters(new android.text.InputFilter[]{Kit.nameLengthFilter()});   // H8: 50 characters, capped while typing
         input.setText(currentName());
         input.setSelection(input.getText().length());
         input.setHint(R.string.sec_profile_name_hint);

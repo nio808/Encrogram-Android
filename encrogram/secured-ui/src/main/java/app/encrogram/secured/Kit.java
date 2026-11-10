@@ -9,6 +9,7 @@ import android.graphics.Paint;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.content.res.ColorStateList;
+import android.text.InputFilter;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -24,6 +25,8 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AvatarDrawable;
+
+import java.util.ArrayList;
 
 /** Small view helpers for the Secured screens. Colours come from our provider, so they follow the theme. */
 final class Kit {
@@ -107,13 +110,57 @@ final class Kit {
      * The one place that sets a Secured avatar's colour and initials. {@code colorKey} is {@link ChatRowMapper#colorId}
      * of the chat id (or a member id), so a chat has the same colour in the list, the header and its info screen.
      * AvatarDrawable takes initials from first and last name, and its single-string path mis-reads a two-word title
-     * ("Team Test" gives "TE"), so split at the last space ("TT").
+     * ("Team Test" gives "TE"), so pass the first and last word ("TT"), see {@link #initialWords}.
      */
     static void setAvatar(AvatarDrawable d, long ignoredLocalId, String name) {
         final String shown = name == null ? "" : name.trim();
-        final long colorKey = colorKey(shown);
-        final int sp = shown.lastIndexOf(' ');
-        d.setInfo(colorKey, sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null);
+        final long colorKey = colorKey(shown);   // the full name, symbols included: the colour never changes (H9)
+        final String[] words = initialWords(shown);
+        d.setInfo(colorKey, words[0], words[1]);
+    }
+
+    /**
+     * H9: the first and last name AvatarDrawable takes its initials from. Words with no letter or digit ("<", "🙂", "-")
+     * are skipped and each word starts at its first letter or digit, so "Harsh A <b>" gives "HB", not "H<". A name with no
+     * letter or digit at all keeps the old split (an emoji-only name still shows its emoji). Pure Java, for the unit test.
+     */
+    static String[] initialWords(String shown) {
+        final ArrayList<String> words = new ArrayList<>();
+        for (String w : shown.split("\\s+")) {
+            for (int i = 0; i < w.length(); ) {
+                final int cp = w.codePointAt(i);
+                if (Character.isLetterOrDigit(cp)) {
+                    words.add(w.substring(i));
+                    break;
+                }
+                i += Character.charCount(cp);
+            }
+        }
+        if (words.isEmpty()) {
+            final int sp = shown.lastIndexOf(' ');
+            return new String[]{sp > 0 ? shown.substring(0, sp).trim() : shown, sp > 0 ? shown.substring(sp + 1) : null};
+        }
+        return new String[]{words.get(0), words.size() > 1 ? words.get(words.size() - 1) : null};
+    }
+
+    /** The engine's limit for a Secured display name, in characters (code points), the way the core counts them. */
+    static final int NAME_MAX_CHARS = 50;
+
+    /** H8: the one cap for the Secured name fields (profile, Settings, new group): stops typing and pasting at 50 characters. */
+    static InputFilter nameLengthFilter() {
+        return (source, start, end, dest, dstart, dend) -> capInsert(NAME_MAX_CHARS, source, start, end, dest, dstart, dend);
+    }
+
+    /**
+     * The InputFilter rule, counted in code points so an emoji counts once and a surrogate pair is never cut in half:
+     * null keeps the edit, otherwise the part of {@code source[start, end)} that still fits. Pure Java, for the unit test.
+     */
+    static CharSequence capInsert(int max, CharSequence source, int start, int end, CharSequence dest, int dstart, int dend) {
+        final int kept = Character.codePointCount(dest, 0, dstart) + Character.codePointCount(dest, dend, dest.length());
+        final int room = max - kept;
+        if (Character.codePointCount(source, start, end) <= room) return null;
+        if (room <= 0) return "";
+        return source.subSequence(start, Character.offsetByCodePoints(source, start, room));
     }
 
     static TextView text(Context context, CharSequence s, float sp, int color, boolean bold) {

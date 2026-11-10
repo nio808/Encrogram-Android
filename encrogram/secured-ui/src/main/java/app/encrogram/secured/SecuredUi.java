@@ -5,7 +5,9 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.EncrogramHooks;
+import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.messenger.LocaleController;
 import org.telegram.tgnet.ConnectionsManager;
@@ -43,6 +45,7 @@ public final class SecuredUi {
     static final long NO_CHAT = Long.MIN_VALUE;
 
     private static Application app;
+    private static SecuredHooks hooks;
     private static EngineProvider provider;
     private static SecuredEngine engine;
     private static String engineError;
@@ -58,7 +61,8 @@ public final class SecuredUi {
     public static void install(Application application, EngineProvider engineProvider) {
         app = application;
         provider = engineProvider;
-        EncrogramHooks.install(new SecuredHooks());
+        hooks = new SecuredHooks();
+        EncrogramHooks.install(hooks);
     }
 
     /** The engine, or null when it cannot be created ({@link #engineError()} then says why). */
@@ -242,7 +246,7 @@ public final class SecuredUi {
      * transition is disabled upstream, so it opens fine on its own. A fresh instance each time.
      */
     static void openTelegramLogin(BaseFragment from) {
-        from.presentFragment(new LoginActivity());
+        from.presentFragment(new SecuredLoginEntry());
         // What IntroActivity did before login: fetch DC settings and the language list. The wake-up hook
         // (willPresentFragment) has already started Telegram's network by this point.
         try {
@@ -250,6 +254,40 @@ public final class SecuredUi {
             ConnectionsManager.getInstance(account).updateDcSettings();
             LocaleController.getInstance().loadRemoteLanguages(account);
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * HT-2: the Telegram segment of the Secured-only list asks first, in Telegram's dialog: signing in connects to
+     * Telegram's servers. Only "Sign in" opens the login (the welcome screen's explicit button opens it directly).
+     */
+    static void askTelegramLogin(BaseFragment from) {
+        final Context context = from.getParentActivity();
+        if (context == null) return;
+        final AlertDialog.Builder b = new AlertDialog.Builder(context, SecuredResourcesProvider.get());
+        b.setTitle(context.getString(R.string.sec_tg_signin_title));
+        b.setMessage(context.getString(R.string.sec_tg_signin_text));
+        b.setNegativeButton(context.getString(R.string.sec_tg_signin_cancel), null);
+        b.setPositiveButton(context.getString(R.string.sec_tg_signin_ok), (d, w) -> openTelegramLogin(from));
+        Kit.show(from, b.create());
+    }
+
+    /** HT-2: a Secured root screen is fully visible again: Telegram goes back to sleep if nothing uses it. Never throws. */
+    static void telegramMaybeSleep() {
+        final SecuredHooks h = hooks;
+        if (h != null) h.sleepTelegramIfUnused();
+    }
+
+    /**
+     * Telegram's LoginActivity unchanged (reuse level 2: a subclass), only told when it closes, so Telegram can go back to
+     * sleep also on tablets, where the login opens in a layer over our screen and our screen gets no visibility callback.
+     * Checked after the stack has settled; the check itself refuses while an account is active or a login is half done.
+     */
+    static final class SecuredLoginEntry extends LoginActivity {
+        @Override
+        public void onFragmentDestroy() {
+            super.onFragmentDestroy();
+            AndroidUtilities.runOnUIThread(SecuredUi::telegramMaybeSleep);
         }
     }
 

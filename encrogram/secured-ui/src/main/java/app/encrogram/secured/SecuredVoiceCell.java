@@ -163,7 +163,7 @@ final class SecuredVoiceCell extends SecuredMediaCell {
         if (media.getState() == MediaState.FAILED) {
             text = MediaText.failureShort(getContext(), media.getFailure());
         } else if (moving()) {
-            text = MediaText.progress(getContext(), progressDone, progressTotal);
+            text = transferLine();
         } else if (audio != null && (playing || played > 0f)) {
             text = MediaText.duration(audio.positionSeconds(message.getChatId(), message.getMessageId()));
         } else {

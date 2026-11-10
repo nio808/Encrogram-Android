@@ -22,6 +22,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.ui.ActionBar.BottomSheet;
@@ -77,6 +78,7 @@ final class SecuredSheets {
                     if (result instanceof SecuredResult.Ok) {
                         final SecuredInvite invite = ((SecuredResult.Ok<SecuredInvite>) result).getValue();
                         showInviteLink(context, box, invite.getLink());
+                        showUnusedInvites(fragment, sheet, engine, context, box, invite);
                     } else {
                         final SecuredError e = ((SecuredResult.Err) result).getError();
                         showInviteFailure(context, box, e.getMessage());
@@ -120,6 +122,77 @@ final class SecuredSheets {
         buttons.addView(copy, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 0, 0, 6, 0));
         buttons.addView(share, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 6, 0, 0, 0));
         box.addView(buttons, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 16, 0, 4));
+    }
+
+    // ---- unused invites (HT-4) -------------------------------------------------------------------------------------
+
+    /** False once the sheet is closed or the screen that opened it is gone: a late callback then changes nothing. */
+    private static boolean alive(BaseFragment fragment, BottomSheet sheet) {
+        return sheet.isShowing() && fragment.getParentActivity() != null && fragment.getParentLayout() != null;
+    }
+
+    /**
+     * Under the new link: how many older one-time links nobody has used yet, and a way to revoke them. Any error (NOT_ALLOWED
+     * before the engine has it, or anything else) or a count of 0 shows nothing. Asks the engine only; no server is contacted.
+     */
+    private static void showUnusedInvites(BaseFragment fragment, BottomSheet sheet, SecuredEngine engine, Context context,
+                                          LinearLayout box, SecuredInvite invite) {
+        try {
+            engine.unusedInviteCount(invite, result -> {
+                if (!alive(fragment, sheet) || !(result instanceof SecuredResult.Ok)) return;
+                final Integer n = ((SecuredResult.Ok<Integer>) result).getValue();
+                if (n == null || n <= 0) return;
+                final TextView line = Kit.text(context, context.getResources().getQuantityString(R.plurals.sec_invite_unused, n, n), 14,
+                        Kit.color(Theme.key_windowBackgroundWhiteGrayText), false);
+                final TextView revoke = Kit.button(context, context.getString(R.string.sec_invite_revoke_others), false);
+                revoke.setOnClickListener(v -> confirmRevoke(fragment, sheet, engine, context, box, invite, line, revoke));
+                box.addView(line, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
+                box.addView(revoke, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 8, 0, 4));
+            });
+        } catch (Throwable ignored) {
+            // no count: the sheet stays as it was
+        }
+    }
+
+    /** Telegram's confirm dialog with a red "Revoke", on top of the sheet (showDialog would close the sheet). */
+    private static void confirmRevoke(BaseFragment fragment, BottomSheet sheet, SecuredEngine engine, Context context, LinearLayout box,
+                                      SecuredInvite invite, View line, View button) {
+        if (!alive(fragment, sheet)) return;
+        final AlertDialog.Builder b = new AlertDialog.Builder(context, SecuredResourcesProvider.get());
+        b.setTitle(context.getString(R.string.sec_invite_revoke_title));
+        b.setMessage(context.getString(R.string.sec_invite_revoke_text));
+        b.setNegativeButton(context.getString(R.string.sec_bs_cancel), null);
+        b.setPositiveButton(context.getString(R.string.sec_invite_revoke_ok), (d, w) -> revoke(fragment, sheet, engine, context, box, invite, line, button));
+        final AlertDialog dialog = b.create();
+        Kit.secure(dialog);
+        dialog.show();
+        dialog.redPositive();
+    }
+
+    private static void revoke(BaseFragment fragment, BottomSheet sheet, SecuredEngine engine, Context context, LinearLayout box,
+                               SecuredInvite invite, View line, View button) {
+        button.setEnabled(false);   // one tap, one revoke
+        try {
+            engine.revokeUnusedInvites(invite, result -> {
+                if (result instanceof SecuredResult.Ok) {
+                    final Integer n = ((SecuredResult.Ok<Integer>) result).getValue();
+                    if (!alive(fragment, sheet)) return;
+                    box.removeView(button);
+                    // The result replaces the "unused links" line in the sheet (a system toast would carry the app icon).
+                    if (n != null && n > 0 && line instanceof TextView) {
+                        ((TextView) line).setText(context.getResources().getQuantityString(R.plurals.sec_invite_revoked, n, n));
+                    } else {
+                        box.removeView(line);
+                    }
+                } else {
+                    if (!alive(fragment, sheet)) return;
+                    button.setEnabled(true);
+                    if (line instanceof TextView) ((TextView) line).setText(((SecuredResult.Err) result).getError().getMessage());
+                }
+            });
+        } catch (Throwable t) {
+            button.setEnabled(true);
+        }
     }
 
     static void copyToClipboard(Context context, String text, boolean sensitive) {

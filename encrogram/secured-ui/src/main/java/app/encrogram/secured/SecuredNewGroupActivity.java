@@ -57,7 +57,6 @@ import app.encrogram.core.api.SecuredResult;
 final class SecuredNewGroupActivity extends SecuredGroupScreen {
 
     private static final int MENU_DONE = 1;
-    private static final int MAX_NAME = 64;
 
     private static final int T_NAME = 0, T_TEXT = 1, T_SHADOW = 2, T_HEADER = 3, T_CONTACT = 4;
 
@@ -411,7 +410,7 @@ final class SecuredNewGroupActivity extends SecuredGroupScreen {
             // Group names are private: no suggestions, no keyboard learning.
             nameField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
             nameField.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
-            nameField.setFilters(new InputFilter[]{new InputFilter.LengthFilter(MAX_NAME)});
+            nameField.setFilters(new InputFilter[]{Kit.nameLengthFilter()});   // the core keeps at most 50 characters of a group name too (mkValidName)
             nameField.setPadding(0, 0, 0, 0);
             nameField.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
             nameField.setOnEditorActionListener((v, actionId, event) -> {

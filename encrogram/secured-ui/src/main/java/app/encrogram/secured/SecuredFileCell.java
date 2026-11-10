@@ -92,7 +92,7 @@ final class SecuredFileCell extends SecuredMediaCell {
             infoFull = MediaText.failureShort(getContext(), media.getFailure());
             infoIsError = true;
         } else if (moving()) {
-            infoFull = MediaText.progress(getContext(), progressDone, progressTotal);
+            infoFull = transferLine();
         } else if (state == MediaState.READY) {
             final String ext = extension(media.getName());
             infoFull = ext == null ? MediaText.size(media.getSizeBytes()) : MediaText.size(media.getSizeBytes()) + " · " + ext;

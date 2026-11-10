@@ -629,6 +629,8 @@ class MediaCoordinatorTest {
         assertEquals(SecuredError.Kind.TOO_LARGE, failure(PrepException(PrepException.Reason.TOO_LARGE)).kind)
         assertEquals(ErrorMapper.MEDIA_UNSUPPORTED, failure(PrepException(PrepException.Reason.UNSUPPORTED)).message)
         assertEquals(SecuredError.Kind.STORAGE, failure(PrepException(PrepException.Reason.STORAGE)).kind)
+        assertEquals("This file is empty.", failure(PrepException(PrepException.Reason.EMPTY)).message)
+        assertEquals(ErrorMapper.MEDIA_UNREADABLE, failure(PrepException(PrepException.Reason.UNREADABLE)).message)
         assertEquals(SecuredError.Kind.TOO_LARGE, failure(OutOfMemoryError(FakeNativeFiles.CORE_TEXT)).kind)
         assertEquals(SecuredError.Kind.STORAGE, failure(NativeFileException("write")).kind)
         assertEquals(SecuredError.Kind.ENGINE_NOT_RUNNING, failure(NativeFileException(CtrlGate.NO_CTRL)).kind)

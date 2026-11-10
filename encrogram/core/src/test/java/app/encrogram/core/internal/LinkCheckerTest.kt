@@ -1,8 +1,11 @@
 package app.encrogram.core.internal
 
 import app.encrogram.core.api.LinkCheck
+import app.encrogram.core.api.SecuredError
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.URLEncoder
 
@@ -246,5 +249,82 @@ class LinkCheckerTest {
             checkSmp("https://encrogram.nytmanager.com/i#$linkId/$linkKey?h=engrogramapi.nytmanager.com"),
         )
         assertEquals(LinkCheck.UnapprovedRelay("encrogram.nytmanager.com"), LinkChecker.check("https://encrogram.nytmanager.com/a#$linkKey", allowed, emptyList()))
+    }
+
+    // ---- cut-off keys (H4) ----------------------------------------------------------------------------------------
+
+    /** Every short link these tests approve, as the core writes it or as we compact it. Keys are 43 characters. */
+    private val wholeShortLinks: List<String>
+        get() = listOf(
+            "https://encrogram.nytmanager.com/i#$linkId/$linkKey?p=5223&c=$fp",
+            "https://encrogram.nytmanager.com/i#$linkId/$linkKey",
+            "https://encrogram.nytmanager.com/i#$linkId/$linkKey=",            // padded: the core's base64url parser takes it
+            "https://encrogram.nytmanager.com/a#$linkKey?p=5223&c=$fp",
+            "https://encrogram.nytmanager.com/a#$linkKey",
+            "https://encrogram.nytmanager.com/g#$linkKey",
+            "https://Encrogram.NytManager.com/g/#$linkKey",
+            "simplex:/i#$linkId/$linkKey?h=encrogram.nytmanager.com&p=5223&c=$fp",
+            "simplex:/a#$linkKey?h=encrogram.nytmanager.com",
+            "simplex:/g#$linkKey?h=encrogram.nytmanager.com&p=5223&c=$fp",
+            "  https://encrogram.nytmanager.com/i#$linkId/$linkKey\n",
+        )
+
+    @Test
+    fun wholeLinksNeverCountAsDamaged() {
+        assertEquals(43, linkKey.length)
+        for (link in wholeShortLinks) {
+            assertEquals("for <$link>", LinkCheck.Approved, check(link))
+            assertFalse("for <$link>", LinkChecker.hasDamagedKey(link))
+        }
+        // Full links have no link key: never this check's business (a cut one fails to parse in the core: invalidConnReq).
+        for (link in listOf(fullInvitation("simplex:", "encrogram.nytmanager.com:5223"), fullInvitation("https://encrogram.nytmanager.com", "encrogram.nytmanager.com"))) {
+            assertFalse(LinkChecker.hasDamagedKey(link))
+            assertFalse(LinkChecker.hasDamagedKey(link.dropLast(20)))
+        }
+        // The compact invite a phone shows, expanded for our relay first, as connect does.
+        val compact = "https://encrogram.nytmanager.com/i#$linkId/$linkKey"
+        assertFalse(LinkChecker.hasDamagedKey(LinkChecker.expand(compact, listOf("smp://$fp@encrogram.nytmanager.com:5223"))))
+        assertFalse(LinkChecker.hasDamagedKey(null))
+        assertFalse(LinkChecker.hasDamagedKey("hello"))
+    }
+
+    @Test
+    fun cutOffKeysAreDamagedThoughTheRelayIsOurs() {
+        val cut = listOf(
+            "https://encrogram.nytmanager.com/i#$linkId/${linkKey.dropLast(1)}",
+            "https://encrogram.nytmanager.com/i#$linkId/${linkKey.take(20)}",
+            "https://encrogram.nytmanager.com/i#$linkId/${linkKey.take(16)}",
+            "https://encrogram.nytmanager.com/i#$linkId/${linkKey.dropLast(1)}=",
+            "https://encrogram.nytmanager.com/a#${linkKey.dropLast(5)}",
+            "https://encrogram.nytmanager.com/g#${linkKey.dropLast(1)}",
+            "simplex:/i#$linkId/${linkKey.dropLast(3)}?h=encrogram.nytmanager.com",
+            // A key that grew (two links pasted together) is not a whole key either.
+            "https://encrogram.nytmanager.com/i#$linkId/${linkKey}AB",
+        )
+        for (link in cut) {
+            // Still on our relay, so the connect sheet goes on to connect, which refuses it before asking the core.
+            assertEquals("for <$link>", LinkCheck.Approved, check(link))
+            assertTrue("for <$link>", LinkChecker.hasDamagedKey(link))
+        }
+        // Shorter than any link token: not a link at all.
+        assertEquals(LinkCheck.Malformed, check("https://encrogram.nytmanager.com/i#$linkId/${linkKey.take(15)}"))
+    }
+
+    @Test
+    fun linkDataTheKeyCantOpenIsADamagedLinkOnlyWhenConnecting() {
+        for (sub in listOf("A_CRYPTO", "A_LINK")) {
+            val e = ErrorMapper.fromCore(CoreError("errorAgent", "AGENT", sub), ErrorMapper.Op.CONNECT)
+            assertEquals(SecuredError.Kind.INVALID_LINK, e.kind)
+            assertEquals(ErrorMapper.LINK_DAMAGED, e.message)
+            assertEquals(ErrorMapper.engine("errorAgent.AGENT.$sub"), ErrorMapper.fromCore(CoreError("errorAgent", "AGENT", sub), ErrorMapper.Op.SEND))
+        }
+        // The core's reply as it arrives (AgentErrorType AGENT {agentErr: A_CRYPTO {cryptoErr}}).
+        val raw = """{"result":{"type":"chatCmdError","chatError":{"type":"errorAgent","agentError":{"type":"AGENT",
+            "agentErr":{"type":"A_CRYPTO","cryptoErr":{"type":"DECRYPT_CB"}}}}}}"""
+        val reply = CoreJson.parseReply(raw) as CoreReply.Error
+        assertEquals(ErrorMapper.LINK_DAMAGED, ErrorMapper.fromCore(reply.error, ErrorMapper.Op.CONNECT).message)
+        // Other agent errors on a link keep their meaning.
+        assertEquals(ErrorMapper.LINK_USED, ErrorMapper.fromCore(CoreError("errorAgent", "SMP", "AUTH"), ErrorMapper.Op.CONNECT).message)
+        assertEquals(ErrorMapper.engine("errorAgent.AGENT.A_VERSION"), ErrorMapper.fromCore(CoreError("errorAgent", "AGENT", "A_VERSION"), ErrorMapper.Op.CONNECT))
     }
 }
